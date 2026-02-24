@@ -16,6 +16,10 @@ RUN pip install --no-cache-dir vastai
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Cache MegaLoc architecture (hubconf.py + model code, ~50MB)
+# This bakes the repo structure so only weights are needed at runtime
+RUN python -c "import torch; torch.hub._get_cache_or_reload('gmberton/MegaLoc', force_reload=False, trust_repo=True, calling_fn='load')"
+
 # Application code
 COPY pipeline.py r2_storage.py entrypoint.sh ./
 COPY gsvpd/ ./gsvpd/

@@ -22,11 +22,28 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import math
 from typing import Dict, List, Set, Tuple
 
 import numpy as np
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Brisbane UTC+10 Logging
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BRISBANE_TZ = timezone(timedelta(hours=10))
+
+
+def _ts() -> str:
+    """Return current Brisbane (AEST UTC+10) timestamp string."""
+    return datetime.now(BRISBANE_TZ).strftime("%Y-%m-%d %H:%M:%S AEST")
+
+
+def log(tag: str, msg: str, flush: bool = True):
+    """Print a structured log line with Brisbane timestamp."""
+    print(f"[{_ts()}] [{tag}] {msg}", flush=flush)
 
 # Fix OpenMP conflict
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -114,7 +131,7 @@ from r2_storage import R2Client
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class R2StatusReporter:
-    """Uploads structured status JSON to R2 for UI polling."""
+    """Uploads compact status JSON to R2 for UI polling."""
 
     def __init__(self, r2_client, worker_index: int, total: int,
                  status_prefix: str, instance_id: str = '',
@@ -143,21 +160,16 @@ class R2StatusReporter:
         remaining = self.total - self.processed
         eta = remaining / speed if speed > 0 else 0
         data = {
-            'worker': self.worker_index,
-            'status': status,
-            'processed': self.processed,
-            'total': self.total,
-            'speed': round(speed, 2),
-            'eta': round(eta),
-            'instance_id': self.instance_id,
-            'timestamp': time.time(),
+            'w': self.worker_index, 's': status,
+            'p': self.processed, 't': self.total,
+            'spd': round(speed, 2), 'eta': round(eta),
+            'iid': self.instance_id, 'ts': time.time(),
         }
-        # Print to stdout as well for debugging
-        print(f"PROGRESS|{self.worker_index}|{self.processed}|{self.total}|{eta:.0f}|{speed:.2f}|{status}", flush=True)
+        print(f"[{_ts()}] PROGRESS|W{self.worker_index}|{self.processed}/{self.total}|{eta:.0f}s|{speed:.2f}/s|{status}", flush=True)
         try:
             self.r2.upload_json(self._status_key, data)
         except Exception as e:
-            print(f"[WARN] Status upload failed: {e}")
+            log("WARN", f"Status upload failed: {e}")
 
     def report_final(self, status: str):
         """Force a final status report."""
@@ -165,39 +177,26 @@ class R2StatusReporter:
 
     def report_upload(self, bytes_done: int, bytes_total: int,
                       speed_mb: float, eta: float, label: str = ""):
-        """Report upload byte-progress to R2 and stdout.
-
-        Args:
-            bytes_done: Bytes transferred so far.
-            bytes_total: Total file size in bytes.
-            speed_mb: Current transfer speed in MB/s.
-            eta: Estimated seconds remaining.
-            label: File label for stdout (e.g. 'NPY', 'META').
-        """
+        """Report upload byte-progress to R2 and stdout."""
         status = f"UPLOADING_{label}" if label else "UPLOADING"
         data = {
-            'worker': self.worker_index,
-            'status': 'UPLOADING',
-            'processed': bytes_done,
-            'total': bytes_total,
-            'speed': round(speed_mb, 2),
-            'eta': round(eta),
-            'instance_id': self.instance_id,
-            'timestamp': time.time(),
+            'w': self.worker_index, 's': 'UPLOADING',
+            'p': bytes_done, 't': bytes_total,
+            'spd': round(speed_mb, 2), 'eta': round(eta),
+            'iid': self.instance_id, 'ts': time.time(),
         }
         pct = int(bytes_done / bytes_total * 100) if bytes_total > 0 else 0
         mb_done = bytes_done / (1024 * 1024)
         mb_total = bytes_total / (1024 * 1024)
         print(
-            f"PROGRESS|{self.worker_index}|{bytes_done}|{bytes_total}"
-            f"|{eta:.0f}|{speed_mb:.2f}|{status}"
-            f"  [{pct}%  {mb_done:.0f}/{mb_total:.0f} MB  {speed_mb:.1f} MB/s]",
+            f"[{_ts()}] PROGRESS|W{self.worker_index}|{status}"
+            f"  [{pct}%  {mb_done:.0f}/{mb_total:.0f} MB  {speed_mb:.1f} MB/s  ETA {eta:.0f}s]",
             flush=True,
         )
         try:
             self.r2.upload_json(self._status_key, data)
         except Exception as e:
-            print(f"[WARN] Upload status report failed: {e}")
+            log("WARN", f"Upload status report failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -283,9 +282,9 @@ class _InitWatchdog:
             self._timer = None
 
     def _on_timeout(self):
-        msg = (f"[FATAL] Watchdog timeout after {self.timeout}s during: {self.stage}. "
+        msg = (f"Watchdog timeout after {self.timeout}s during: {self.stage}. "
                f"Process is stuck — forcing exit.")
-        print(msg, flush=True)
+        log("FATAL", msg)
         # Report failure to R2 before dying
         try:
             r2 = R2Client()
@@ -352,9 +351,9 @@ class GpuExtractor:
         """Download MegaLoc model with multiple fallback sources.
 
         Strategy:
-          1. torch.hub (GitHub + HuggingFace) — two attempts with backoff
+          1. huggingface_hub — resumable, retries built-in, most reliable
           2. R2 fallback — download safetensors from R2 bucket if configured
-          3. Direct HuggingFace URL — bypasses torch.hub plumbing
+          3. torch.hub — full download as last resort
 
         Returns the loaded model (on CPU).
         """
@@ -366,56 +365,87 @@ class GpuExtractor:
         if _hf_token:
             os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", _hf_token)
 
-        # ── Source 1: torch.hub (standard path) ──
-        def _try_torch_hub():
-            for attempt in range(1, 4):
-                try:
-                    print(f"[INIT]   torch.hub attempt {attempt}/3...", flush=True)
-                    return torch.hub.load(
-                        "gmberton/MegaLoc", "get_trained_model", trust_repo=True
-                    )
-                except Exception as e:
-                    print(f"[INIT]   torch.hub attempt {attempt} failed: "
-                          f"{type(e).__name__}: {e}", flush=True)
-                    errors.append(f"torch.hub#{attempt}: {e}")
-                    if attempt < 3:
-                        time.sleep(2 ** attempt)
-            return None
+        # Helper: load state_dict using baked architecture from Docker image
+        def _load_from_state_dict(state_dict_path):
+            """Load model weights using the baked MegaLoc architecture."""
+            from safetensors.torch import load_file
+            state_dict = load_file(state_dict_path)
 
+            hub_dir = Path(torch.hub.get_dir()) / 'gmberton_MegaLoc_main'
+            if not hub_dir.exists():
+                # Try to fetch architecture (should be baked in Docker)
+                log("INIT", "Architecture not cached, fetching from GitHub...")
+                torch.hub._get_cache_or_reload(
+                    "gmberton/MegaLoc", force_reload=False,
+                    trust_repo=True, calling_fn="load"
+                )
+
+            if not hub_dir.exists():
+                raise FileNotFoundError(
+                    f"MegaLoc architecture not found at {hub_dir}. "
+                    "Rebuild Docker image to bake it in."
+                )
+
+            sys.path.insert(0, str(hub_dir))
+            try:
+                import importlib
+                hubconf = importlib.import_module('hubconf')
+                model = hubconf.get_trained_model()
+                model.load_state_dict(state_dict, strict=False)
+                return model
+            finally:
+                sys.path.pop(0)
+
+        # ── Source 1: huggingface_hub (resumable, reliable) ──
+        local_model_path = '/tmp/megaloc_model.safetensors'
         try:
-            model = _run_with_timeout(_try_torch_hub, timeout_sec, "model_download_hub")
-            if model is not None:
-                print("[INIT]   Model loaded via torch.hub", flush=True)
+            from huggingface_hub import hf_hub_download
+            log("INIT", "Source 1: huggingface_hub download...")
+
+            def _try_hf_hub():
+                return hf_hub_download(
+                    repo_id="gmberton/MegaLoc",
+                    filename="model.safetensors",
+                    token=_hf_token or None,
+                    local_dir="/tmp/hf_megaloc",
+                    local_dir_use_symlinks=False,
+                )
+
+            downloaded_path = _run_with_timeout(_try_hf_hub, timeout_sec, "model_download_hf_hub")
+            if downloaded_path and os.path.exists(downloaded_path):
+                size_mb = os.path.getsize(downloaded_path) / 1e6
+                log("INIT", f"huggingface_hub download OK ({size_mb:.1f}MB)")
+                model = _load_from_state_dict(downloaded_path)
+                log("INIT", "Model loaded via huggingface_hub + baked architecture")
                 return model
         except TimeoutError:
-            errors.append(f"torch.hub timed out after {timeout_sec}s")
-            print(f"[WARN] torch.hub timed out after {timeout_sec}s", flush=True)
+            errors.append(f"huggingface_hub timed out after {timeout_sec}s")
+            log("WARN", f"huggingface_hub timed out after {timeout_sec}s")
         except Exception as e:
-            errors.append(f"torch.hub: {e}")
+            errors.append(f"huggingface_hub: {e}")
+            log("WARN", f"huggingface_hub failed: {e}")
 
         # ── Source 2: R2 fallback ──
         r2_model_key = os.environ.get(
             'R2_MODEL_KEY', 'Models/MegaLoc/model.safetensors'
         )
-        local_model_path = '/tmp/megaloc_model.pt'
 
         try:
-            print(f"[INIT]   Trying R2 fallback: {r2_model_key}...", flush=True)
+            log("INIT", f"Source 2: R2 fallback ({r2_model_key})...")
             r2 = R2Client()
             if r2.download_file(r2_model_key, local_model_path, max_retries=3):
                 size_mb = os.path.getsize(local_model_path) / 1e6
-                print(f"[INIT]   Downloaded model from R2 ({size_mb:.1f}MB)", flush=True)
+                log("INIT", f"Downloaded model from R2 ({size_mb:.1f}MB)")
 
-                # Try loading as a full torch checkpoint first (model.torch),
+                # Try loading as a full torch checkpoint first,
                 # then as safetensors state_dict
                 model = None
                 try:
                     loaded = torch.load(local_model_path, map_location='cpu', weights_only=False)
                     if isinstance(loaded, torch.nn.Module):
                         model = loaded
-                        print("[INIT]   Loaded complete model from R2 (torch checkpoint)", flush=True)
+                        log("INIT", "Loaded complete model from R2 (torch checkpoint)")
                     elif isinstance(loaded, dict):
-                        # It's a state_dict — need architecture
                         state_dict = loaded
                     else:
                         state_dict = loaded
@@ -430,19 +460,19 @@ class GpuExtractor:
                 if model is not None:
                     return model
 
-                # Have state_dict but need architecture — try cached hub repo
+                # Have state_dict but need architecture — use baked hub repo
                 if state_dict is not None:
                     hub_dir = Path(torch.hub.get_dir()) / 'gmberton_MegaLoc_main'
                     if not hub_dir.exists():
                         try:
-                            print("[INIT]   Downloading model architecture from GitHub...", flush=True)
+                            log("INIT", "Downloading model architecture from GitHub...")
                             torch.hub._get_cache_or_reload(
                                 "gmberton/MegaLoc", force_reload=False,
                                 trust_repo=True, calling_fn="load"
                             )
                         except Exception as e2:
                             errors.append(f"R2 architecture download: {e2}")
-                            print(f"[WARN] Could not download architecture: {e2}", flush=True)
+                            log("WARN", f"Could not download architecture: {e2}")
 
                     if hub_dir.exists():
                         sys.path.insert(0, str(hub_dir))
@@ -451,47 +481,45 @@ class GpuExtractor:
                             hubconf = importlib.import_module('hubconf')
                             model = hubconf.get_trained_model()
                             model.load_state_dict(state_dict, strict=False)
-                            print("[INIT]   Model loaded via R2 state_dict + hub architecture", flush=True)
+                            log("INIT", "Model loaded via R2 state_dict + hub architecture")
                             return model
                         except Exception as e2:
                             errors.append(f"R2 architecture load: {e2}")
-                            print(f"[WARN] Hub architecture load failed: {e2}", flush=True)
+                            log("WARN", f"Hub architecture load failed: {e2}")
                         finally:
                             sys.path.pop(0)
             else:
                 errors.append("R2 model download returned False (file may not exist)")
-                print("[WARN] R2 model file not found or download failed", flush=True)
+                log("WARN", "R2 model file not found or download failed")
         except Exception as e:
             errors.append(f"R2 fallback: {e}")
-            print(f"[WARN] R2 fallback failed: {e}", flush=True)
+            log("WARN", f"R2 fallback failed: {e}")
 
-        # ── Source 3: Direct HuggingFace download via urllib (bypass httpx/torch.hub) ──
+        # ── Source 3: torch.hub (full download, last resort) ──
+        def _try_torch_hub():
+            for attempt in range(1, 4):
+                try:
+                    log("INIT", f"Source 3: torch.hub attempt {attempt}/3...")
+                    return torch.hub.load(
+                        "gmberton/MegaLoc", "get_trained_model", trust_repo=True
+                    )
+                except Exception as e:
+                    log("INIT", f"torch.hub attempt {attempt} failed: {type(e).__name__}: {e}")
+                    errors.append(f"torch.hub#{attempt}: {e}")
+                    if attempt < 3:
+                        time.sleep(2 ** attempt)
+            return None
+
         try:
-            import urllib.request
-            hf_url = "https://huggingface.co/gberton/MegaLoc/resolve/main/model.safetensors"
-            print(f"[INIT]   Trying direct HuggingFace download...", flush=True)
-
-            def _direct_download():
-                req = urllib.request.Request(
-                    hf_url,
-                    headers={"Authorization": f"Bearer {_hf_token}"}
-                )
-                with urllib.request.urlopen(req) as resp, open(local_model_path, 'wb') as f:
-                    f.write(resp.read())
-                return True
-
-            _run_with_timeout(_direct_download, timeout_sec, "model_download_direct_hf")
-            if os.path.exists(local_model_path) and os.path.getsize(local_model_path) > 1e6:
-                print(f"[INIT]   Direct HF download OK ({os.path.getsize(local_model_path) / 1e6:.1f}MB)", flush=True)
-                # Now load via torch.hub using cached repo + downloaded weights
-                model = torch.hub.load(
-                    "gmberton/MegaLoc", "get_trained_model", trust_repo=True
-                )
-                print("[INIT]   Model loaded via direct HuggingFace download", flush=True)
+            model = _run_with_timeout(_try_torch_hub, timeout_sec, "model_download_hub")
+            if model is not None:
+                log("INIT", "Model loaded via torch.hub")
                 return model
+        except TimeoutError:
+            errors.append(f"torch.hub timed out after {timeout_sec}s")
+            log("WARN", f"torch.hub timed out after {timeout_sec}s")
         except Exception as e:
-            errors.append(f"Direct HF: {e}")
-            print(f"[WARN] Direct HuggingFace download failed: {e}", flush=True)
+            errors.append(f"torch.hub: {e}")
 
         # All sources exhausted
         raise RuntimeError(
@@ -504,7 +532,7 @@ class GpuExtractor:
 
     def _init_gpu(self, t0: float):
         # ── Step 1: CUDA check ──
-        print(f"[INIT] Step 1/5: Checking CUDA availability...", flush=True)
+        log("INIT", f"Step 1/5: Checking CUDA availability...")
         cuda_available = torch.cuda.is_available()
         if not cuda_available:
             raise RuntimeError(
@@ -514,20 +542,20 @@ class GpuExtractor:
         gpu_name = torch.cuda.get_device_name(0)
         props = torch.cuda.get_device_properties(0)
         gpu_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0)) / (1024**3)
-        print(f"[INIT]   CUDA OK — GPU: {gpu_name}, VRAM: {gpu_mem:.1f}GB", flush=True)
-        print(f"[INIT]   CUDA version: {torch.version.cuda}, PyTorch: {torch.__version__}", flush=True)
+        log("INIT", f"CUDA OK — GPU: {gpu_name}, VRAM: {gpu_mem:.1f}GB")
+        log("INIT", f"CUDA version: {torch.version.cuda}, PyTorch: {torch.__version__}")
 
         torch.set_float32_matmul_precision('high')
         self.device = torch.device('cuda')
 
         # ── Step 2: Download model ──
-        print(f"[INIT] Step 2/5: Downloading MegaLoc model (timeout={GPU_INIT_TIMEOUT}s)...", flush=True)
+        log("INIT", f"Step 2/5: Downloading MegaLoc model (timeout={GPU_INIT_TIMEOUT}s)...")
         dl_start = time.time()
         model = self._download_model_with_fallback(GPU_INIT_TIMEOUT)
-        print(f"[INIT]   Model ready in {time.time() - dl_start:.1f}s", flush=True)
+        log("INIT", f"Model ready in {time.time() - dl_start:.1f}s")
 
         # ── Step 3: Move to GPU ──
-        print(f"[INIT] Step 3/5: Moving model to {self.device}...", flush=True)
+        log("INIT", f"Step 3/5: Moving model to {self.device}...")
         move_start = time.time()
         try:
             model = _run_with_timeout(
@@ -540,16 +568,16 @@ class GpuExtractor:
                 "model.to(cuda) timed out after 120s. CUDA driver may be unresponsive. "
                 "Check nvidia-smi and dmesg for GPU errors."
             )
-        print(f"[INIT]   Model on GPU in {time.time() - move_start:.1f}s", flush=True)
+        log("INIT", f"Model on GPU in {time.time() - move_start:.1f}s")
 
         # ── Step 4: DataParallel / compile ──
         gpu_count = torch.cuda.device_count()
         if gpu_count > 1:
-            print(f"[INIT] Step 4/5: Wrapping with DataParallel ({gpu_count} GPUs)...", flush=True)
+            log("INIT", f"Step 4/5: Wrapping with DataParallel ({gpu_count} GPUs)...")
             model = torch.nn.DataParallel(model)
 
         if hasattr(torch, 'compile'):
-            print(f"[INIT] Step 4/5: torch.compile()...", flush=True)
+            log("INIT", f"Step 4/5: torch.compile()...")
             compile_start = time.time()
             try:
                 model = _run_with_timeout(
@@ -557,16 +585,16 @@ class GpuExtractor:
                     timeout_sec=120,
                     stage="torch_compile"
                 )
-                print(f"[INIT]   torch.compile() done in {time.time() - compile_start:.1f}s", flush=True)
+                log("INIT", f"torch.compile() done in {time.time() - compile_start:.1f}s")
             except TimeoutError:
-                print(f"[WARN] torch.compile() timed out after 120s — running without compilation (this is OK)", flush=True)
+                log("WARN", f"torch.compile() timed out after 120s — running without compilation (this is OK)")
             except Exception as e:
-                print(f"[WARN] torch.compile() failed: {type(e).__name__}: {e} — running without compilation", flush=True)
+                log("WARN", f"torch.compile() failed: {type(e).__name__}: {e} — running without compilation")
         else:
-            print(f"[INIT] Step 4/5: torch.compile not available (PyTorch < 2.0), skipping", flush=True)
+            log("INIT", f"Step 4/5: torch.compile not available (PyTorch < 2.0), skipping")
 
         # ── Step 5: Warmup inference ──
-        print(f"[INIT] Step 5/5: Warmup inference...", flush=True)
+        log("INIT", f"Step 5/5: Warmup inference...")
         warmup_start = time.time()
         try:
             dummy = torch.randn(1, 3, 322, 322, device=self.device)
@@ -576,12 +604,12 @@ class GpuExtractor:
                 _ = model(dummy)
             del dummy
             torch.cuda.synchronize()
-            print(f"[INIT]   Warmup done in {time.time() - warmup_start:.1f}s", flush=True)
+            log("INIT", f"Warmup done in {time.time() - warmup_start:.1f}s")
         except Exception as e:
             # torch.compile inductor can crash on low-VRAM GPUs (BrokenProcessPool).
             # Fall back to eager mode — this is safe, just slower compilation.
-            print(f"[WARN] Compiled warmup failed: {type(e).__name__}: {e}", flush=True)
-            print(f"[WARN] Falling back to eager mode (disabling torch.compile)...", flush=True)
+            log("WARN", f"Compiled warmup failed: {type(e).__name__}: {e}")
+            log("WARN", f"Falling back to eager mode (disabling torch.compile)...")
 
             # Reset dynamo state and unwrap the compiled model
             try:
@@ -592,7 +620,7 @@ class GpuExtractor:
             # Get the original uncompiled model
             if hasattr(model, '_orig_mod'):
                 model = model._orig_mod
-                print(f"[WARN] Unwrapped compiled model to original module", flush=True)
+                log("WARN", f"Unwrapped compiled model to original module")
 
             # Retry warmup in eager mode
             try:
@@ -604,7 +632,7 @@ class GpuExtractor:
                     _ = model(dummy)
                 del dummy
                 torch.cuda.synchronize()
-                print(f"[INIT]   Eager warmup OK in {time.time() - warmup_start:.1f}s", flush=True)
+                log("INIT", f"Eager warmup OK in {time.time() - warmup_start:.1f}s")
             except Exception as e2:
                 raise RuntimeError(
                     f"Warmup inference failed in both compiled AND eager mode: {type(e2).__name__}: {e2}. "
@@ -617,14 +645,14 @@ class GpuExtractor:
         self.executor = ThreadPoolExecutor(max_workers=16)
 
         # ── Step 6: Auto batch size probe ──
-        print(f"[INIT] Step 6/6: Probing optimal batch size via VRAM measurement...", flush=True)
+        log("INIT", f"Step 6/6: Probing optimal batch size via VRAM measurement...")
         self.batch_size = self._probe_max_batch_size()
 
         vram_used = torch.cuda.memory_allocated(0) / (1024**3)
         vram_reserved = torch.cuda.memory_reserved(0) / (1024**3)
-        print(f"[INIT] GpuExtractor ready — total init: {time.time() - t0:.1f}s, "
+        log("INIT", f"GpuExtractor ready — total init: {time.time() - t0:.1f}s, "
               f"VRAM: {vram_used:.2f}GB used / {vram_reserved:.2f}GB reserved, "
-              f"batch_size={self.batch_size}", flush=True)
+              f"batch_size={self.batch_size}")
 
     def _probe_max_batch_size(self) -> int:
         """Run a single-image inference under autocast, measure peak VRAM delta,
@@ -652,11 +680,11 @@ class GpuExtractor:
             # Round down to nearest power of 2 for alignment
             max_batch = 2 ** int(math.log2(max_batch))
 
-            print(f"[INIT]   Auto batch size: {max_batch} "
-                  f"(per-image={per_image / 1e6:.1f} MB, free={free / 1e6:.0f} MB)", flush=True)
+            log("INIT", f"Auto batch size: {max_batch} "
+                  f"(per-image={per_image / 1e6:.1f} MB, free={free / 1e6:.0f} MB)")
             return max_batch
         except Exception as e:
-            print(f"[WARN] Batch size probe failed ({e}), defaulting to 32", flush=True)
+            log("WARN", f"Batch size probe failed ({e}), defaulting to 32")
             return 32
 
     @staticmethod
@@ -666,7 +694,7 @@ class GpuExtractor:
             img = Image.open(io.BytesIO(item.jpeg_bytes)).convert('RGB')
             return transforms.functional.to_tensor(img)
         except Exception as e:
-            print(f"[WARN] Decode failed panoid={item.panoid}: {type(e).__name__}: {e}", flush=True)
+            log("WARN", f"Decode failed panoid={item.panoid}: {type(e).__name__}: {e}")
             return None
 
     def start_decode(self, items: List[ViewItem]) -> list:
@@ -705,12 +733,12 @@ class GpuExtractor:
             half = len(valid_tensors) // 2
             torch.cuda.empty_cache()
             if half == 0:
-                print("[WARN] OOM on single image — skipping", flush=True)
+                log("WARN", "OOM on single image — skipping")
                 return None, [], []
 
             new_bs = max(8, half)
-            print(f"[WARN] OOM on batch={len(valid_tensors)} → retrying as 2×{half}, "
-                  f"shrinking batch_size {self.batch_size} → {new_bs}", flush=True)
+            log("WARN", f"OOM on batch={len(valid_tensors)} → retrying as 2x{half}, "
+                  f"shrinking batch_size {self.batch_size} → {new_bs}")
             self.batch_size = new_bs
 
             f1, m1, vi1 = self._run_inference(items, valid_tensors[:half], valid_indices[:half])
@@ -732,7 +760,7 @@ class GpuExtractor:
 
         failures = len(items) - len(valid_tensors)
         if failures:
-            print(f"[WARN] {failures}/{len(items)} images failed to decode in batch", flush=True)
+            log("WARN", f"{failures}/{len(items)} images failed to decode in batch")
         if not valid_tensors:
             return None, [], []
         return self._run_inference(items, valid_tensors, valid_indices)
@@ -745,7 +773,7 @@ class GpuExtractor:
 
         failures = len(items) - len(valid_tensors)
         if failures:
-            print(f"[WARN] {failures}/{len(items)} images failed to decode in batch", flush=True)
+            log("WARN", f"{failures}/{len(items)} images failed to decode in batch")
         if not valid_tensors:
             return None, [], []
         return self._run_inference(items, valid_tensors, valid_indices)
@@ -778,7 +806,7 @@ def load_csv(csv_path: str) -> Tuple[List[dict], Dict[str, Dict]]:
                     col_map['heading'] = field
 
         if 'panoid' not in col_map:
-            print(f"[ERROR] No panoid column in CSV. Columns: {reader.fieldnames}")
+            log("ERROR", f"No panoid column in CSV. Columns: {reader.fieldnames}")
             sys.exit(1)
 
         for row in reader:
@@ -909,7 +937,7 @@ def get_free_gb(path: str = '/') -> float:
 
 def wait_for_disk_space(path: str = '/', min_gb: float = MIN_FREE_GB):
     while get_free_gb(path) < min_gb:
-        print(f"[WARN] Only {get_free_gb(path):.1f}GB free, waiting for space (need {min_gb}GB)...")
+        log("WARN", f"Only {get_free_gb(path):.1f}GB free, waiting for space (need {min_gb}GB)...")
         time.sleep(60)
 
 
@@ -921,12 +949,27 @@ LOG_FILE = f"/tmp/worker_{WORKER_INDEX}.log"
 
 
 class TeeWriter:
-    """Writes to both the original stream and a log file."""
+    """Writes to both the original stream and a log file, filtering noise."""
+
+    # Lines containing these substrings are suppressed (sshd probes, etc.)
+    _NOISE_PATTERNS = (
+        "kex_exchange_identification",
+        "banner exchange: Connection from",
+        "client sent invalid protocol identifier",
+        "Connection from ",  # sshd connection noise (starts with "Connection from")
+        "Warning: You are sending unauthenticated requests to the HF Hub",
+    )
+
     def __init__(self, original, log_file_handle):
         self.original = original
         self.log_file = log_file_handle
 
+    def _is_noise(self, data: str) -> bool:
+        return any(p in data for p in self._NOISE_PATTERNS)
+
     def write(self, data):
+        if data.strip() and self._is_noise(data):
+            return  # suppress noisy lines
         self.original.write(data)
         try:
             self.log_file.write(data)
@@ -953,7 +996,7 @@ def _start_log_capture():
         sys.stderr = TeeWriter(sys.__stderr__, fh)
         return fh
     except Exception as e:
-        print(f"[WARN] Could not start log capture: {e}")
+        log("WARN", f"Could not start log capture: {e}")
         return None
 
 
@@ -967,9 +1010,9 @@ def upload_logs_to_r2():
         r2 = R2Client()
         log_key = f"Logs/{FEATURES_BUCKET_PREFIX}/worker_{WORKER_INDEX}.log"
         r2.upload_file(LOG_FILE, log_key)
-        print(f"[INFO] Uploaded logs to R2: {log_key}")
+        log("INFO", f"Uploaded logs to R2: {log_key}")
     except Exception as e:
-        print(f"[WARN] Failed to upload logs to R2: {e}")
+        log("WARN", f"Failed to upload logs to R2: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -990,10 +1033,10 @@ def _detect_instance_id():
         data = r2.download_json(key)
         if data and data.get('instance_id'):
             detected = str(data['instance_id'])
-            print(f"[INFO] Got INSTANCE_ID from R2: {detected}")
+            log("INFO", f"Got INSTANCE_ID from R2: {detected}")
             return detected
     except Exception as e:
-        print(f"[WARN] R2 instance ID lookup failed: {e}")
+        log("WARN", f"R2 instance ID lookup failed: {e}")
 
     # Method 2: Fallback — only safe if there's exactly one instance
     if not VAST_API_KEY:
@@ -1009,13 +1052,13 @@ def _detect_instance_id():
             if instances and len(instances) == 1:
                 detected = str(instances[0].get('id', ''))
                 if detected:
-                    print(f"[INFO] Auto-detected INSTANCE_ID (sole instance): {detected}")
+                    log("INFO", f"Auto-detected INSTANCE_ID (sole instance): {detected}")
                     return detected
             if instances and len(instances) > 1:
-                print(f"[WARN] {len(instances)} instances running — cannot auto-detect safely. "
+                log("WARN", f"{len(instances)} instances running — cannot auto-detect safely. "
                       "INSTANCE_ID should be set via R2 or env var.")
     except Exception as e:
-        print(f"[WARN] Instance ID auto-detect failed: {e}")
+        log("WARN", f"Instance ID auto-detect failed: {e}")
     return None
 
 
@@ -1024,11 +1067,11 @@ def self_destruct():
     instance_id = _detect_instance_id() or INSTANCE_ID
 
     if not instance_id:
-        print("[WARN] Cannot self-destruct: unable to determine INSTANCE_ID — sleeping forever to prevent restart loop")
+        log("WARN", "Cannot self-destruct: unable to determine INSTANCE_ID — sleeping forever to prevent restart loop")
         while True:
             time.sleep(3600)
     if not VAST_API_KEY:
-        print("[WARN] Cannot self-destruct: VAST_API_KEY not set — sleeping forever to prevent restart loop")
+        log("WARN", "Cannot self-destruct: VAST_API_KEY not set — sleeping forever to prevent restart loop")
         while True:
             time.sleep(3600)
 
@@ -1037,17 +1080,17 @@ def self_destruct():
     while True:
         attempt += 1
         try:
-            print(f"[INFO] Self-destruct attempt {attempt} for instance {instance_id}...")
+            log("INFO", f"Self-destruct attempt {attempt} for instance {instance_id}...")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             stdout = result.stdout.strip()
             stderr = result.stderr.strip()
-            print(f"[INFO] Self-destruct response: exit={result.returncode} stdout='{stdout}' stderr='{stderr}'")
+            log("INFO", f"Self-destruct response: exit={result.returncode} stdout='{stdout}' stderr='{stderr}'")
             if result.returncode == 0:
-                print(f"[INFO] Instance {instance_id} destroyed successfully.")
+                log("INFO", f"Instance {instance_id} destroyed successfully.")
                 return
-            print(f"[WARN] Self-destruct attempt {attempt} failed (exit {result.returncode}) — retrying in 30s")
+            log("WARN", f"Self-destruct attempt {attempt} failed (exit {result.returncode}) — retrying in 30s")
         except Exception as e:
-            print(f"[WARN] Self-destruct attempt {attempt} exception: {e} — retrying in 30s")
+            log("WARN", f"Self-destruct attempt {attempt} exception: {e} — retrying in 30s")
         time.sleep(30)
 
 
@@ -1061,7 +1104,7 @@ def find_last_written_row(features_path: str) -> int:
     Returns the index of the NEXT writable position (last_nonzero + 1).
     If file is all zeros, returns 0.
     """
-    print("[RESUME] Scanning features.npy for last written row...")
+    log("RESUME", "Scanning features.npy for last written row...")
     features = np.load(features_path, mmap_mode='r')
     n_rows = features.shape[0]
 
@@ -1082,12 +1125,12 @@ def find_last_written_row(features_path: str) -> int:
     gc.collect()
 
     if last_nonzero == -1:
-        print("[RESUME]   Features file is all zeros — no valid data.")
+        log("RESUME", "Features file is all zeros — no valid data.")
         return 0
 
     resume_from = last_nonzero + 1
-    print(f"[RESUME]   Last non-zero row: {last_nonzero}")
-    print(f"[RESUME]   Next writable index: {resume_from}")
+    log("RESUME", f"Last non-zero row: {last_nonzero}")
+    log("RESUME", f"Next writable index: {resume_from}")
     return resume_from
 
 
@@ -1118,7 +1161,7 @@ def truncate_metadata_file(metadata_path: str, keep_lines: int) -> Set[str]:
         for line in kept_lines_data:
             f.write(line)
 
-    print(f"[RESUME] Truncated metadata to {len(kept_lines_data)} lines ({len(kept_panoids)} panoids)")
+    log("RESUME", f"Truncated metadata to {len(kept_lines_data)} lines ({len(kept_panoids)} panoids)")
     return kept_panoids
 
 
@@ -1137,34 +1180,34 @@ def check_and_resume(r2, work_dir: Path):
     metadata_file = str(work_dir / 'metadata.jsonl')
     failed_file = str(work_dir / 'failed.jsonl')
 
-    print("[RESUME] ── Checking R2 status for prior run ──")
+    log("RESUME", "── Checking R2 status for prior run ──")
     status_data = r2.download_json(status_key)
 
     if not status_data:
-        print("[RESUME] No prior status found. Starting fresh.")
+        log("RESUME", "No prior status found. Starting fresh.")
         return "FRESH", 0, set()
 
     prev_status = status_data.get('status', 'UNKNOWN')
     prev_processed = status_data.get('processed', 0)
     prev_total = status_data.get('total', 0)
-    print(f"[RESUME] Prior status: {prev_status}, processed: {prev_processed}/{prev_total}")
+    log("RESUME", f"Prior status: {prev_status}, processed: {prev_processed}/{prev_total}")
 
     # ── Case 1: Already completed → self-destruct ──
     if prev_status == "COMPLETED":
-        print("[RESUME] Previous run COMPLETED. Self-destructing...")
+        log("RESUME", "Previous run COMPLETED. Self-destructing...")
         upload_logs_to_r2()
         self_destruct()
         sys.exit(0)
 
     # ── Case 2: Failed or unknown → just restart fresh ──
     if prev_status.startswith("FAILED") or prev_status == "UNKNOWN":
-        print(f"[RESUME] Prior status is '{prev_status}'. Clearing status and starting fresh.")
+        log("RESUME", f"Prior status is '{prev_status}'. Clearing status and starting fresh.")
         r2.delete_object(status_key)
         # Also clear any stale local files
         for f in [features_file, metadata_file, failed_file]:
             if os.path.exists(f):
                 os.remove(f)
-                print(f"[RESUME]   Removed stale {os.path.basename(f)}")
+                log("RESUME", f"Removed stale {os.path.basename(f)}")
         return "FRESH", 0, set()
 
     # ── Case 3: Has progress ──
@@ -1174,8 +1217,8 @@ def check_and_resume(r2, work_dir: Path):
 
         if not has_features or not has_metadata:
             # Status says progress but no local files → wipe and restart
-            print("[RESUME] Status shows progress but no local files found!")
-            print("[RESUME] Clearing R2 status and starting fresh.")
+            log("RESUME", "Status shows progress but no local files found!")
+            log("RESUME", "Clearing R2 status and starting fresh.")
             r2.delete_object(status_key)
             for f in [features_file, metadata_file, failed_file]:
                 if os.path.exists(f):
@@ -1183,18 +1226,18 @@ def check_and_resume(r2, work_dir: Path):
             return "FRESH", 0, set()
 
         # Both files exist → compute safe resume point with rollback
-        print("[RESUME] Local files found. Computing safe resume point...")
+        log("RESUME", "Local files found. Computing safe resume point...")
 
         # Count metadata lines
         meta_count = 0
         with open(metadata_file, 'r', encoding='utf-8') as f:
             for _ in f:
                 meta_count += 1
-        print(f"[RESUME]   metadata.jsonl has {meta_count} lines")
+        log("RESUME", f"metadata.jsonl has {meta_count} lines")
 
         # Scan features for last written row
         feat_count = find_last_written_row(features_file)
-        print(f"[RESUME]   features.npy has {feat_count} written rows")
+        log("RESUME", f"features.npy has {feat_count} written rows")
 
         # Take the minimum to be safe (metadata and features must align)
         safe_count = min(meta_count, feat_count)
@@ -1203,11 +1246,11 @@ def check_and_resume(r2, work_dir: Path):
         batch_size = HARDCODED_CONFIG['batch_size']
         rollback = min(batch_size, safe_count)
         safe_count = max(0, safe_count - rollback)
-        print(f"[RESUME]   Rolled back {rollback} rows → safe_count = {safe_count}")
+        log("RESUME", f"Rolled back {rollback} rows → safe_count = {safe_count}")
 
         if safe_count == 0:
             # Rollback brought us to zero → just start fresh
-            print("[RESUME] Rollback brought count to 0. Starting fresh.")
+            log("RESUME", "Rollback brought count to 0. Starting fresh.")
             r2.delete_object(status_key)
             for f in [features_file, metadata_file, failed_file]:
                 if os.path.exists(f):
@@ -1228,11 +1271,11 @@ def check_and_resume(r2, work_dir: Path):
                     except Exception:
                         pass
 
-        print(f"[RESUME] ✓ Will resume from row {safe_count} ({len(done_panoids)} panoids done)")
+        log("RESUME", f"✓ Will resume from row {safe_count} ({len(done_panoids)} panoids done)")
         return "RESUME", safe_count, done_panoids
 
     # ── Case 4: No progress yet (status like DOWNLOADING_CSV, INITIALIZING) ──
-    print("[RESUME] Prior run had no progress. Starting fresh.")
+    log("RESUME", "Prior run had no progress. Starting fresh.")
     r2.delete_object(status_key)
     return "FRESH", 0, set()
 
@@ -1245,10 +1288,10 @@ def main():
     work_dir = Path('/app/work')
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] Worker {WORKER_INDEX}/{NUM_WORKERS} starting")
-    print(f"[INFO] City: {CITY_NAME}")
-    print(f"[INFO] CSV prefix: {CSV_BUCKET_PREFIX}")
-    print(f"[INFO] Features prefix: {FEATURES_BUCKET_PREFIX}")
+    log("INFO", f"Worker {WORKER_INDEX}/{NUM_WORKERS} starting")
+    log("INFO", f"City: {CITY_NAME}")
+    log("INFO", f"CSV prefix: {CSV_BUCKET_PREFIX}")
+    log("INFO", f"Features prefix: {FEATURES_BUCKET_PREFIX}")
 
     # ── Step 0: Check for prior run & decide resume strategy ──
     r2 = R2Client()
@@ -1258,7 +1301,7 @@ def main():
     global INSTANCE_ID
     resolved_id = _detect_instance_id() or INSTANCE_ID
     if resolved_id and resolved_id != INSTANCE_ID:
-        print(f"[INFO] Overriding INSTANCE_ID: env={INSTANCE_ID!r} → R2={resolved_id!r}")
+        log("INFO", f"Overriding INSTANCE_ID: env={INSTANCE_ID!r} → R2={resolved_id!r}")
         INSTANCE_ID = resolved_id
 
     # ── Pre-check: are the output files already in R2? ──
@@ -1266,21 +1309,21 @@ def main():
     # regardless of local state or status JSON.
     npy_key  = f"{FEATURES_BUCKET_PREFIX}/{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.npy"
     meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.jsonl"
-    print(f"[PRE-CHECK] Checking R2 for existing outputs...")
-    print(f"[PRE-CHECK]   npy  key: {npy_key}")
-    print(f"[PRE-CHECK]   meta key: {meta_key}")
+    log("PRE-CHECK", f"Checking R2 for existing outputs...")
+    log("PRE-CHECK", f"npy  key: {npy_key}")
+    log("PRE-CHECK", f"meta key: {meta_key}")
     if r2.file_exists(npy_key) and r2.file_exists(meta_key):
-        print(f"[PRE-CHECK] ✓ Both output files already in R2 — worker {WORKER_INDEX} is DONE.")
+        log("PRE-CHECK", f"✓ Both output files already in R2 — worker {WORKER_INDEX} is DONE.")
         reporter = R2StatusReporter(r2, WORKER_INDEX, 0, status_prefix, INSTANCE_ID)
         reporter.report_final("COMPLETED")
         upload_logs_to_r2()
         self_destruct()
         sys.exit(0)
     else:
-        print(f"[PRE-CHECK] Output files not yet in R2 — proceeding with pipeline.")
+        log("PRE-CHECK", f"Output files not yet in R2 — proceeding with pipeline.")
 
     resume_strategy, rows_done, done_panoids = check_and_resume(r2, work_dir)
-    print(f"[INFO] Resume strategy: {resume_strategy}, rows_done: {rows_done}")
+    log("INFO", f"Resume strategy: {resume_strategy}, rows_done: {rows_done}")
 
     # ── Step 1: Download CSV segment from R2 ──
     reporter = R2StatusReporter(r2, WORKER_INDEX, 0, status_prefix, INSTANCE_ID)
@@ -1292,13 +1335,13 @@ def main():
 
     # Only download CSV if we don't already have it locally
     if not os.path.exists(local_csv):
-        print(f"[INFO] Downloading {csv_key} from R2...")
+        log("INFO", f"Downloading {csv_key} from R2...")
         if not r2.download_file(csv_key, local_csv, max_retries=5):
-            print(f"[ERROR] Failed to download CSV: {csv_key}")
+            log("ERROR", f"Failed to download CSV: {csv_key}")
             reporter.report_final("FAILED:csv_download")
             sys.exit(1)
     else:
-        print(f"[INFO] CSV already exists locally: {local_csv}")
+        log("INFO", f"CSV already exists locally: {local_csv}")
 
     # ── Step 2: Load CSV ──
     records, metadata_map = load_csv(local_csv)
@@ -1307,7 +1350,7 @@ def main():
     total_views_est = total_records * views_per_pano
     feature_dim = 8448
 
-    print(f"[INFO] {total_records} panoids, ~{total_views_est} views expected")
+    log("INFO", f"{total_records} panoids, ~{total_views_est} views expected")
     reporter = R2StatusReporter(r2, WORKER_INDEX, total_views_est, status_prefix, INSTANCE_ID)
     reporter.report_final("INITIALIZING")
 
@@ -1333,7 +1376,7 @@ def main():
                 except Exception:
                     pass
         if rows_done > 0:
-            print(f"[INFO] Fresh start but found local metadata: {rows_done} views already done")
+            log("INFO", f"Fresh start but found local metadata: {rows_done} views already done")
 
     if resume_strategy == "FRESH" and os.path.exists(failed_file):
         with open(failed_file, 'r', encoding='utf-8') as f:
@@ -1346,10 +1389,10 @@ def main():
                     pass
 
     to_process = [r for r in records if r['panoid'] not in done_panoids]
-    print(f"[INFO] Processing {len(to_process)}/{total_records} panoids (rows_done={rows_done})")
+    log("INFO", f"Processing {len(to_process)}/{total_records} panoids (rows_done={rows_done})")
 
     if not to_process:
-        print("[INFO] All panoids already processed, skipping to upload")
+        log("INFO", "All panoids already processed, skipping to upload")
     else:
         # Create or open memmap
         if os.path.exists(features_file):
@@ -1374,7 +1417,7 @@ def main():
         stats = {'dl_ok': 0, 'dl_fail': 0, 'ext_ok': rows_done, 'views_produced': 0, 'dl_done': False}
 
         # Init GPU extractor
-        print("[INFO] Initializing GPU extractor...")
+        log("INFO", "Initializing GPU extractor...")
         extractor = GpuExtractor()
 
         # Start downloader thread
@@ -1393,7 +1436,7 @@ def main():
         STALL_TIMEOUT = int(os.environ.get('STALL_TIMEOUT', '600'))  # 10 min default
         LOG_INTERVAL = 30  # Log stats every 30s
 
-        print(f"[INFO] Starting extraction loop (batch_size={extractor.batch_size}, stall_timeout={STALL_TIMEOUT}s)", flush=True)
+        log("INFO", f"Starting extraction loop (batch_size={extractor.batch_size}, stall_timeout={STALL_TIMEOUT}s)")
 
         # Prefetch pipeline: decode batch N+1 in the thread pool while the GPU
         # runs inference on batch N, eliminating CPU-GPU idle time.
@@ -1409,11 +1452,11 @@ def main():
                 now = time.time()
                 since_progress = now - last_progress_time
                 if since_progress > STALL_TIMEOUT and stats['ext_ok'] == last_progress_count:
-                    msg = (f"[FATAL] Pipeline stalled — no progress for {since_progress:.0f}s "
+                    msg = (f"Pipeline stalled — no progress for {since_progress:.0f}s "
                            f"(threshold: {STALL_TIMEOUT}s). ext_ok={stats['ext_ok']}, "
                            f"dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']}, "
                            f"queue_size={item_queue.qsize()}, dl_alive={dl_thread.is_alive()}")
-                    print(msg, flush=True)
+                    log("FATAL", msg)
                     reporter.report_final(f"FAILED:stall_timeout_{STALL_TIMEOUT}s")
                     upload_logs_to_r2()
                     raise RuntimeError(msg)
@@ -1429,14 +1472,14 @@ def main():
                     panos_done = stats['ext_ok'] // HARDCODED_CONFIG['num_views']
                     pct = int(stats['ext_ok'] / total_views_est * 100) if total_views_est > 0 else 0
                     elapsed_min = elapsed / 60
-                    print(f"[STATS] worker={WORKER_INDEX}/{NUM_WORKERS} | "
+                    log("STATS", f"W{WORKER_INDEX}/{NUM_WORKERS} | "
                           f"views={stats['ext_ok']:,}/{total_views_est:,} ({pct}%) | "
                           f"panos~{panos_done:,}/{total_records:,} | "
-                          f"speed={speed:.1f} views/s | eta={eta/60:.1f}min | "
+                          f"speed={speed:.1f}/s | eta={eta/60:.1f}min | "
                           f"elapsed={elapsed_min:.1f}min | "
-                          f"dl_ok={stats['dl_ok']} | dl_fail={stats['dl_fail']} | "
-                          f"queue={item_queue.qsize()} | avg_batch={avg_batch:.2f}s | "
-                          f"vram={vram_used:.2f}GB | dl_alive={dl_thread.is_alive()}", flush=True)
+                          f"dl_ok={stats['dl_ok']} dl_fail={stats['dl_fail']} | "
+                          f"queue={item_queue.qsize()} | batch={avg_batch:.2f}s | "
+                          f"vram={vram_used:.2f}GB")
                     last_log_time = now
 
                 # ── Fill next batch (extractor.batch_size may shrink after an OOM) ──
@@ -1467,7 +1510,7 @@ def main():
                             if stats['ext_ok'] % 5000 == 0:
                                 gc.collect()
                         except Exception as e:
-                            print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
+                            log("ERROR", f"Batch extraction failed: {type(e).__name__}: {e}")
                             import traceback
                             traceback.print_exc()
                         finally:
@@ -1498,7 +1541,7 @@ def main():
                         if stats['ext_ok'] % 5000 == 0:
                             gc.collect()
                     except Exception as e:
-                        print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
+                        log("ERROR", f"Batch extraction failed: {type(e).__name__}: {e}")
                         import traceback
                         traceback.print_exc()
 
@@ -1507,7 +1550,7 @@ def main():
                 pending_futures = current_futures
 
         except KeyboardInterrupt:
-            print("[WARN] Interrupted", flush=True)
+            log("WARN", "Interrupted")
 
         dl_thread.join()
         final_count = shared_state.write_idx
@@ -1518,7 +1561,7 @@ def main():
         gc.collect()
 
         if final_count == 0 and total_records > 0:
-            print(f"[ERROR] 0 features extracted from {total_records} records! Marking as FAILED.")
+            log("ERROR", f"0 features extracted from {total_records} records! Marking as FAILED.")
             reporter.report_final("FAILED:zero_features_extracted")
             # Clean up empty files
             try:
@@ -1529,18 +1572,18 @@ def main():
             sys.exit(1)
 
         if final_count > 0 and final_count < total_views_est:
-            print(f"[INFO] Truncating features: {total_views_est} → {final_count}")
+            log("INFO", f"Truncating features: {total_views_est} → {final_count}")
             mm = np.lib.format.open_memmap(features_file, mode='r+')
             truncated = mm[:final_count].copy()
             del mm
             np.save(features_file, truncated)
             del truncated
 
-        print(f"[INFO] Extraction complete: {final_count} features extracted")
+        log("INFO", f"Extraction complete: {final_count} features extracted")
 
     # ── Step 4: Upload to R2 ──
     reporter.report_final("UPLOADING")
-    print("[INFO] Uploading features to R2...")
+    log("INFO", "Uploading features to R2...")
 
     npy_key = f"{FEATURES_BUCKET_PREFIX}/{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.npy"
     meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.jsonl"
@@ -1564,25 +1607,25 @@ def main():
                 _last_r2_report[0] = now
 
         for attempt in range(1, max_attempts + 1):
-            print(f"[INFO] Uploading {label} ({file_size / (1024**3):.2f} GB), attempt {attempt}/{max_attempts}...")
+            log("INFO", f"Uploading {label} ({file_size / (1024**3):.2f} GB), attempt {attempt}/{max_attempts}...")
             _upload_start[0] = time.time()
             _last_r2_report[0] = 0.0
             if r2.upload_file(local_path, bucket_key, max_retries=1,
                               progress_callback=_progress_cb):
                 reporter.report_upload(file_size, file_size, 0, 0, label)
                 return True
-            print(f"[WARN] Upload attempt {attempt}/{max_attempts} failed for {bucket_key}")
+            log("WARN", f"Upload attempt {attempt}/{max_attempts} failed for {bucket_key}")
             reporter.report_upload(0, file_size, 0, 0, f"{label}_RETRY")
             if attempt < max_attempts:
                 wait = min(2 ** attempt, 120)
-                print(f"[INFO] Retrying in {wait}s...")
+                log("INFO", f"Retrying in {wait}s...")
                 time.sleep(wait)
 
         # Indefinite retry every 60s — keep reporting so UI doesn't mark stale
         retry_count = 0
         while True:
             retry_count += 1
-            print(f"[WARN] Indefinite retry #{retry_count} for {bucket_key} (every 60s)...")
+            log("WARN", f"Indefinite retry #{retry_count} for {bucket_key} (every 60s)...")
             reporter.report_upload(0, file_size, 0, 0, f"{label}_RETRY")
             _upload_start[0] = time.time()
             _last_r2_report[0] = 0.0
@@ -1602,7 +1645,7 @@ def main():
 
     if success:
         reporter.report_final("COMPLETED")
-        print("[INFO] Upload complete! Self-destructing...")
+        log("INFO", "Upload complete! Self-destructing...")
         # Cleanup local files
         for f in [features_file, metadata_file, failed_file, local_csv]:
             try:
@@ -1613,7 +1656,7 @@ def main():
         self_destruct()
     else:
         reporter.report_final("FAILED:upload")
-        print("[ERROR] Upload failed. Instance kept alive for debugging.")
+        log("ERROR", "Upload failed. Instance kept alive for debugging.")
         upload_logs_to_r2()
         sys.exit(1)
 
@@ -1624,7 +1667,7 @@ if __name__ == '__main__':
         main()
     except Exception as e:
         error_type = type(e).__name__
-        print(f"[CRITICAL] {error_type}: {e}", flush=True)
+        log("CRITICAL", f"{error_type}: {e}")
         import traceback
         traceback.print_exc()
         # Truncate error message for status key (R2 keys have limits)
@@ -1636,5 +1679,5 @@ if __name__ == '__main__':
             reporter = R2StatusReporter(r2, WORKER_INDEX, 0, FEATURES_BUCKET_PREFIX, INSTANCE_ID)
             reporter.report_final(f"FAILED:{short_err}")
         except Exception as r2e:
-            print(f"[CRITICAL] Could not report failure to R2: {r2e}", flush=True)
+            log("CRITICAL", f"Could not report failure to R2: {r2e}")
         sys.exit(1)
