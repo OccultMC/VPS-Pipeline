@@ -824,7 +824,7 @@ def load_csv(csv_path: str) -> Tuple[List[dict], Dict[str, Dict]]:
                 try:
                     lat = float(row.get(col_map['lat'], '').strip())
                     lon = float(row.get(col_map['lon'], '').strip())
-                    metadata[panoid] = {'lat': round(lat, 5), 'lng': round(lon, 5)}
+                    metadata[panoid] = {'lat': round(lat, 6), 'lng': round(lon, 6)}
                 except (ValueError, AttributeError):
                     pass
     return records, metadata
