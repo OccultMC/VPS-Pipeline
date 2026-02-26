@@ -47,6 +47,46 @@ else
     echo "[$(ts)] [ERROR] MegaLoc architecture NOT cached! Rebuild Docker image."
 fi
 
+# ── Pre-flight: verify torch actually imports ──
+echo "[$(ts)] [INFO] Pre-flight: testing PyTorch import..."
+if ! python -c "import torch; assert torch.cuda.is_available(), 'No CUDA'; print(f'OK: PyTorch {torch.__version__}, CUDA {torch.version.cuda}, GPU: {torch.cuda.get_device_name(0)}')" 2>/tmp/torch_check.log; then
+    echo "[$(ts)] [FATAL] PyTorch/CUDA pre-flight FAILED. This machine is broken."
+    cat /tmp/torch_check.log 2>/dev/null
+    echo "[$(ts)] [INFO] Reporting FAILED status to R2 and self-destructing..."
+    python -c "
+import os, json, time
+try:
+    from r2_storage import R2Client
+    r2 = R2Client(os.environ['R2_ACCOUNT_ID'], os.environ['R2_ACCESS_KEY_ID'],
+                   os.environ['R2_SECRET_ACCESS_KEY'], os.environ['R2_BUCKET_NAME'])
+    city = os.environ.get('CITY_NAME', 'Unknown')
+    iid = os.environ.get('INSTANCE_ID', '')
+    if iid:
+        key = f'Status/{city}_{iid}.json'
+    else:
+        widx = os.environ.get('WORKER_INDEX', '0')
+        nw = os.environ.get('NUM_WORKERS', '1')
+        key = f'Status/{city}_worker{widx}.json'
+    r2.upload_json(key, {'s': 'FAILED_PREFLIGHT', 'p': 0, 't': 0, 'eta': 0, 'spd': 0,
+                         'iid': iid, 'ts': time.time()})
+    print(f'Reported FAILED_PREFLIGHT to {key}')
+except Exception as e:
+    print(f'Could not report status: {e}')
+try:
+    import subprocess
+    vast_key = os.environ.get('VAST_API_KEY', '')
+    if vast_key:
+        subprocess.run(['vastai', 'destroy', 'instance', os.environ.get('CONTAINER_ID', ''),
+                        '--api-key', vast_key], timeout=30)
+except Exception:
+    pass
+" 2>&1 || true
+    echo "[$(ts)] [INFO] Container kept alive for debugging. SSH in to investigate."
+    tail -f /dev/null
+    exit 1
+fi
+echo "[$(ts)] [OK] Pre-flight passed"
+
 # Fix for PyTorch 2.x compile (inductor) missing libcuda.so
 echo "[$(ts)] [INFO] Checking for libcuda.so..."
 LIBCUDA_PATH=$(ldconfig -p | grep libcuda.so.1 | head -n 1 | awk '{print $4}')
@@ -73,6 +113,27 @@ EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
     echo "[$(ts)] [ERROR] Pipeline exited with code $EXIT_CODE"
+    # Report FAILED to R2 so the monitor picks it up
+    python -c "
+import os, json, time
+try:
+    from r2_storage import R2Client
+    r2 = R2Client(os.environ['R2_ACCOUNT_ID'], os.environ['R2_ACCESS_KEY_ID'],
+                   os.environ['R2_SECRET_ACCESS_KEY'], os.environ['R2_BUCKET_NAME'])
+    city = os.environ.get('CITY_NAME', 'Unknown')
+    iid = os.environ.get('INSTANCE_ID', '')
+    if iid:
+        key = f'Status/{city}_{iid}.json'
+    else:
+        widx = os.environ.get('WORKER_INDEX', '0')
+        nw = os.environ.get('NUM_WORKERS', '1')
+        key = f'Status/{city}_worker{widx}.json'
+    r2.upload_json(key, {'s': 'FAILED_CRASH', 'p': 0, 't': 0, 'eta': 0, 'spd': 0,
+                         'iid': iid, 'ts': time.time()})
+    print(f'Reported FAILED_CRASH to {key}')
+except Exception as e:
+    print(f'Could not report status: {e}')
+" 2>&1 || true
     echo "[$(ts)] [INFO] Container kept alive for debugging. SSH in to investigate."
     tail -f /dev/null
 fi
