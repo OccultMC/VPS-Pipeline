@@ -16,9 +16,15 @@ RUN pip install --no-cache-dir vastai
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Cache MegaLoc architecture (hubconf.py + model code, ~50MB)
-# This bakes the repo structure so only weights are needed at runtime
+# Cache MegaLoc architecture (hubconf.py + model code)
 RUN python -c "import torch; torch.hub._get_cache_or_reload('gmberton/MegaLoc', force_reload=False, trust_repo=True, calling_fn='load')"
+
+# Download and embed MegaLoc model weights into the image
+# This eliminates runtime model downloads and all fallback logic
+RUN python -c "\
+from huggingface_hub import hf_hub_download; \
+hf_hub_download('gmberton/MegaLoc', 'model.safetensors', local_dir='/app/models/megaloc')" && \
+    ls -lh /app/models/megaloc/model.safetensors
 
 # Application code
 COPY pipeline.py r2_storage.py entrypoint.sh ./

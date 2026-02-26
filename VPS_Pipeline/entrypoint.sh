@@ -32,13 +32,19 @@ if [ -z "${INSTANCE_ID}" ]; then
     echo "[$(ts)] [INFO] INSTANCE_ID not set — pipeline.py will detect via R2"
 fi
 
-# Verify MegaLoc architecture is baked into the image
+# Verify MegaLoc model is baked into the image
+MODEL_FILE="/app/models/megaloc/model.safetensors"
 HUB_CACHE="/root/.cache/torch/hub/gmberton_MegaLoc_main"
+if [ -f "$MODEL_FILE" ]; then
+    MODEL_SIZE=$(du -h "$MODEL_FILE" | cut -f1)
+    echo "[$(ts)] [OK] MegaLoc model baked in: $MODEL_FILE ($MODEL_SIZE)"
+else
+    echo "[$(ts)] [ERROR] MegaLoc model NOT found at $MODEL_FILE! Rebuild Docker image."
+fi
 if [ -d "$HUB_CACHE" ]; then
     echo "[$(ts)] [OK] MegaLoc architecture cached at $HUB_CACHE"
 else
-    echo "[$(ts)] [WARN] MegaLoc architecture NOT cached! Model download may be slower."
-    echo "[$(ts)] [WARN] Rebuild Docker image to bake in architecture."
+    echo "[$(ts)] [ERROR] MegaLoc architecture NOT cached! Rebuild Docker image."
 fi
 
 # Fix for PyTorch 2.x compile (inductor) missing libcuda.so

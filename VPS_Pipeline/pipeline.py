@@ -131,21 +131,26 @@ from r2_storage import R2Client
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class R2StatusReporter:
-    """Uploads compact status JSON to R2 for UI polling."""
+    """Uploads compact status JSON to R2 for UI polling.
+
+    Status key format: Status/{city_name}_{instance_id}.json
+    This flat format avoids location-nested paths and supports
+    multiple sessions scraping the same city concurrently.
+    """
 
     def __init__(self, r2_client, worker_index: int, total: int,
-                 status_prefix: str, instance_id: str = '',
+                 city_name: str, instance_id: str = '',
                  interval: float = 15.0):
         self.r2 = r2_client
         self.worker_index = worker_index
         self.total = total
-        self.status_prefix = status_prefix
+        self.city_name = city_name
         self.instance_id = instance_id
         self.interval = interval
         self.processed = 0
         self.start_time = time.time()
         self._last_report = 0.0
-        self._status_key = f"Status/{status_prefix}/worker_{worker_index}.json"
+        self._status_key = f"Status/{city_name}_{instance_id}.json"
 
     def update(self, processed: int, status: str = "EXTRACTING"):
         self.processed = processed
@@ -288,7 +293,7 @@ class _InitWatchdog:
         # Report failure to R2 before dying
         try:
             r2 = R2Client()
-            status_key = f"Status/{FEATURES_BUCKET_PREFIX}/worker_{WORKER_INDEX}.json"
+            status_key = f"Status/{CITY_NAME}_{INSTANCE_ID}.json"
             r2.upload_json(status_key, {
                 'worker': WORKER_INDEX,
                 'status': f'FAILED:watchdog_timeout_{self.stage}',
@@ -296,10 +301,6 @@ class _InitWatchdog:
                 'timestamp': time.time(),
                 'instance_id': INSTANCE_ID,
             })
-        except Exception:
-            pass
-        try:
-            upload_logs_to_r2()
         except Exception:
             pass
         os._exit(1)
@@ -347,188 +348,45 @@ class GpuExtractor:
             watchdog.cancel()
 
     @staticmethod
-    def _download_model_with_fallback(timeout_sec: int):
-        """Download MegaLoc model with multiple fallback sources.
+    def _load_baked_model():
+        """Load MegaLoc model from weights baked into the Docker image.
 
-        Strategy:
-          1. huggingface_hub — resumable, retries built-in, most reliable
-          2. R2 fallback — download safetensors from R2 bucket if configured
-          3. torch.hub — full download as last resort
+        The Dockerfile downloads model.safetensors from HuggingFace and
+        caches the architecture code via torch.hub during build time.
+        No network access is needed at runtime.
 
         Returns the loaded model (on CPU).
         """
-        errors = []
+        from safetensors.torch import load_file
 
-        # Set HF token for authenticated downloads (higher rate limits)
-        # Token is injected via HF_TOKEN env var in the worker deployment config
-        _hf_token = os.environ.get("HF_TOKEN", "")
-        if _hf_token:
-            os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", _hf_token)
+        model_path = Path('/app/models/megaloc/model.safetensors')
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"MegaLoc model weights not found at {model_path}. "
+                "Rebuild the Docker image to embed the model."
+            )
 
-        # Helper: load state_dict using baked architecture from Docker image
-        def _load_from_state_dict(state_dict_path):
-            """Load model weights using the baked MegaLoc architecture."""
-            from safetensors.torch import load_file
-            state_dict = load_file(state_dict_path)
+        size_mb = model_path.stat().st_size / 1e6
+        log("INIT", f"Loading baked model weights ({size_mb:.1f}MB) from {model_path}")
+        state_dict = load_file(str(model_path))
 
-            hub_dir = Path(torch.hub.get_dir()) / 'gmberton_MegaLoc_main'
-            if not hub_dir.exists():
-                # Try to fetch architecture (should be baked in Docker)
-                log("INIT", "Architecture not cached, fetching from GitHub...")
-                torch.hub._get_cache_or_reload(
-                    "gmberton/MegaLoc", force_reload=False,
-                    trust_repo=True, calling_fn="load"
-                )
+        hub_dir = Path(torch.hub.get_dir()) / 'gmberton_MegaLoc_main'
+        if not hub_dir.exists():
+            raise FileNotFoundError(
+                f"MegaLoc architecture not found at {hub_dir}. "
+                "Rebuild the Docker image to bake it in."
+            )
 
-            if not hub_dir.exists():
-                raise FileNotFoundError(
-                    f"MegaLoc architecture not found at {hub_dir}. "
-                    "Rebuild Docker image to bake it in."
-                )
-
-            sys.path.insert(0, str(hub_dir))
-            try:
-                import importlib
-                hubconf = importlib.import_module('hubconf')
-                model = hubconf.get_trained_model()
-                model.load_state_dict(state_dict, strict=False)
-                return model
-            finally:
-                sys.path.pop(0)
-
-        # ── Source 1: huggingface_hub (resumable, reliable) ──
-        local_model_path = '/tmp/megaloc_model.safetensors'
+        sys.path.insert(0, str(hub_dir))
         try:
-            from huggingface_hub import hf_hub_download
-            log("INIT", "Source 1: huggingface_hub download...")
-
-            def _try_hf_hub():
-                return hf_hub_download(
-                    repo_id="gmberton/MegaLoc",
-                    filename="model.safetensors",
-                    token=_hf_token or None,
-                    local_dir="/tmp/hf_megaloc",
-                    local_dir_use_symlinks=False,
-                )
-
-            downloaded_path = _run_with_timeout(_try_hf_hub, timeout_sec, "model_download_hf_hub")
-            if downloaded_path and os.path.exists(downloaded_path):
-                size_mb = os.path.getsize(downloaded_path) / 1e6
-                log("INIT", f"huggingface_hub download OK ({size_mb:.1f}MB)")
-                model = _load_from_state_dict(downloaded_path)
-                log("INIT", "Model loaded via huggingface_hub + baked architecture")
-                return model
-        except TimeoutError:
-            errors.append(f"huggingface_hub timed out after {timeout_sec}s")
-            log("WARN", f"huggingface_hub timed out after {timeout_sec}s")
-        except Exception as e:
-            errors.append(f"huggingface_hub: {e}")
-            log("WARN", f"huggingface_hub failed: {e}")
-
-        # ── Source 2: R2 fallback ──
-        r2_model_key = os.environ.get(
-            'R2_MODEL_KEY', 'Models/MegaLoc/model.safetensors'
-        )
-
-        try:
-            log("INIT", f"Source 2: R2 fallback ({r2_model_key})...")
-            r2 = R2Client()
-            if r2.download_file(r2_model_key, local_model_path, max_retries=3):
-                size_mb = os.path.getsize(local_model_path) / 1e6
-                log("INIT", f"Downloaded model from R2 ({size_mb:.1f}MB)")
-
-                # Try loading as a full torch checkpoint first,
-                # then as safetensors state_dict
-                model = None
-                try:
-                    loaded = torch.load(local_model_path, map_location='cpu', weights_only=False)
-                    if isinstance(loaded, torch.nn.Module):
-                        model = loaded
-                        log("INIT", "Loaded complete model from R2 (torch checkpoint)")
-                    elif isinstance(loaded, dict):
-                        state_dict = loaded
-                    else:
-                        state_dict = loaded
-                except Exception:
-                    # Try safetensors format
-                    try:
-                        from safetensors.torch import load_file
-                        state_dict = load_file(local_model_path)
-                    except Exception:
-                        state_dict = None
-
-                if model is not None:
-                    return model
-
-                # Have state_dict but need architecture — use baked hub repo
-                if state_dict is not None:
-                    hub_dir = Path(torch.hub.get_dir()) / 'gmberton_MegaLoc_main'
-                    if not hub_dir.exists():
-                        try:
-                            log("INIT", "Downloading model architecture from GitHub...")
-                            torch.hub._get_cache_or_reload(
-                                "gmberton/MegaLoc", force_reload=False,
-                                trust_repo=True, calling_fn="load"
-                            )
-                        except Exception as e2:
-                            errors.append(f"R2 architecture download: {e2}")
-                            log("WARN", f"Could not download architecture: {e2}")
-
-                    if hub_dir.exists():
-                        sys.path.insert(0, str(hub_dir))
-                        try:
-                            import importlib
-                            hubconf = importlib.import_module('hubconf')
-                            model = hubconf.get_trained_model()
-                            model.load_state_dict(state_dict, strict=False)
-                            log("INIT", "Model loaded via R2 state_dict + hub architecture")
-                            return model
-                        except Exception as e2:
-                            errors.append(f"R2 architecture load: {e2}")
-                            log("WARN", f"Hub architecture load failed: {e2}")
-                        finally:
-                            sys.path.pop(0)
-            else:
-                errors.append("R2 model download returned False (file may not exist)")
-                log("WARN", "R2 model file not found or download failed")
-        except Exception as e:
-            errors.append(f"R2 fallback: {e}")
-            log("WARN", f"R2 fallback failed: {e}")
-
-        # ── Source 3: torch.hub (full download, last resort) ──
-        def _try_torch_hub():
-            for attempt in range(1, 4):
-                try:
-                    log("INIT", f"Source 3: torch.hub attempt {attempt}/3...")
-                    return torch.hub.load(
-                        "gmberton/MegaLoc", "get_trained_model", trust_repo=True
-                    )
-                except Exception as e:
-                    log("INIT", f"torch.hub attempt {attempt} failed: {type(e).__name__}: {e}")
-                    errors.append(f"torch.hub#{attempt}: {e}")
-                    if attempt < 3:
-                        time.sleep(2 ** attempt)
-            return None
-
-        try:
-            model = _run_with_timeout(_try_torch_hub, timeout_sec, "model_download_hub")
-            if model is not None:
-                log("INIT", "Model loaded via torch.hub")
-                return model
-        except TimeoutError:
-            errors.append(f"torch.hub timed out after {timeout_sec}s")
-            log("WARN", f"torch.hub timed out after {timeout_sec}s")
-        except Exception as e:
-            errors.append(f"torch.hub: {e}")
-
-        # All sources exhausted
-        raise RuntimeError(
-            f"All model download sources failed after {len(errors)} attempts:\n"
-            + "\n".join(f"  - {err}" for err in errors)
-            + "\n\nTo fix: upload MegaLoc model.safetensors to R2 at "
-            + f"'{r2_model_key}', or ensure outbound network access to "
-            + "github.com and huggingface.co."
-        )
+            import importlib
+            hubconf = importlib.import_module('hubconf')
+            model = hubconf.get_trained_model()
+            model.load_state_dict(state_dict, strict=False)
+            log("INIT", "Model loaded from baked weights + architecture")
+            return model
+        finally:
+            sys.path.pop(0)
 
     def _init_gpu(self, t0: float):
         # ── Step 1: CUDA check ──
@@ -548,10 +406,10 @@ class GpuExtractor:
         torch.set_float32_matmul_precision('high')
         self.device = torch.device('cuda')
 
-        # ── Step 2: Download model ──
-        log("INIT", f"Step 2/5: Downloading MegaLoc model (timeout={GPU_INIT_TIMEOUT}s)...")
+        # ── Step 2: Load baked model ──
+        log("INIT", f"Step 2/5: Loading baked MegaLoc model...")
         dl_start = time.time()
-        model = self._download_model_with_fallback(GPU_INIT_TIMEOUT)
+        model = self._load_baked_model()
         log("INIT", f"Model ready in {time.time() - dl_start:.1f}s")
 
         # ── Step 3: Move to GPU ──
@@ -1000,19 +858,7 @@ def _start_log_capture():
         return None
 
 
-def upload_logs_to_r2():
-    """Upload the captured log file to R2."""
-    try:
-        # Flush before uploading
-        sys.stdout.flush()
-        sys.stderr.flush()
-
-        r2 = R2Client()
-        log_key = f"Logs/{FEATURES_BUCKET_PREFIX}/worker_{WORKER_INDEX}.log"
-        r2.upload_file(LOG_FILE, log_key)
-        log("INFO", f"Uploaded logs to R2: {log_key}")
-    except Exception as e:
-        log("WARN", f"Failed to upload logs to R2: {e}")
+    # Log uploads to R2 removed — logs stay local for SSH debugging
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1022,18 +868,17 @@ def upload_logs_to_r2():
 def _detect_instance_id():
     """Detect this worker's instance ID from R2 (written by the UI at creation time).
 
-    The old approach of `vastai show instances` + `instances[0]` was broken:
-    with multiple workers, ALL of them would pick the same first instance,
-    causing workers to destroy each other instead of themselves.
+    The UI writes a lookup file at Status/_lookup_{CITY}_{WORKER}.{TOTAL}.json
+    containing the instance_id for this specific worker.
     """
-    # Method 1: Read from R2 (reliable — UI writes worker-specific instance ID)
+    # Method 1: Read from R2 flat lookup key
     try:
         r2 = R2Client()
-        key = f"Status/{FEATURES_BUCKET_PREFIX}/worker_{WORKER_INDEX}_instance.json"
+        key = f"Status/_lookup_{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.json"
         data = r2.download_json(key)
         if data and data.get('instance_id'):
             detected = str(data['instance_id'])
-            log("INFO", f"Got INSTANCE_ID from R2: {detected}")
+            log("INFO", f"Got INSTANCE_ID from R2 lookup: {detected}")
             return detected
     except Exception as e:
         log("WARN", f"R2 instance ID lookup failed: {e}")
@@ -1175,7 +1020,7 @@ def check_and_resume(r2, work_dir: Path):
         rows_done: int — number of valid rows to start from
         done_panoids: Set[str] — panoids already processed (for filtering records)
     """
-    status_key = f"Status/{FEATURES_BUCKET_PREFIX}/worker_{WORKER_INDEX}.json"
+    status_key = f"Status/{CITY_NAME}_{INSTANCE_ID}.json"
     features_file = str(work_dir / 'features.npy')
     metadata_file = str(work_dir / 'metadata.jsonl')
     failed_file = str(work_dir / 'failed.jsonl')
@@ -1195,7 +1040,7 @@ def check_and_resume(r2, work_dir: Path):
     # ── Case 1: Already completed → self-destruct ──
     if prev_status == "COMPLETED":
         log("RESUME", "Previous run COMPLETED. Self-destructing...")
-        upload_logs_to_r2()
+
         self_destruct()
         sys.exit(0)
 
@@ -1295,7 +1140,6 @@ def main():
 
     # ── Step 0: Check for prior run & decide resume strategy ──
     r2 = R2Client()
-    status_prefix = FEATURES_BUCKET_PREFIX
 
     # Resolve correct instance ID early (R2 lookup, then env var fallback)
     global INSTANCE_ID
@@ -1314,9 +1158,9 @@ def main():
     log("PRE-CHECK", f"meta key: {meta_key}")
     if r2.file_exists(npy_key) and r2.file_exists(meta_key):
         log("PRE-CHECK", f"✓ Both output files already in R2 — worker {WORKER_INDEX} is DONE.")
-        reporter = R2StatusReporter(r2, WORKER_INDEX, 0, status_prefix, INSTANCE_ID)
+        reporter = R2StatusReporter(r2, WORKER_INDEX, 0, CITY_NAME, INSTANCE_ID)
         reporter.report_final("COMPLETED")
-        upload_logs_to_r2()
+        _cleanup_status(r2)
         self_destruct()
         sys.exit(0)
     else:
@@ -1326,7 +1170,7 @@ def main():
     log("INFO", f"Resume strategy: {resume_strategy}, rows_done: {rows_done}")
 
     # ── Step 1: Download CSV segment from R2 ──
-    reporter = R2StatusReporter(r2, WORKER_INDEX, 0, status_prefix, INSTANCE_ID)
+    reporter = R2StatusReporter(r2, WORKER_INDEX, 0, CITY_NAME, INSTANCE_ID)
     reporter.report_final("DOWNLOADING_CSV")
 
     csv_filename = f"{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.csv"
@@ -1351,7 +1195,7 @@ def main():
     feature_dim = 8448
 
     log("INFO", f"{total_records} panoids, ~{total_views_est} views expected")
-    reporter = R2StatusReporter(r2, WORKER_INDEX, total_views_est, status_prefix, INSTANCE_ID)
+    reporter = R2StatusReporter(r2, WORKER_INDEX, total_views_est, CITY_NAME, INSTANCE_ID)
     reporter.report_final("INITIALIZING")
 
     # ── Step 3: Setup output files ──
@@ -1458,7 +1302,7 @@ def main():
                            f"queue_size={item_queue.qsize()}, dl_alive={dl_thread.is_alive()}")
                     log("FATAL", msg)
                     reporter.report_final(f"FAILED:stall_timeout_{STALL_TIMEOUT}s")
-                    upload_logs_to_r2()
+            
                     raise RuntimeError(msg)
 
                 # ── Periodic status log ──
@@ -1645,20 +1489,35 @@ def main():
 
     if success:
         reporter.report_final("COMPLETED")
-        log("INFO", "Upload complete! Self-destructing...")
+        log("INFO", "Upload complete!")
         # Cleanup local files
         for f in [features_file, metadata_file, failed_file, local_csv]:
             try:
                 os.remove(f)
             except Exception:
                 pass
-        upload_logs_to_r2()
+        # Wait for monitor to pick up COMPLETED, then clean up status
+        log("INFO", "Waiting 30s for monitor to see COMPLETED status...")
+        time.sleep(30)
+        _cleanup_status(r2)
+        log("INFO", "Self-destructing...")
         self_destruct()
     else:
         reporter.report_final("FAILED:upload")
         log("ERROR", "Upload failed. Instance kept alive for debugging.")
-        upload_logs_to_r2()
         sys.exit(1)
+
+
+def _cleanup_status(r2: R2Client):
+    """Delete the status and lookup files from R2 after completion."""
+    status_key = f"Status/{CITY_NAME}_{INSTANCE_ID}.json"
+    lookup_key = f"Status/_lookup_{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.json"
+    for key in [status_key, lookup_key]:
+        try:
+            r2.delete_file(key)
+            log("INFO", f"Cleaned up {key}")
+        except Exception as e:
+            log("WARN", f"Failed to delete {key}: {e}")
 
 
 if __name__ == '__main__':
@@ -1672,11 +1531,10 @@ if __name__ == '__main__':
         traceback.print_exc()
         # Truncate error message for status key (R2 keys have limits)
         short_err = f"{error_type}:{str(e)[:100]}"
-        upload_logs_to_r2()
         # Report failure to R2
         try:
             r2 = R2Client()
-            reporter = R2StatusReporter(r2, WORKER_INDEX, 0, FEATURES_BUCKET_PREFIX, INSTANCE_ID)
+            reporter = R2StatusReporter(r2, WORKER_INDEX, 0, CITY_NAME, INSTANCE_ID)
             reporter.report_final(f"FAILED:{short_err}")
         except Exception as r2e:
             log("CRITICAL", f"Could not report failure to R2: {r2e}")
