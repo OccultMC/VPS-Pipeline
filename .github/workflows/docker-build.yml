@@ -38,6 +38,15 @@ jobs:
         tags: |
           type=raw,value=latest
 
+    - name: Download MegaLoc model weights
+      run: |
+        mkdir -p VPS_Pipeline/models/megaloc
+        curl -fSL --retry 3 \
+          -H "Authorization: Bearer ${{ secrets.HF_TOKEN }}" \
+          "https://huggingface.co/gmberton/MegaLoc/resolve/main/model.safetensors" \
+          -o VPS_Pipeline/models/megaloc/model.safetensors
+        ls -lh VPS_Pipeline/models/megaloc/model.safetensors
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
 
@@ -51,5 +60,3 @@ jobs:
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
-        secrets: |
-          HF_TOKEN=${{ secrets.HF_TOKEN }}
