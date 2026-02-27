@@ -20,10 +20,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "import torch; torch.hub._get_cache_or_reload('gmberton/MegaLoc', force_reload=False, trust_repo=True, calling_fn='load')"
 
 # Download and embed MegaLoc model weights into the image
-# This eliminates runtime model downloads and all fallback logic
-RUN python -c "\
+# Uses BuildKit secret so the HF token never leaks into image layers
+RUN --mount=type=secret,id=HF_TOKEN \
+    python -c "\
+token = open('/run/secrets/HF_TOKEN').read().strip(); \
 from huggingface_hub import hf_hub_download; \
-hf_hub_download('gmberton/MegaLoc', 'model.safetensors', local_dir='/app/models/megaloc')" && \
+hf_hub_download('gmberton/MegaLoc', 'model.safetensors', local_dir='/app/models/megaloc', token=token)" && \
     ls -lh /app/models/megaloc/model.safetensors
 
 # Application code
