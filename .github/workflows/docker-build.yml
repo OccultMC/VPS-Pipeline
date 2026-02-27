@@ -38,13 +38,16 @@ jobs:
         tags: |
           type=raw,value=latest
 
-    - name: Download MegaLoc model weights
+    - name: Download MegaLoc model from R2
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       run: |
         mkdir -p VPS_Pipeline/models/megaloc
-        curl -fSL --retry 3 \
-          -H "Authorization: Bearer ${{ secrets.HF_TOKEN }}" \
-          "https://huggingface.co/gmberton/MegaLoc/resolve/main/model.safetensors" \
-          -o VPS_Pipeline/models/megaloc/model.safetensors
+        aws s3 cp \
+          "s3://streetview-data/Models/MegaLoc/model.safetensors" \
+          VPS_Pipeline/models/megaloc/model.safetensors \
+          --endpoint-url "https://ce06ef4aff61c60c4e503993576b023c.r2.cloudflarestorage.com"
         ls -lh VPS_Pipeline/models/megaloc/model.safetensors
 
     - name: Set up Docker Buildx
