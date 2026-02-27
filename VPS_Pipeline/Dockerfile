@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Cache MegaLoc architecture (hubconf.py + model code)
 RUN python -c "import torch; torch.hub._get_cache_or_reload('gmberton/MegaLoc', force_reload=False, trust_repo=True, calling_fn='load')"
 
-# MegaLoc model weights - downloaded by CI workflow, copied into image
+# MegaLoc model weights - downloaded from R2 by CI workflow, copied into image
 COPY models/megaloc/model.safetensors /app/models/megaloc/model.safetensors
 
 # Application code

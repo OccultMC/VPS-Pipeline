@@ -351,9 +351,8 @@ class GpuExtractor:
     def _load_baked_model():
         """Load MegaLoc model from weights baked into the Docker image.
 
-        The Dockerfile downloads model.safetensors from HuggingFace and
-        caches the architecture code via torch.hub during build time.
-        No network access is needed at runtime.
+        The CI workflow downloads model.safetensors from R2 and the
+        Dockerfile COPYs it in. No network access is needed at runtime.
 
         Returns the loaded model (on CPU).
         """
