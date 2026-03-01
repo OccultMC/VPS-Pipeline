@@ -1,13 +1,41 @@
-.claude/
-.vscode/
-Junk/
-Output/
+# Python
 __pycache__/
-*.pyc
-exports/
-*.log
-.env
-node_modules/
+*.py[cod]
+*.egg-info/
 dist/
 build/
-.ipynb_checkpoints/
+*.egg
+
+# Environment
+.env
+*.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude
+.claude/
+
+# Data / Output (large files)
+Output/
+Global/
+Tools/
+Junk/
+JUNK.zip
+Local_Stages/
+
+# Scraper local data
+Scraper/Code/
+
+# Model weights (downloaded in CI)
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# OS
+Thumbs.db
+.DS_Store

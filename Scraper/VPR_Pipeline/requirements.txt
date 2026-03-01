@@ -1,0 +1,7 @@
+torch==2.5.1
+torchvision==0.20.1
+safetensors==0.4.5
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+aiohttp==3.11.11
+boto3==1.35.81

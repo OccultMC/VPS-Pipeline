@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VPR Scraper</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <!-- deck.gl + dependencies from CDN -->
+    <script src="https://unpkg.com/deck.gl@8.9.35/dist.min.js"></script>
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet">
+</head>
+<body>
+    <div id="app">
+        <!-- Map -->
+        <div id="map-container">
+            <div id="map-canvas"></div>
+            <div class="map-tooltip" id="tooltip"></div>
+        </div>
+
+        <!-- Sidebar -->
+        <div id="sidebar">
+            <div class="sidebar-header">
+                <h1>VPR Scraper</h1>
+                <div class="status-dot" id="ws-status" title="WebSocket"></div>
+            </div>
+
+            <!-- Import -->
+            <div class="section">
+                <div class="section-title">Import Shapes</div>
+                <div class="file-drop" id="file-drop">
+                    <input type="file" id="file-input" accept=".geojson,.json,.shp,.zip">
+                    <div class="file-drop-text">Drop .geojson / .shp here or click</div>
+                </div>
+            </div>
+
+            <!-- Shapes -->
+            <div class="section" id="shapes-section" style="display:none">
+                <div class="section-title">Shapes (<span id="shape-count">0</span>)</div>
+                <div class="shape-list" id="shape-list"></div>
+                <div class="path-field" id="path-field" style="display:none">
+                    <label>Path:</label>
+                    <input type="text" id="path-input" placeholder="US/State/City">
+                    <button class="btn btn-sm btn-primary" id="path-save-btn">Set</button>
+                </div>
+            </div>
+
+            <!-- Tabs -->
+            <div class="tabs">
+                <div class="tab active" data-tab="deploy">VPS Deploy</div>
+                <div class="tab" data-tab="build">Build Index</div>
+                <div class="tab" data-tab="logs">Logs</div>
+            </div>
+
+            <!-- Tab content -->
+            <div class="tab-content">
+                <!-- Deploy tab -->
+                <div class="tab-panel active" id="tab-deploy">
+                    <div class="scrape-overlay" id="scrape-progress">
+                        <h3>Scraping Panoramas</h3>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="scrape-progress-bar" style="width:0%"></div>
+                        </div>
+                        <div class="scrape-stats" id="scrape-stats">Preparing...</div>
+                    </div>
+
+                    <div class="settings-toggle" id="deploy-settings-toggle">
+                        <span>&#9660;</span> Settings
+                    </div>
+                    <div class="settings-panel" id="deploy-settings">
+                        <div class="setting-row">
+                            <label>Workers</label>
+                            <input type="number" id="worker-count" placeholder="auto" min="1" max="50">
+                        </div>
+                        <div class="setting-row">
+                            <label>Image</label>
+                            <input type="text" id="pipeline-image" placeholder="default">
+                        </div>
+                    </div>
+
+                    <button class="btn btn-primary" id="deploy-btn" disabled>Deploy Pipeline</button>
+                    <button class="btn btn-danger" id="cancel-btn" style="display:none;margin-top:8px">Cancel Scrape</button>
+                    <button class="btn btn-danger" id="destroy-btn" style="display:none;margin-top:8px">Destroy All Instances</button>
+                </div>
+
+                <!-- Build tab -->
+                <div class="tab-panel" id="tab-build">
+                    <div class="settings-toggle" id="build-settings-toggle">
+                        <span>&#9660;</span> FAISS Settings
+                    </div>
+                    <div class="settings-panel" id="build-settings">
+                        <div class="setting-row">
+                            <label>Index Type</label>
+                            <select id="index-type">
+                                <option value="PQ" selected>PQ (Product Quantization)</option>
+                                <option value="IVF_PQ">IVF_PQ (IVF + PQ)</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <label>M</label>
+                            <input type="number" id="pq-m" value="256" min="1">
+                        </div>
+                        <div class="setting-row">
+                            <label>nbits</label>
+                            <input type="number" id="pq-nbits" value="8" min="1" max="16">
+                        </div>
+                        <div class="setting-row">
+                            <label>Training</label>
+                            <input type="number" id="training-samples" value="1000000" min="10000">
+                        </div>
+                        <div class="setting-row" id="nlist-row">
+                            <label>nlist</label>
+                            <input type="number" id="nlist" value="0" min="0" placeholder="auto">
+                        </div>
+                        <div class="setting-row">
+                            <label>nprobe</label>
+                            <input type="number" id="nprobe" value="100" min="1">
+                        </div>
+                        <div class="setting-row">
+                            <label>Image</label>
+                            <input type="text" id="builder-image" placeholder="default">
+                        </div>
+                    </div>
+
+                    <button class="btn btn-primary" id="build-btn" disabled>Deploy Builder</button>
+                </div>
+
+                <!-- Logs tab -->
+                <div class="tab-panel" id="tab-logs">
+                    <div id="worker-logs">
+                        <div style="color:var(--text-secondary);font-size:13px;text-align:center;padding:20px">
+                            No workers deployed yet
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status bar -->
+            <div class="status-bar">
+                <span id="status-text">Ready</span>
+                <span id="status-path"></span>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
