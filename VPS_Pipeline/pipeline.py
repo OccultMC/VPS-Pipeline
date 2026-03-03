@@ -891,13 +891,14 @@ def _detect_instance_id():
     causing workers to destroy each other instead of themselves.
     """
     # Method 1: Read from R2 (reliable — UI writes worker-specific instance ID)
+    # The scraper writes: Status/_lookup_{city}_{worker}.{total}.json
     try:
         r2 = R2Client()
-        key = f"Status/{FEATURES_BUCKET_PREFIX}/worker_{WORKER_INDEX}_instance.json"
+        key = f"Status/_lookup_{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.json"
         data = r2.download_json(key)
         if data and data.get('instance_id'):
             detected = str(data['instance_id'])
-            print(f"[INFO] Got INSTANCE_ID from R2: {detected}")
+            print(f"[INFO] Got INSTANCE_ID from R2 lookup ({key}): {detected}")
             return detected
     except Exception as e:
         print(f"[WARN] R2 instance ID lookup failed: {e}")
