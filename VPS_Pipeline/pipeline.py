@@ -339,13 +339,13 @@ GPU_INIT_TIMEOUT = int(os.environ.get('GPU_INIT_TIMEOUT', '300'))  # 5 min defau
 class GpuExtractor:
     def __init__(self):
         t0 = time.time()
-        watchdog = _InitWatchdog(GPU_INIT_TIMEOUT * 2 + 120, "gpu_init_overall")
-        watchdog.start()
+        self._watchdog = _InitWatchdog(GPU_INIT_TIMEOUT * 2 + 120, "gpu_init_overall")
+        self._watchdog.start()
 
         try:
             self._init_gpu(t0)
         finally:
-            watchdog.cancel()
+            self._watchdog.cancel()
 
     @staticmethod
     def _load_baked_model():
@@ -379,10 +379,14 @@ class GpuExtractor:
         sys.path.insert(0, str(hub_dir))
         try:
             import importlib
-            hubconf = importlib.import_module('hubconf')
-            model = hubconf.get_trained_model()
+            # Import MegaLoc class directly — avoids hubconf.get_trained_model()
+            # which calls hf_hub_download() and can stall on cloud instances,
+            # triggering the watchdog timeout.  We already have all weights
+            # in the baked safetensors file so no download is needed.
+            megaloc_module = importlib.import_module('megaloc_model')
+            model = megaloc_module.MegaLoc()
             model.load_state_dict(state_dict, strict=False)
-            log("INIT", "Model loaded from baked weights + architecture")
+            log("INIT", "Model architecture created + baked weights loaded (no download)")
             return model
         finally:
             sys.path.pop(0)
@@ -407,11 +411,23 @@ class GpuExtractor:
 
         # ── Step 2: Load baked model ──
         log("INIT", f"Step 2/5: Loading baked MegaLoc model...")
+        self._watchdog.start("load_baked_model")
         dl_start = time.time()
-        model = self._load_baked_model()
+        try:
+            model = _run_with_timeout(
+                self._load_baked_model,
+                timeout_sec=GPU_INIT_TIMEOUT,
+                stage="load_baked_model"
+            )
+        except TimeoutError:
+            raise RuntimeError(
+                f"Model loading timed out after {GPU_INIT_TIMEOUT}s. "
+                "safetensors load or model construction is hung."
+            )
         log("INIT", f"Model ready in {time.time() - dl_start:.1f}s")
 
         # ── Step 3: Move to GPU ──
+        self._watchdog.start("model_to_cuda")
         log("INIT", f"Step 3/5: Moving model to {self.device}...")
         move_start = time.time()
         try:
@@ -428,6 +444,7 @@ class GpuExtractor:
         log("INIT", f"Model on GPU in {time.time() - move_start:.1f}s")
 
         # ── Step 4: DataParallel / compile ──
+        self._watchdog.start("torch_compile")
         gpu_count = torch.cuda.device_count()
         if gpu_count > 1:
             log("INIT", f"Step 4/5: Wrapping with DataParallel ({gpu_count} GPUs)...")
@@ -451,6 +468,7 @@ class GpuExtractor:
             log("INIT", f"Step 4/5: torch.compile not available (PyTorch < 2.0), skipping")
 
         # ── Step 5: Warmup inference ──
+        self._watchdog.start("warmup_inference")
         log("INIT", f"Step 5/5: Warmup inference...")
         warmup_start = time.time()
         try:
@@ -502,6 +520,7 @@ class GpuExtractor:
         self.executor = ThreadPoolExecutor(max_workers=16)
 
         # ── Step 6: Auto batch size probe ──
+        self._watchdog.start("batch_size_probe")
         log("INIT", f"Step 6/6: Probing optimal batch size via VRAM measurement...")
         self.batch_size = self._probe_max_batch_size()
 
