@@ -1453,7 +1453,9 @@ def main():
     npy_key = f"{FEATURES_BUCKET_PREFIX}/{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.npy"
     meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.jsonl"
 
-    # Upload with progress reporting and indefinite retry for large files
+    # Upload with progress reporting and capped retry for large files
+    MAX_EXTENDED_RETRIES = 30  # ~30 min of extended retries before giving up
+
     def upload_with_retry(local_path, bucket_key, label="FILE", max_attempts=5):
         file_size = os.path.getsize(local_path)
         _last_r2_report = [0.0]
@@ -1486,19 +1488,21 @@ def main():
                 print(f"[INFO] Retrying in {wait}s...")
                 time.sleep(wait)
 
-        # Indefinite retry every 60s — keep reporting so UI doesn't mark stale
-        retry_count = 0
-        while True:
-            retry_count += 1
-            print(f"[WARN] Indefinite retry #{retry_count} for {bucket_key} (every 60s)...")
+        # Extended retry with cap — reset S3 client each round to clear stale connections
+        for retry_count in range(1, MAX_EXTENDED_RETRIES + 1):
+            print(f"[WARN] Extended retry #{retry_count}/{MAX_EXTENDED_RETRIES} for {bucket_key} (60s cooldown)...")
             reporter.report_upload(0, file_size, 0, 0, f"{label}_RETRY")
+            r2.reset_client()
+            time.sleep(60)
             _upload_start[0] = time.time()
             _last_r2_report[0] = 0.0
             if r2.upload_file(local_path, bucket_key, max_retries=1,
                               progress_callback=_progress_cb):
                 reporter.report_upload(file_size, file_size, 0, 0, label)
                 return True
-            time.sleep(60)
+
+        print(f"[ERROR] Upload permanently failed after {max_attempts + MAX_EXTENDED_RETRIES} total attempts for {bucket_key}")
+        return False
 
     success = True
     if os.path.exists(features_file) and os.path.getsize(features_file) > 0:
@@ -1511,19 +1515,18 @@ def main():
     if success:
         reporter.report_final("COMPLETED")
         print("[INFO] Upload complete! Self-destructing...")
-        # Cleanup local files
-        for f in [features_file, metadata_file, failed_file, local_csv]:
-            try:
-                os.remove(f)
-            except Exception:
-                pass
-        upload_logs_to_r2()
-        self_destruct()
     else:
         reporter.report_final("FAILED:upload")
-        print("[ERROR] Upload failed. Instance kept alive for debugging.")
-        upload_logs_to_r2()
-        sys.exit(1)
+        print("[ERROR] Upload failed after all retries. Self-destructing to stop billing.")
+
+    # Cleanup local files
+    for f in [features_file, metadata_file, failed_file, local_csv]:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+    upload_logs_to_r2()
+    self_destruct()
 
 
 if __name__ == '__main__':

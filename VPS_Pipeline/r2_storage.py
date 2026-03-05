@@ -39,26 +39,42 @@ class R2Client:
         if not all([self.account_id, self.access_key_id, self.secret_access_key, self.bucket_name]):
             raise ValueError("Missing R2 credentials")
 
-        endpoint_url = f"https://{self.account_id}.r2.cloudflarestorage.com"
+        self._endpoint_url = f"https://{self.account_id}.r2.cloudflarestorage.com"
+        self.s3 = self._make_client()
 
-        self.s3 = boto3.client(
+    def _make_client(self):
+        """Create a fresh boto3 S3 client (avoids stale connection pool issues)."""
+        return boto3.client(
             "s3",
-            endpoint_url=endpoint_url,
+            endpoint_url=self._endpoint_url,
             aws_access_key_id=self.access_key_id,
             aws_secret_access_key=self.secret_access_key,
             config=Config(
                 retries={"max_attempts": 3, "mode": "adaptive"},
                 s3={"addressing_style": "path"},
-                read_timeout=600,     # 10 min — 100MB chunks at 0.2 MB/s need ~500s
+                read_timeout=120,     # 2 min per chunk — 8MB at 0.1 MB/s = 80s
                 connect_timeout=30,
             ),
             region_name="auto",
         )
 
+    def reset_client(self):
+        """Reset the S3 client to clear stale connections."""
+        self.s3 = self._make_client()
+
     def upload_file(self, local_path: str, bucket_key: str, max_retries: int = 3,
                     progress_callback=None) -> bool:
         local_path = str(local_path)
         file_size = os.path.getsize(local_path)
+
+        # Use smaller chunks and single-threaded upload for files >1GB
+        # to avoid overwhelming flaky connections on rented machines.
+        if file_size > 1 * 1024 * 1024 * 1024:  # >1GB
+            chunk_size = 8 * 1024 * 1024       # 8MB parts
+            concurrency = 1                     # sequential uploads
+        else:
+            chunk_size = 25 * 1024 * 1024       # 25MB parts
+            concurrency = 4
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -71,9 +87,9 @@ class R2Client:
                     callback = _cb
 
                 config = boto3.s3.transfer.TransferConfig(
-                    multipart_threshold=25 * 1024 * 1024,
-                    multipart_chunksize=25 * 1024 * 1024,
-                    max_concurrency=4,
+                    multipart_threshold=chunk_size,
+                    multipart_chunksize=chunk_size,
+                    max_concurrency=concurrency,
                 )
                 self.s3.upload_file(local_path, self.bucket_name, bucket_key,
                                     Callback=callback, Config=config)
@@ -88,6 +104,8 @@ class R2Client:
             except Exception as e:
                 print(f"[R2] Upload attempt {attempt}/{max_retries}: {e}")
                 if attempt < max_retries:
+                    # Reset client to clear stale connections before retry
+                    self.reset_client()
                     time.sleep(2 ** attempt)
 
         return False
