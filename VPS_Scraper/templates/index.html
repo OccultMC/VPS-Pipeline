@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,675 +9,1376 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0a0a0a;
+            color: #ccc;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
         /* Header */
-        .header { background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 100%); padding: 8px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #333; flex-shrink: 0; }
-        .header h1 { font-size: 16px; font-weight: 700; color: #00cc88; letter-spacing: 0.5px; }
-        .header .session-id { font-size: 11px; color: #666; font-family: monospace; }
-        .header .status-bar { font-size: 12px; color: #aaa; max-width: 50%; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .header {
+            background: #000;
+            padding: 8px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #222;
+            flex-shrink: 0;
+        }
+
+        .header h1 {
+            font-size: 16px;
+            font-weight: 700;
+            color: #fff;
+            letter-spacing: 0.5px;
+        }
+
+        .header .session-id {
+            font-size: 11px;
+            color: #555;
+            font-family: monospace;
+        }
+
+        .header .status-bar {
+            font-size: 12px;
+            color: #888;
+            max-width: 50%;
+            text-align: right;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
         /* Main layout */
-        .main { display: flex; flex: 1; overflow: hidden; }
+        .main {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
         /* Map */
-        .map-panel { flex: 3; position: relative; }
-        #map-container { width: 100%; height: 100%; }
-        #map-controls { position: absolute; top: 10px; left: 10px; z-index: 100; background: rgba(20,20,35,0.95); padding: 10px 14px; border-radius: 8px; font-size: 12px; backdrop-filter: blur(8px); border: 1px solid #333; }
-        #map-controls button { background: #0066cc; color: #fff; border: none; padding: 5px 10px; margin: 2px; border-radius: 4px; cursor: pointer; font-size: 11px; transition: background 0.2s; }
-        #map-controls button:hover { background: #0088ff; }
-        #map-controls button.active { background: #ff8800; }
-        .draw-btn { display: none; }
-        .draw-btn.show { display: inline-block; }
-        #draw-status { color: #ffcc00; font-size: 11px; margin-top: 4px; display: none; }
-        #selection-info { position: absolute; bottom: 10px; left: 10px; z-index: 100; background: rgba(0,150,0,0.9); padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; display: none; backdrop-filter: blur(4px); }
-        #tooltip { position: absolute; z-index: 200; pointer-events: none; background: rgba(0,0,0,0.85); padding: 6px 10px; border-radius: 4px; font-size: 12px; display: none; }
+        .map-panel {
+            flex: 3;
+            position: relative;
+        }
+
+        #map-container {
+            width: 100%;
+            height: 100%;
+        }
+
+        #map-controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            background: rgba(0, 0, 0, 0.9);
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 12px;
+            backdrop-filter: blur(8px);
+            border: 1px solid #222;
+        }
+
+        #map-controls button {
+            background: #0066cc;
+            color: #fff;
+            border: none;
+            padding: 5px 10px;
+            margin: 2px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            transition: background 0.2s;
+        }
+
+        #map-controls button:hover {
+            background: #0088ff;
+        }
+
+        #map-controls button.active {
+            background: #ff8800;
+        }
+
+        .draw-btn {
+            display: none;
+        }
+
+        .draw-btn.show {
+            display: inline-block;
+        }
+
+        #draw-status {
+            color: #ffcc00;
+            font-size: 11px;
+            margin-top: 4px;
+            display: none;
+        }
+
+        #selection-info {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            z-index: 100;
+            background: rgba(0, 150, 0, 0.9);
+            padding: 8px 14px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            display: none;
+            backdrop-filter: blur(4px);
+        }
+
+        #tooltip {
+            position: absolute;
+            z-index: 200;
+            pointer-events: none;
+            background: rgba(0, 0, 0, 0.85);
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            display: none;
+        }
+
         /* Control Panel */
-        .control-panel { flex: 1; min-width: 380px; max-width: 420px; overflow-y: auto; padding: 12px; background: #232338; border-left: 1px solid #333; display: flex; flex-direction: column; gap: 10px; }
+        .control-panel {
+            flex: 1;
+            min-width: 380px;
+            max-width: 420px;
+            overflow-y: auto;
+            padding: 12px;
+            background: #000;
+            border-left: 1px solid #222;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
         /* Groups */
-        .group { background: #1e1e30; border: 1px solid #3a3a55; border-radius: 8px; padding: 12px; }
-        .group h3 { font-size: 13px; font-weight: 600; color: #00cc88; margin-bottom: 8px; letter-spacing: 0.3px; }
-        .form-row { display: flex; align-items: center; margin-bottom: 6px; gap: 8px; }
-        .form-row label { font-size: 12px; color: #aaa; min-width: 110px; flex-shrink: 0; }
-        .form-row input, .form-row select { flex: 1; padding: 5px 8px; background: #2a2a45; border: 1px solid #444; border-radius: 4px; color: #eee; font-size: 12px; font-family: inherit; }
-        .form-row input:focus, .form-row select:focus { outline: none; border-color: #00cc88; }
-        .form-row input[type=number] { max-width: 80px; }
-        .form-row input[type=file] { font-size: 11px; }
+        .group {
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 8px;
+            padding: 12px;
+        }
+
+        .group h3 {
+            font-size: 13px;
+            font-weight: 600;
+            color: #ccc;
+            margin-bottom: 8px;
+            letter-spacing: 0.3px;
+        }
+
+        .form-row {
+            display: flex;
+            align-items: center;
+            margin-bottom: 6px;
+            gap: 8px;
+        }
+
+        .form-row label {
+            font-size: 12px;
+            color: #999;
+            min-width: 110px;
+            flex-shrink: 0;
+        }
+
+        .form-row input,
+        .form-row select {
+            flex: 1;
+            padding: 5px 8px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 4px;
+            color: #ddd;
+            font-size: 12px;
+            font-family: inherit;
+        }
+
+        .form-row input:focus,
+        .form-row select:focus {
+            outline: none;
+            border-color: #888;
+        }
+
+        .form-row input[type=number] {
+            max-width: 80px;
+        }
+
+        .form-row input[type=file] {
+            font-size: 11px;
+        }
+
         /* Tabs */
-        .tabs { display: flex; border-bottom: 2px solid #333; margin-bottom: 8px; }
-        .tab-btn { background: none; border: none; color: #888; padding: 6px 14px; cursor: pointer; font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
-        .tab-btn.active { color: #00cc88; border-bottom-color: #00cc88; }
-        .tab-btn:hover { color: #fff; }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
+        .tabs {
+            display: flex;
+            border-bottom: 2px solid #222;
+            margin-bottom: 8px;
+        }
+
+        .tab-btn {
+            background: none;
+            border: none;
+            color: #666;
+            padding: 6px 14px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            transition: all 0.2s;
+        }
+
+        .tab-btn.active {
+            color: #fff;
+            border-bottom-color: #fff;
+        }
+
+        .tab-btn:hover {
+            color: #ccc;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
         /* Buttons */
-        .btn { padding: 10px 16px; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit; }
-        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-        .btn-scrape { background: linear-gradient(135deg, #00aa00, #00cc44); color: #fff; }
-        .btn-scrape:hover:not(:disabled) { background: linear-gradient(135deg, #00cc00, #00ee55); transform: translateY(-1px); }
-        .btn-cancel { background: linear-gradient(135deg, #cc0000, #ee2222); color: #fff; }
-        .btn-cancel:hover:not(:disabled) { background: linear-gradient(135deg, #ee0000, #ff3333); }
-        .btn-deploy { background: linear-gradient(135deg, #0066cc, #0088ff); color: #fff; }
-        .btn-deploy:hover:not(:disabled) { background: linear-gradient(135deg, #0088ff, #00aaff); }
-        .btn-build { background: linear-gradient(135deg, #cc6600, #ff8800); color: #fff; }
-        .btn-build:hover:not(:disabled) { background: linear-gradient(135deg, #ee7700, #ffaa22); }
-        .btn-sm { padding: 5px 10px; font-size: 11px; border-radius: 4px; }
-        .btn-danger { background: #cc0000; color: #fff; }
-        .btn-danger:hover { background: #ee2222; }
-        .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+        .btn {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-family: inherit;
+        }
+
+        .btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .btn-scrape {
+            background: linear-gradient(135deg, #00aa00, #00cc44);
+            color: #fff;
+        }
+
+        .btn-scrape:hover:not(:disabled) {
+            background: linear-gradient(135deg, #00cc00, #00ee55);
+            transform: translateY(-1px);
+        }
+
+        .btn-cancel {
+            background: linear-gradient(135deg, #cc0000, #ee2222);
+            color: #fff;
+        }
+
+        .btn-cancel:hover:not(:disabled) {
+            background: linear-gradient(135deg, #ee0000, #ff3333);
+        }
+
+        .btn-deploy {
+            background: linear-gradient(135deg, #0066cc, #0088ff);
+            color: #fff;
+        }
+
+        .btn-deploy:hover:not(:disabled) {
+            background: linear-gradient(135deg, #0088ff, #00aaff);
+        }
+
+        .btn-build {
+            background: linear-gradient(135deg, #cc6600, #ff8800);
+            color: #fff;
+        }
+
+        .btn-build:hover:not(:disabled) {
+            background: linear-gradient(135deg, #ee7700, #ffaa22);
+        }
+
+        .btn-sm {
+            padding: 5px 10px;
+            font-size: 11px;
+            border-radius: 4px;
+        }
+
+        .btn-danger {
+            background: #cc0000;
+            color: #fff;
+        }
+
+        .btn-danger:hover {
+            background: #ee2222;
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
         /* Progress */
-        .progress-bar { width: 100%; height: 22px; background: #2a2a45; border-radius: 6px; overflow: hidden; border: 1px solid #444; position: relative; }
-        .progress-fill { height: 100%; background: linear-gradient(90deg, #00aa00, #00cc44); transition: width 0.3s ease; border-radius: 5px; }
-        .progress-text { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; }
-        .stat-label { font-size: 12px; color: #888; margin-top: 4px; }
+        .progress-bar {
+            width: 100%;
+            height: 22px;
+            background: #1a1a1a;
+            border-radius: 6px;
+            overflow: hidden;
+            border: 1px solid #333;
+            position: relative;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00aa00, #00cc44);
+            transition: width 0.3s ease;
+            border-radius: 5px;
+        }
+
+        .progress-text {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #777;
+            margin-top: 4px;
+        }
+
         /* Worker Table */
-        .worker-table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 6px; }
-        .worker-table th { background: #2a2a45; padding: 4px 6px; text-align: left; color: #888; font-weight: 500; border-bottom: 1px solid #444; }
-        .worker-table td { padding: 4px 6px; border-bottom: 1px solid #333; }
-        .worker-table tr:hover { background: #2a2a45; }
+        .worker-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+            margin-top: 6px;
+        }
+
+        .worker-table th {
+            background: #1a1a1a;
+            padding: 4px 6px;
+            text-align: left;
+            color: #777;
+            font-weight: 500;
+            border-bottom: 1px solid #333;
+        }
+
+        .worker-table td {
+            padding: 4px 6px;
+            border-bottom: 1px solid #222;
+        }
+
+        .worker-table tr:hover {
+            background: #1a1a1a;
+        }
+
         /* Offer Table */
-        .offer-table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 6px; }
-        .offer-table th { background: #2a2a45; padding: 5px 6px; text-align: left; color: #888; }
-        .offer-table td { padding: 5px 6px; border-bottom: 1px solid #333; cursor: pointer; }
-        .offer-table tr.selected { background: rgba(0,204,136,0.15); }
-        .offer-table tr:hover { background: rgba(255,255,255,0.05); }
+        .offer-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+            margin-top: 6px;
+        }
+
+        .offer-table th {
+            background: #1a1a1a;
+            padding: 5px 6px;
+            text-align: left;
+            color: #777;
+        }
+
+        .offer-table td {
+            padding: 5px 6px;
+            border-bottom: 1px solid #222;
+            cursor: pointer;
+        }
+
+        .offer-table tr.selected {
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        .offer-table tr:hover {
+            background: rgba(255, 255, 255, 0.04);
+        }
+
         /* Modal */
-        .modal-backdrop { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1000; align-items: center; justify-content: center; }
-        .modal-backdrop.show { display: flex; }
-        .modal { background: #232338; border: 1px solid #444; border-radius: 12px; padding: 20px; min-width: 700px; max-width: 90vw; max-height: 80vh; overflow-y: auto; }
-        .modal h2 { font-size: 16px; color: #00cc88; margin-bottom: 12px; }
+        .modal-backdrop {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-backdrop.show {
+            display: flex;
+        }
+
+        .modal {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 12px;
+            padding: 20px;
+            min-width: 700px;
+            max-width: 90vw;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .modal h2 {
+            font-size: 16px;
+            color: #fff;
+            margin-bottom: 12px;
+        }
+
         /* Scrollbar */
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: #1a1a2e; }
-        ::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #555; }
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #0a0a0a;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #333;
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #444;
+        }
+
+        /* Collapsible advanced settings */
+        details.advanced-settings {
+            margin-top: 8px;
+        }
+
+        details.advanced-settings summary {
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            color: #777;
+            padding: 6px 0;
+            list-style: none;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            user-select: none;
+        }
+
+        details.advanced-settings summary::before {
+            content: '\25B6';
+            font-size: 9px;
+            transition: transform 0.2s;
+            color: #555;
+        }
+
+        details.advanced-settings[open] summary::before {
+            transform: rotate(90deg);
+        }
+
+        details.advanced-settings summary::-webkit-details-marker {
+            display: none;
+        }
+
+        details.advanced-settings .advanced-content {
+            padding-top: 8px;
+            border-top: 1px solid #222;
+            margin-top: 4px;
+        }
+
         /* Hidden utility */
-        .hidden { display: none !important; }
+        .hidden {
+            display: none !important;
+        }
+
+        /* Missing Workers Modal */
+        .missing-modal .modal {
+            max-width: 520px;
+        }
+
+        .worker-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin: 6px 0 12px 0;
+        }
+
+        .worker-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 600;
+            font-family: monospace;
+        }
+
+        .worker-badge.complete {
+            background: rgba(0, 200, 0, 0.15);
+            color: #00cc00;
+            border: 1px solid rgba(0, 200, 0, 0.3);
+        }
+
+        .worker-badge.missing {
+            background: rgba(255, 60, 60, 0.15);
+            color: #ff4444;
+            border: 1px solid rgba(255, 60, 60, 0.3);
+        }
+
+        .missing-summary {
+            font-size: 13px;
+            color: #aaa;
+            margin-bottom: 10px;
+            line-height: 1.5;
+        }
+
+        .missing-section-label {
+            font-size: 12px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .missing-section-label.green {
+            color: #00cc00;
+        }
+
+        .missing-section-label.red {
+            color: #ff4444;
+        }
     </style>
 </head>
+
 <body>
 
-<!-- Header -->
-<div class="header">
-    <h1>⬡ VPS Scraper</h1>
-    <span class="session-id" id="session-id">Connecting...</span>
-    <span class="status-bar" id="status-bar">Initializing...</span>
-</div>
-
-<!-- Main -->
-<div class="main">
-    <!-- Map -->
-    <div class="map-panel">
-        <div id="map-container"></div>
-        <div id="map-controls">
-            <div id="shape-count">No shapes loaded</div>
-            <button onclick="selectAll()">Select All</button>
-            <button onclick="clearSelection()">Clear</button>
-            <button id="draw-btn" onclick="toggleDrawing()">Draw</button>
-            <button class="draw-btn" id="finish-btn" onclick="finishDrawing()">Finish</button>
-            <button class="draw-btn" id="cancel-draw-btn" onclick="cancelDrawing()">Cancel</button>
-            <button onclick="deleteSelected()">Delete</button>
-            <div id="draw-status"></div>
-        </div>
-        <div id="selection-info">0 shapes selected</div>
-        <div id="tooltip"></div>
+    <!-- Header -->
+    <div class="header">
+        <h1>VPS Scraper</h1>
+        <span class="session-id" id="session-id">Connecting...</span>
+        <span class="status-bar" id="status-bar">Initializing...</span>
     </div>
 
-    <!-- Control Panel -->
-    <div class="control-panel">
-        <!-- Region -->
-        <div class="group">
-            <h3>📍 Region</h3>
-            <div class="form-row">
-                <label>Shape File</label>
-                <input type="file" id="shape-file" accept=".geojson,.json,.shp">
+    <!-- Main -->
+    <div class="main">
+        <!-- Map -->
+        <div class="map-panel">
+            <div id="map-container"></div>
+            <div id="map-controls">
+                <div id="shape-count">No shapes loaded</div>
+                <button onclick="selectAll()">Select All</button>
+                <button onclick="clearSelection()">Clear</button>
+                <button id="draw-btn" onclick="toggleDrawing()">Draw</button>
+                <button class="draw-btn" id="finish-btn" onclick="finishDrawing()">Finish</button>
+                <button class="draw-btn" id="cancel-draw-btn" onclick="cancelDrawing()">Cancel</button>
+                <button onclick="deleteSelected()">Delete</button>
+                <div id="draw-status"></div>
             </div>
-            <div class="form-row">
-                <label>Max Area (km²)</label>
-                <input type="number" id="max-area" value="10000" min="1" max="100000">
-            </div>
-            <div class="btn-row" style="margin-top:6px">
-                <button class="btn btn-sm btn-deploy" onclick="loadShapeFile()">Load</button>
-                <button class="btn btn-sm btn-danger" onclick="unloadShapes()">Unload</button>
-                <button class="btn btn-sm btn-build" onclick="mergeSelectedShapes()">Merge</button>
-                <button class="btn btn-sm" style="background:#555" onclick="scanProgress()">Scan Progress</button>
-            </div>
+            <div id="selection-info">0 shapes selected</div>
+            <div id="tooltip"></div>
         </div>
 
-        <!-- Settings Tabs -->
-        <div class="group">
-            <div class="tabs">
-                <button class="tab-btn active" onclick="switchTab('vps')">VPS Deploy</button>
-                <button class="tab-btn" onclick="switchTab('index')">Index Build</button>
-            </div>
-            <!-- VPS Deploy Tab -->
-            <div class="tab-content active" id="tab-vps">
-                <div class="form-row"><label>R2 Account ID</label><input type="text" id="r2-account"></div>
-                <div class="form-row"><label>R2 Access Key</label><input type="text" id="r2-access"></div>
-                <div class="form-row"><label>R2 Secret Key</label><input type="password" id="r2-secret"></div>
-                <div class="form-row"><label>R2 Bucket</label><input type="text" id="r2-bucket"></div>
-                <div class="form-row"><label>Vast.ai API Key</label><input type="password" id="vast-key"></div>
-                <div class="form-row"><label>Region Path</label><input type="text" id="region-path" placeholder="e.g. US/Florida/Florida"></div>
-                <div class="form-row"><label>Workers</label><input type="number" id="num-workers" value="10" min="1" max="100"></div>
-                <div class="form-row"><label>Docker Image</label><input type="text" id="docker-image" value="ghcr.io/occultmc/geoaxisimage:latest"></div>
-                <div class="form-row"><label>GPU Type</label><input type="text" id="gpu-type" placeholder="e.g. RTX_4090"></div>
-                <div class="form-row"><label>Min VRAM (GB)</label><input type="number" id="min-vram" value="21" min="1"></div>
-                <div class="form-row"><label>Max $/hr</label><input type="number" id="max-price" value="0.5" step="0.01" min="0.01"></div>
-                <div class="form-row"><label>Geo Filter</label><input type="text" id="geo-filter" placeholder="US, CA"></div>
-                <div class="form-row"><label>Disk (GB)</label><input type="number" id="disk-gb" value="100" min="10"></div>
-            </div>
-            <!-- Index Build Tab -->
-            <div class="tab-content" id="tab-index">
-                <div class="form-row"><label>Builder Image</label><input type="text" id="builder-image" value="ghcr.io/occultmc/geoaxisbuilder:latest"></div>
-                <div class="form-row"><label>Max $/hr</label><input type="number" id="builder-max-price" value="2.0" step="0.1" min="0.1"></div>
-                <div class="form-row"><label>Disk (GB)</label><input type="number" id="builder-disk" value="500" min="100"></div>
-                <div class="form-row"><label>Index Type</label>
-                    <select id="index-type"><option>IVF_PQ</option><option>IVF_FLAT</option><option>FLAT</option></select>
+        <!-- Control Panel -->
+        <div class="control-panel">
+            <!-- Region -->
+            <div class="group">
+                <h3>Region</h3>
+                <div class="form-row">
+                    <label>Shape File</label>
+                    <input type="file" id="shape-file" accept=".geojson,.json,.shp">
                 </div>
-                <div class="form-row"><label>nlist</label><input type="number" id="nlist" value="4096"></div>
-                <div class="form-row"><label>M</label><input type="number" id="m-param" value="64"></div>
-                <div class="form-row"><label>nbits</label><input type="number" id="nbits" value="8"></div>
-                <div class="form-row"><label>Train Samples</label><input type="number" id="train-samples" value="500000"></div>
-                <div class="form-row"><label>niter</label><input type="number" id="niter" value="25"></div>
-                <div class="form-row"><label>Path Override</label><input type="text" id="builder-path" placeholder="e.g. US/Florida/Florida"></div>
+                <div class="form-row">
+                    <label>Max Area (km²)</label>
+                    <input type="number" id="max-area" value="10000" min="1" max="100000">
+                </div>
+                <div class="btn-row" style="margin-top:6px">
+                    <button class="btn btn-sm btn-deploy" onclick="loadShapeFile()">Load</button>
+                    <button class="btn btn-sm btn-danger" onclick="unloadShapes()">Unload</button>
+                    <button class="btn btn-sm btn-build" onclick="mergeSelectedShapes()">Merge</button>
+                    <button class="btn btn-sm" style="background:#555" onclick="scanProgress()">Scan Progress</button>
+                </div>
+            </div>
+
+            <!-- Settings Tabs -->
+            <div class="group">
+                <div class="tabs">
+                    <button class="tab-btn active" onclick="switchTab('vps')">VPS Deploy</button>
+                    <button class="tab-btn" onclick="switchTab('index')">Index Build</button>
+                </div>
+                <!-- VPS Deploy Tab -->
+                <div class="tab-content active" id="tab-vps">
+                    <div class="form-row"><label>Region Path</label><input type="text" id="region-path"
+                            placeholder="e.g. US/Florida/Florida"></div>
+                    <div class="form-row"><label>Max $/hr</label><input type="number" id="max-price" value="0.2"
+                            step="0.01" min="0.01"></div>
+                    <details class="advanced-settings">
+                        <summary>Advanced Settings</summary>
+                        <div class="advanced-content">
+                            <div class="form-row"><label>R2 Account ID</label><input type="text" id="r2-account"></div>
+                            <div class="form-row"><label>R2 Access Key</label><input type="text" id="r2-access"></div>
+                            <div class="form-row"><label>R2 Secret Key</label><input type="password" id="r2-secret">
+                            </div>
+                            <div class="form-row"><label>R2 Bucket</label><input type="text" id="r2-bucket"></div>
+                            <div class="form-row"><label>Vast.ai API Key</label><input type="password" id="vast-key">
+                            </div>
+                            <div class="form-row"><label>Workers</label><input type="number" id="num-workers" value="10"
+                                    min="1" max="100"></div>
+                            <div class="form-row"><label>Docker Image</label><input type="text" id="docker-image"
+                                    value="ghcr.io/occultmc/geoaxisimage:latest"></div>
+                            <div class="form-row"><label>GPU Type</label><input type="text" id="gpu-type"
+                                    placeholder="e.g. RTX_4090"></div>
+                            <div class="form-row"><label>Min VRAM (GB)</label><input type="number" id="min-vram"
+                                    value="21" min="1"></div>
+                            <div class="form-row"><label>Geo Filter</label><input type="text" id="geo-filter"
+                                    value="US,CA" placeholder="US, CA"></div>
+                            <div class="form-row"><label>Disk (GB)</label><input type="number" id="disk-gb" value="100"
+                                    min="10"></div>
+                        </div>
+                    </details>
+                </div>
+                <!-- Index Build Tab -->
+                <div class="tab-content" id="tab-index">
+                    <div class="form-row"><label>Builder Image</label><input type="text" id="builder-image"
+                            value="ghcr.io/occultmc/indbuilder:latest"></div>
+                    <div class="form-row"><label>Max $/hr</label><input type="number" id="builder-max-price" value="0.5"
+                            step="0.1" min="0.1"></div>
+                    <div class="form-row"><label>Disk (GB)</label><input type="number" id="builder-disk" value="700"
+                            min="100"></div>
+                    <div class="form-row"><label>Index Type</label>
+                        <select id="index-type">
+                            <option value="pq" selected>pq</option>
+                            <option value="ivfpq">ivfpq</option>
+                        </select>
+                    </div>
+                    <div class="form-row"><label>nlist</label><input type="number" id="nlist" value="4096"></div>
+                    <div class="form-row"><label>M</label><input type="number" id="m-param" value="256"></div>
+                    <div class="form-row"><label>nbits</label><input type="number" id="nbits" value="8"></div>
+                    <div class="form-row"><label>Train Samples</label><input type="number" id="train-samples"
+                            value="1000000"></div>
+                    <div class="form-row"><label>niter</label><input type="number" id="niter" value="100"></div>
+                    <div class="form-row"><label>Path Override</label><input type="text" id="builder-path"
+                            placeholder="e.g. US/Florida/Florida"></div>
+                </div>
+            </div>
+
+            <!-- Progress -->
+            <div class="group">
+                <h3>Progress</h3>
+                <div id="status-label" class="stat-label">Ready</div>
+                <div class="progress-bar" style="margin-top:6px">
+                    <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+                    <div class="progress-text" id="progress-text">0%</div>
+                </div>
+                <div id="pano-count" class="stat-label" style="margin-top:4px">Panoramas: 0 | Images: 0</div>
+                <div id="speed-label" class="stat-label">Speed: -- found/s | -- panos/s | -- views/s</div>
+            </div>
+
+            <!-- Buttons -->
+            <div class="btn-row">
+                <button class="btn btn-scrape" id="btn-scrape" onclick="startScraping()">Start Scraping</button>
+                <button class="btn btn-cancel" id="btn-cancel" onclick="cancelScraping()" disabled>Cancel</button>
+                <button class="btn btn-deploy" id="btn-deploy" onclick="startVPSDeploy()">Deploy to VPS</button>
+                <button class="btn btn-build" id="btn-build" onclick="startIndexBuild()">Build Index</button>
+            </div>
+
+            <!-- VPS Workers (hidden initially) -->
+            <div class="group hidden" id="vps-workers-group">
+                <h3>VPS Workers</h3>
+                <div class="progress-bar" style="margin-bottom:6px">
+                    <div class="progress-fill" id="vps-progress-fill" style="width:0%"></div>
+                    <div class="progress-text" id="vps-progress-text">0%</div>
+                </div>
+                <div id="vps-status" class="stat-label">No VPS deployment active</div>
+                <table class="worker-table" id="worker-table">
+                    <thead>
+                        <tr>
+                            <th>Worker</th>
+                            <th>Status</th>
+                            <th>Progress</th>
+                            <th>Speed</th>
+                            <th>ETA</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+                <div class="btn-row" style="margin-top:8px">
+                    <button class="btn btn-sm btn-danger" onclick="destroyAll()">Destroy All</button>
+                </div>
+            </div>
+
+            <!-- Builder Progress (hidden initially) -->
+            <div class="group hidden" id="builder-group">
+                <h3>Index Builder</h3>
+                <div id="builder-status" class="stat-label">No builder active</div>
+                <div class="progress-bar" style="margin-top:4px">
+                    <div class="progress-fill" id="builder-progress-fill" style="width:0%"></div>
+                    <div class="progress-text" id="builder-progress-text">0%</div>
+                </div>
+                <div id="builder-step" class="stat-label"></div>
             </div>
         </div>
+    </div>
 
-        <!-- Progress -->
-        <div class="group">
-            <h3>📊 Progress</h3>
-            <div id="status-label" class="stat-label">Ready</div>
-            <div class="progress-bar" style="margin-top:6px">
-                <div class="progress-fill" id="progress-fill" style="width:0%"></div>
-                <div class="progress-text" id="progress-text">0%</div>
-            </div>
-            <div id="pano-count" class="stat-label" style="margin-top:4px">Panoramas: 0 | Images: 0</div>
-            <div id="speed-label" class="stat-label">Speed: -- found/s | -- panos/s | -- views/s</div>
-        </div>
-
-        <!-- Buttons -->
-        <div class="btn-row">
-            <button class="btn btn-scrape" id="btn-scrape" onclick="startScraping()">Start Scraping</button>
-            <button class="btn btn-cancel" id="btn-cancel" onclick="cancelScraping()" disabled>Cancel</button>
-            <button class="btn btn-deploy" id="btn-deploy" onclick="startVPSDeploy()">Deploy to VPS</button>
-            <button class="btn btn-build" id="btn-build" onclick="startIndexBuild()">Build Index</button>
-        </div>
-
-        <!-- VPS Workers (hidden initially) -->
-        <div class="group hidden" id="vps-workers-group">
-            <h3>🖥️ VPS Workers</h3>
-            <div class="progress-bar" style="margin-bottom:6px">
-                <div class="progress-fill" id="vps-progress-fill" style="width:0%"></div>
-                <div class="progress-text" id="vps-progress-text">0%</div>
-            </div>
-            <div id="vps-status" class="stat-label">No VPS deployment active</div>
-            <table class="worker-table" id="worker-table">
-                <thead><tr><th>Worker</th><th>Status</th><th>Progress</th><th>Speed</th><th>ETA</th></tr></thead>
+    <!-- Offer Selection Modal -->
+    <div class="modal-backdrop" id="offer-modal">
+        <div class="modal">
+            <h2 id="offer-modal-title">Select Vast.ai Offers</h2>
+            <div id="offer-selection-label" style="font-weight:600;margin-bottom:8px;color:#888">Selected: 0 / 0</div>
+            <table class="offer-table" id="offer-table">
+                <thead>
+                    <tr>
+                        <th>GPU</th>
+                        <th>VRAM</th>
+                        <th>CPU</th>
+                        <th>RAM</th>
+                        <th>Disk</th>
+                        <th>$/hr</th>
+                        <th>↓Mbps</th>
+                        <th>Rel.</th>
+                        <th>Region</th>
+                    </tr>
+                </thead>
                 <tbody></tbody>
             </table>
-            <div class="btn-row" style="margin-top:8px">
-                <button class="btn btn-sm btn-danger" onclick="destroyAll()">Destroy All</button>
+            <div class="btn-row" style="margin-top:12px;justify-content:flex-end">
+                <button class="btn btn-sm" style="background:#555" onclick="closeOfferModal()">Cancel</button>
+                <button class="btn btn-sm btn-scrape" id="offer-ok-btn" onclick="confirmOfferSelection()"
+                    disabled>OK</button>
             </div>
         </div>
+    </div>
 
-        <!-- Builder Progress (hidden initially) -->
-        <div class="group hidden" id="builder-group">
-            <h3>🏗️ Index Builder</h3>
-            <div id="builder-status" class="stat-label">No builder active</div>
-            <div class="progress-bar" style="margin-top:4px">
-                <div class="progress-fill" id="builder-progress-fill" style="width:0%"></div>
-                <div class="progress-text" id="builder-progress-text">0%</div>
+    <!-- Missing Workers Modal -->
+    <div class="modal-backdrop missing-modal" id="missing-modal">
+        <div class="modal">
+            <h2>Partial Features Detected</h2>
+            <div class="missing-summary" id="missing-summary"></div>
+            <div id="missing-complete-section">
+                <div class="missing-section-label green">✓ Complete</div>
+                <div class="worker-list" id="missing-complete-list"></div>
             </div>
-            <div id="builder-step" class="stat-label"></div>
+            <div id="missing-missing-section">
+                <div class="missing-section-label red">✗ Missing</div>
+                <div class="worker-list" id="missing-missing-list"></div>
+            </div>
+            <div class="btn-row" style="margin-top:14px;justify-content:flex-end;gap:8px">
+                <button class="btn btn-sm" style="background:#555" onclick="closeMissingModal()">Cancel</button>
+                <button class="btn btn-sm btn-danger" id="missing-rerun-btn" onclick="missingModalRerunAll()">Re-run
+                    All</button>
+                <button class="btn btn-sm btn-scrape" id="missing-deploy-btn"
+                    onclick="missingModalDeployMissing()">Deploy Missing</button>
+            </div>
         </div>
     </div>
-</div>
 
-<!-- Offer Selection Modal -->
-<div class="modal-backdrop" id="offer-modal">
-    <div class="modal">
-        <h2 id="offer-modal-title">Select Vast.ai Offers</h2>
-        <div id="offer-selection-label" style="font-weight:600;margin-bottom:8px;color:#888">Selected: 0 / 0</div>
-        <table class="offer-table" id="offer-table">
-            <thead><tr><th>GPU</th><th>VRAM</th><th>CPU</th><th>RAM</th><th>Disk</th><th>$/hr</th><th>↓Mbps</th><th>Rel.</th><th>Region</th></tr></thead>
-            <tbody></tbody>
-        </table>
-        <div class="btn-row" style="margin-top:12px;justify-content:flex-end">
-            <button class="btn btn-sm" style="background:#555" onclick="closeOfferModal()">Cancel</button>
-            <button class="btn btn-sm btn-scrape" id="offer-ok-btn" onclick="confirmOfferSelection()" disabled>OK</button>
-        </div>
-    </div>
-</div>
+    <script>
+        // ═══════════════════════════════════════════════════════════════════
+        // State
+        // ═══════════════════════════════════════════════════════════════════
+        let sessionId = null;
+        let socket = null;
+        let allShapes = [];
+        let selectedIndices = new Set();
+        let scrapedPoints = [];
+        let deckgl = null;
+        let isDrawing = false;
+        let drawingCoords = [];
+        let drawnShapeCount = 0;
+        let drawRevision = 0;
+        let mainShapes = [];
+        let isIntersectionMode = false;
+        let pointsByPanoid = {};
+        let dataRevision = 0;
+        let showPoints = false;
+        let selectionRevision = 0;
+        let currentViewState = { longitude: -98.5795, latitude: 39.8283, zoom: 3, pitch: 0, bearing: 0 };
+        let _lastFound = 0, _lastImages = 0;
 
-<script>
-// ═══════════════════════════════════════════════════════════════════
-// State
-// ═══════════════════════════════════════════════════════════════════
-let sessionId = null;
-let socket = null;
-let allShapes = [];
-let selectedIndices = new Set();
-let scrapedPoints = [];
-let deckgl = null;
-let isDrawing = false;
-let drawingCoords = [];
-let drawnShapeCount = 0;
-let drawRevision = 0;
-let mainShapes = [];
-let isIntersectionMode = false;
-let lastBinZoom = -1;
-let hexBinCache = [];
-let pointsByPanoid = {};
-let dataRevision = 0;
-let selectionRevision = 0;
-let currentViewState = { longitude: -98.5795, latitude: 39.8283, zoom: 3, pitch: 0, bearing: 0 };
-let _lastFound = 0, _lastImages = 0;
+        // Offer modal state
+        let _offerResolve = null;
+        let _offerOffers = [];
+        let _offerNumNeeded = 0;
+        let _offerSelected = new Set();
 
-// Offer modal state
-let _offerResolve = null;
-let _offerOffers = [];
-let _offerNumNeeded = 0;
-let _offerSelected = new Set();
+        // ═══════════════════════════════════════════════════════════════════
+        // Socket.IO
+        // ═══════════════════════════════════════════════════════════════════
+        socket = io();
+        socket.on('session_init', (data) => {
+            // Reuse existing session ID across reconnects so background work isn't lost
+            const existingId = sessionStorage.getItem('vps_session_id');
+            const isReconnect = !!existingId;
+            sessionId = existingId || data.session_id;
+            sessionStorage.setItem('vps_session_id', sessionId);
+            socket.emit('register_session', { session_id: sessionId });
+            document.getElementById('session-id').textContent = 'Session: ' + sessionId.substring(0, 8);
+            setStatus('Ready — Session active');
 
-// ═══════════════════════════════════════════════════════════════════
-// Socket.IO
-// ═══════════════════════════════════════════════════════════════════
-socket = io();
-socket.on('session_init', (data) => {
-    sessionId = data.session_id;
-    socket.emit('register_session', { session_id: sessionId });
-    document.getElementById('session-id').textContent = 'Session: ' + sessionId.substring(0, 8);
-    setStatus('Ready — Session active');
+            // Load env defaults
+            fetch('/api/env-defaults').then(r => r.json()).then(d => {
+                if (d.r2_account) document.getElementById('r2-account').value = d.r2_account;
+                if (d.r2_access) document.getElementById('r2-access').value = d.r2_access;
+                if (d.r2_secret) document.getElementById('r2-secret').value = d.r2_secret;
+                if (d.r2_bucket) document.getElementById('r2-bucket').value = d.r2_bucket;
+                if (d.vast_key) document.getElementById('vast-key').value = d.vast_key;
+            });
 
-    // Load env defaults
-    fetch('/api/env-defaults').then(r=>r.json()).then(d => {
-        if (d.r2_account) document.getElementById('r2-account').value = d.r2_account;
-        if (d.r2_access) document.getElementById('r2-access').value = d.r2_access;
-        if (d.r2_secret) document.getElementById('r2-secret').value = d.r2_secret;
-        if (d.r2_bucket) document.getElementById('r2-bucket').value = d.r2_bucket;
-        if (d.vast_key) document.getElementById('vast-key').value = d.vast_key;
-    });
-});
-socket.on('scrape_progress', d => { setProgress(d.total > 0 ? (d.current/d.total*100) : 0); });
-socket.on('scrape_status', d => { document.getElementById('status-label').textContent = d.message; });
-socket.on('point_found', d => { addPoint(d.lat, d.lon, d.panoid); });
-socket.on('point_completed', d => { markCompleted(d.panoid); });
-socket.on('scrape_stats', d => {
-    const foundSpd = d.found - _lastFound; const imgSpd = d.images - _lastImages;
-    _lastFound = d.found; _lastImages = d.images;
-    const panoSpd = (imgSpd / 6).toFixed(1);
-    document.getElementById('speed-label').textContent = `Speed: ${foundSpd} found/s | ${panoSpd} panos/s | ${imgSpd} views/s`;
-    if (d.p2_total > 0) {
-        document.getElementById('pano-count').textContent = `Found: ${d.found} | Downloading: ${d.p2_done}/${d.p2_total} panos | Views: ${d.images}`;
-        setProgress(d.p2_done / d.p2_total * 100);
-    } else {
-        document.getElementById('pano-count').textContent = `Found: ${d.found} | Written: ${d.written} | Views: ${d.images}`;
-        if (d.total_tiles > 0) setProgress(d.tiles / d.total_tiles * 100);
-    }
-});
-socket.on('scrape_finished', d => {
-    setStatus(`Complete! ${d.total_written} panoramas, ${d.total_images} views`);
-    toggleControls(true); flushPoints();
-});
-socket.on('scrape_error', d => { setStatus('Error: ' + d.error); toggleControls(true); });
-// VPS events
-socket.on('vps_status', d => { setStatus(d.message); });
-socket.on('vps_geocode_done', d => { setStatus(`VPS: ${d.country}/${d.state}/${d.city}`); });
-socket.on('vps_r2_checked', d => {
-    if (d.segment_count > 0) {
-        const completed = new Set(d.completed);
-        const all = Array.from({length: d.segment_count}, (_, i) => i + 1);
-        const missing = all.filter(i => !completed.has(i));
-        if (missing.length === 0) { setStatus(`All ${d.segment_count} workers complete. Nothing to deploy.`); toggleControls(true); return; }
-        setStatus(`R2: ${d.segment_count} CSVs, ${d.completed.length} complete, ${missing.length} missing`);
-        // Auto provision missing
-        searchOffers();
-    } else {
-        setStatus('No CSVs in R2 — starting fresh scrape...');
-    }
-});
-socket.on('vps_offers_found', d => { showOfferModal(d.offers, parseInt(document.getElementById('num-workers').value) || 1, 'deploy'); });
-socket.on('vps_instances_created', d => {
-    const map = d.instance_worker_map;
-    showWorkerTable(map);
-    setStatus(`${Object.keys(map).length} instances running. Starting monitoring...`);
-    fetch('/api/start-monitoring', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ session_id: sessionId, instance_worker_map: map })
-    });
-});
-socket.on('vps_worker_progress', d => { updateWorkerRow(d.worker_idx, d); });
-socket.on('vps_worker_finished', d => {
-    const tr = document.querySelector(`#worker-table tbody tr[data-worker="${d.worker_idx}"]`);
-    if (tr) { tr.querySelector('.w-status').textContent = d.status; tr.querySelector('.w-status').style.color = d.status === 'COMPLETED' ? '#00cc00' : '#cc0000'; }
-});
-socket.on('vps_log', d => { setStatus('VPS: ' + d.message); });
-socket.on('vps_error', d => { setStatus('VPS Error: ' + d.error); toggleControls(true); });
-// Builder events
-socket.on('builder_offers_found', d => { showOfferModal(d.offers, 1, 'builder'); });
-socket.on('builder_progress', d => {
-    document.getElementById('builder-group').classList.remove('hidden');
-    document.getElementById('builder-status').textContent = `${d.status} — ${d.step}`;
-    document.getElementById('builder-step').textContent = d.detail;
-    setBuilderProgress(d.pct);
-});
-socket.on('builder_finished', d => { document.getElementById('builder-status').textContent = d.status === 'COMPLETED' ? 'Index built!' : 'Builder failed'; document.getElementById('btn-build').disabled = false; });
-socket.on('builder_error', d => { setStatus('Builder Error: ' + d.error); document.getElementById('btn-build').disabled = false; });
-socket.on('scan_complete', d => { if (d.done_indices.length > 0) setShapesDone(d.done_indices); setStatus(`Scan: ${d.done_indices.length} completed regions`); });
-
-// ═══════════════════════════════════════════════════════════════════
-// UI Helpers
-// ═══════════════════════════════════════════════════════════════════
-function setStatus(msg) { document.getElementById('status-bar').textContent = msg; }
-function setProgress(pct) { pct = Math.min(100, Math.max(0, pct)); document.getElementById('progress-fill').style.width = pct+'%'; document.getElementById('progress-text').textContent = Math.floor(pct)+'%'; }
-function setBuilderProgress(pct) { document.getElementById('builder-progress-fill').style.width = pct+'%'; document.getElementById('builder-progress-text').textContent = pct+'%'; }
-function switchTab(name) {
-    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
-    event.target.classList.add('active');
-    document.getElementById('tab-'+name).classList.add('active');
-}
-function toggleControls(enabled) {
-    document.getElementById('btn-scrape').disabled = !enabled;
-    document.getElementById('btn-cancel').disabled = enabled;
-    document.getElementById('btn-deploy').disabled = !enabled;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// DeckGL Map (ported from ui.py DeckGLMapView)
-// ═══════════════════════════════════════════════════════════════════
-function getHexSize(zoom) { return 180 / Math.pow(2, zoom + 3); }
-function hexVertices(cx, cy, size) {
-    const s = size * 0.92; const latScale = 1 / Math.cos(cy * Math.PI / 180); const v = [];
-    for (let i = 0; i < 6; i++) { const a = Math.PI / 3 * i - Math.PI / 6; v.push([cx + s * Math.cos(a) * latScale, cy + s * Math.sin(a)]); }
-    return v;
-}
-function rebinHexagons() {
-    const zoom = Math.floor(currentViewState.zoom);
-    if (zoom === lastBinZoom) return; lastBinZoom = zoom;
-    if (scrapedPoints.length === 0) { hexBinCache = []; return; }
-    const size = getHexSize(zoom); const rowH = size*1.5; const colW = size*2; const bins = new Map();
-    for (let i = 0; i < scrapedPoints.length; i++) {
-        const p = scrapedPoints[i]; const row = Math.round(p.lat/rowH); const isOdd = ((row%2)+2)%2===1;
-        const col = Math.round((p.lon-(isOdd?size:0))/colW); const key = col*131071+row;
-        let bin = bins.get(key); if (!bin) { bin = {cLon:col*colW+(isOdd?size:0),cLat:row*rowH,n:0,c:0}; bins.set(key,bin); }
-        bin.n++; if (p.completed) bin.c++;
-    }
-    hexBinCache = []; let mx=1; for (const b of bins.values()) if(b.n>mx) mx=b.n;
-    for (const b of bins.values()) hexBinCache.push({polygon:hexVertices(b.cLon,b.cLat,size),count:b.n,completed:b.c,norm:b.n/mx});
-}
-function initDeckGL() {
-    deckgl = new deck.DeckGL({
-        container: 'map-container', initialViewState: currentViewState, controller: true,
-        onViewStateChange: ({viewState}) => {
-            const oldZ = Math.floor(currentViewState.zoom); currentViewState = viewState;
-            if (Math.floor(viewState.zoom) !== oldZ && scrapedPoints.length > 0) { lastBinZoom=-1; updateLayers(); }
-            return viewState;
-        },
-        layers: [new deck.TileLayer({id:'base-map',data:'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png',minZoom:0,maxZoom:19,tileSize:256,renderSubLayers:p=>{const{bbox:{west,south,east,north}}=p.tile;return new deck.BitmapLayer(p,{data:null,image:p.data,bounds:[west,south,east,north]});}})],
-        onClick: handleClick, onHover: handleHover
-    });
-}
-function handleClick(info) {
-    if (isDrawing) { if (info.coordinate) { drawingCoords.push([info.coordinate[0],info.coordinate[1]]); drawRevision++; const ds=document.getElementById('draw-status'); ds.textContent=drawingCoords.length+' vertices'+(drawingCoords.length<3?' (need 3+)':''); updateLayers(); } return; }
-    if (!info.object || info.layer.id==='base-map' || info.layer.id==='main-outlines') return;
-    const idx = info.object.index; if (idx===undefined) return;
-    if (selectedIndices.has(idx)) selectedIndices.delete(idx); else selectedIndices.add(idx);
-    selectionRevision++; updateLayers(); updateSelectionInfo();
-}
-function handleHover(info) {
-    const tt = document.getElementById('tooltip');
-    if (info.object && info.layer.id!=='base-map') { const p=info.object.properties||{}; const l=p.city||p.name||p.NAME||'Shape'; const a=p.area_sqkm?p.area_sqkm.toFixed(1)+' km²':''; tt.innerHTML='<b>'+l+'</b>'+(a?'<br>Area: '+a:''); tt.style.display='block'; tt.style.left=(info.x+10)+'px'; tt.style.top=(info.y+10)+'px'; }
-    else tt.style.display='none';
-}
-function updateLayers() {
-    if (!deckgl) return;
-    const layers = [new deck.TileLayer({id:'base-map',data:'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png',minZoom:0,maxZoom:19,tileSize:256,renderSubLayers:p=>{const{bbox:{west,south,east,north}}=p.tile;return new deck.BitmapLayer(p,{data:null,image:p.data,bounds:[west,south,east,north]});}})];
-    if (allShapes.length > 0) {
-        layers.push(new deck.PolygonLayer({id:'shapes',data:allShapes,getPolygon:d=>d.coordinates,
-            getFillColor:d=>{if(selectedIndices.has(d.index))return[0,255,0,150];if(d.properties.done)return[255,0,0,150];return[0,100,255,100];},
-            getLineColor:d=>{if(selectedIndices.has(d.index))return[0,255,0,255];if(d.properties.done)return[255,0,0,255];return[0,150,255,200];},
-            lineWidthMinPixels:2,pickable:true,filled:true,stroked:true,
-            updateTriggers:{getFillColor:[selectionRevision,dataRevision],getLineColor:[selectionRevision,dataRevision]}
-        }));
-    }
-    if (isIntersectionMode && mainShapes.length > 0) {
-        layers.push(new deck.PolygonLayer({id:'main-outlines',data:mainShapes,getPolygon:d=>d.coordinates,getFillColor:[0,0,0,0],getLineColor:[255,255,255,200],lineWidthMinPixels:3,filled:true,stroked:true,pickable:false}));
-    }
-    if (scrapedPoints.length > 0) {
-        rebinHexagons();
-        layers.push(new deck.PolygonLayer({id:'hex-coverage',data:hexBinCache,getPolygon:d=>d.polygon,
-            getFillColor:d=>{const a=Math.floor(60+d.norm*195);if(d.completed>d.count*0.5)return[255,140,0,a];return[30,144,255,a];},
-            getLineColor:[255,255,255,30],lineWidthMinPixels:0.5,filled:true,stroked:true,pickable:false,
-            updateTriggers:{getFillColor:dataRevision,getPolygon:lastBinZoom}
-        }));
-    }
-    if (isDrawing && drawingCoords.length > 0) {
-        if (drawingCoords.length >= 2) layers.push(new deck.PathLayer({id:'drawing-line',data:[{path:[...drawingCoords,drawingCoords[0]]}],getPath:d=>d.path,getColor:[255,200,0,220],widthMinPixels:2,getDashArray:[6,4],dashJustified:true,extensions:[new deck.PathStyleExtension({dash:true})],updateTriggers:{getPath:drawRevision}}));
-        layers.push(new deck.ScatterplotLayer({id:'drawing-vertices',data:drawingCoords.map((c,i)=>({pos:c,i})),getPosition:d=>d.pos,getFillColor:[255,200,0,255],getRadius:200,radiusMinPixels:5,radiusMaxPixels:8,pickable:false,updateTriggers:{getPosition:drawRevision}}));
-    }
-    deckgl.setProps({ layers });
-}
-function updateSelectionInfo() { const el=document.getElementById('selection-info'); const n=selectedIndices.size; if(n>0){el.style.display='block';el.textContent=n+' shape(s) selected';}else el.style.display='none'; }
-function calculateAreaSqKm(coords) {
-    if(!coords||coords.length<3) return 0; const toRad=Math.PI/180; const R=6371; let t=0;
-    for(let i=0;i<coords.length;i++){const j=(i+1)%coords.length;t+=(coords[j][0]-coords[i][0])*toRad*(2+Math.sin(coords[i][1]*toRad)+Math.sin(coords[j][1]*toRad));}
-    return Math.abs(t*R*R/2);
-}
-function loadShapesFromGeoJSON(geojsonData, maxArea) {
-    allShapes=[]; selectedIndices.clear(); if(typeof geojsonData==='string') geojsonData=JSON.parse(geojsonData);
-    if(!geojsonData.features) return; let loaded=0, pruned=0;
-    geojsonData.features.forEach(f=>{
-        if(!f.geometry) return; let sets=[];
-        try{if(f.geometry.type==='MultiPolygon') f.geometry.coordinates.forEach(p=>{if(p&&p[0])sets.push(p[0]);});
-        else if(f.geometry.type==='Polygon'&&f.geometry.coordinates&&f.geometry.coordinates[0]) sets.push(f.geometry.coordinates[0]);}catch(e){return;}
-        sets.forEach(raw=>{
-            if(!raw||raw.length<3) return; const coords=[];
-            for(let i=0;i<raw.length;i++){const c=raw[i];if(c&&c.length>=2){const lng=parseFloat(c[0]),lat=parseFloat(c[1]);if(!isNaN(lng)&&!isNaN(lat)&&lng>=-180&&lng<=180&&lat>=-90&&lat<=90)coords.push([lng,lat]);}}
-            if(coords.length<3) return; const a=calculateAreaSqKm(coords); if(a>maxArea){pruned++;return;} loaded++;
-            allShapes.push({index:allShapes.length,coordinates:coords,properties:{...f.properties,area_sqkm:a},pruned:false});
+            // On reconnect, check job state and only show offers if actually awaiting selection
+            if (isReconnect) {
+                fetch('/api/job-state', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId })
+                }).then(r => r.json()).then(state => {
+                    if (state.job_state === 'awaiting_offer_selection') {
+                        fetch('/api/pending-offers', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ session_id: sessionId })
+                        }).then(r => r.json()).then(d => {
+                            if (d.offers && d.offers.length > 0) {
+                                _vpsWorkerIndices = d.worker_indices || [];
+                                _vpsTotalWorkers = d.total_workers || _vpsWorkerIndices.length;
+                                showOfferModal(d.offers, _vpsWorkerIndices.length, 'deploy');
+                            }
+                        });
+                    } else if (state.job_state === 'scraping') {
+                        setStatus('Reconnected — scraping in progress');
+                    } else if (state.job_state === 'monitoring') {
+                        setStatus('Reconnected — monitoring workers');
+                    } else if (state.job_state === 'creating_instances') {
+                        setStatus('Reconnected — creating instances');
+                    }
+                });
+            }
         });
-    });
-    document.getElementById('shape-count').textContent = loaded+' shapes'+(pruned>0?' ('+pruned+' pruned)':'');
-    mainShapes=allShapes.map(s=>({...s})); isIntersectionMode=false; updateLayers();
-    if(allShapes.length>0) fitToBounds();
-}
-function fitToBounds() {
-    if(allShapes.length===0) return; let mnLng=180,mxLng=-180,mnLat=90,mxLat=-90;
-    allShapes.forEach(s=>s.coordinates.forEach(c=>{if(c[0]<mnLng)mnLng=c[0];if(c[0]>mxLng)mxLng=c[0];if(c[1]<mnLat)mnLat=c[1];if(c[1]>mxLat)mxLat=c[1];}));
-    const d=Math.max(mxLng-mnLng,mxLat-mnLat); let z=d<0.5?10:d<1?8:d<5?6:d<20?4:d<50?3:2;
-    currentViewState={longitude:(mnLng+mxLng)/2,latitude:(mnLat+mxLat)/2,zoom:z,pitch:0,bearing:0,transitionDuration:1000};
-    deckgl.setProps({initialViewState:currentViewState});
-}
-function selectAll(){selectedIndices.clear();allShapes.forEach(s=>selectedIndices.add(s.index));selectionRevision++;updateLayers();updateSelectionInfo();}
-function clearSelection(){selectedIndices.clear();selectionRevision++;updateLayers();updateSelectionInfo();}
-function getSelectedCoords(){const c=[];selectedIndices.forEach(i=>{const s=allShapes[i];if(s)c.push(s.coordinates.map(p=>[p[1],p[0]]));});return c;}
-function addPoint(lat,lon,panoid){scrapedPoints.push({lat,lon,panoid,completed:false});pointsByPanoid[panoid]=scrapedPoints.length-1;dataRevision++;lastBinZoom=-1;updateLayers();}
-function markCompleted(panoid){const i=pointsByPanoid[panoid];if(i!==undefined&&scrapedPoints[i])scrapedPoints[i].completed=true;dataRevision++;lastBinZoom=-1;updateLayers();}
-function flushPoints(){dataRevision++;lastBinZoom=-1;updateLayers();}
-function clearPoints(){scrapedPoints=[];pointsByPanoid={};hexBinCache=[];lastBinZoom=-1;updateLayers();}
-function unloadShapes(){allShapes=[];mainShapes=[];isIntersectionMode=false;selectedIndices.clear();selectionRevision++;document.getElementById('shape-count').textContent='No shapes loaded';updateLayers();updateSelectionInfo();}
-function setShapesDone(indices){indices.forEach(i=>{if(allShapes[i])allShapes[i].properties.done=true;});dataRevision++;updateLayers();}
-function toggleDrawing(){if(isDrawing){cancelDrawing();return;}isDrawing=true;drawingCoords=[];drawRevision++;document.getElementById('draw-btn').classList.add('active');document.getElementById('finish-btn').classList.add('show');document.getElementById('cancel-draw-btn').classList.add('show');const ds=document.getElementById('draw-status');ds.style.display='block';ds.textContent='Click map to place vertices';updateLayers();}
-function finishDrawing(){if(drawingCoords.length<3){document.getElementById('draw-status').textContent='Need 3+ vertices!';return;}const coords=[...drawingCoords];const a=calculateAreaSqKm(coords);drawnShapeCount++;const ni=allShapes.length;allShapes.push({index:ni,coordinates:coords,properties:{name:'Drawn Shape '+drawnShapeCount,area_sqkm:a,drawn:true},pruned:false});selectedIndices.add(ni);selectionRevision++;isDrawing=false;drawingCoords=[];document.getElementById('draw-btn').classList.remove('active');document.getElementById('finish-btn').classList.remove('show');document.getElementById('cancel-draw-btn').classList.remove('show');document.getElementById('draw-status').style.display='none';document.getElementById('shape-count').textContent=allShapes.length+' shapes';updateLayers();updateSelectionInfo();}
-function cancelDrawing(){isDrawing=false;drawingCoords=[];drawRevision++;document.getElementById('draw-btn').classList.remove('active');document.getElementById('finish-btn').classList.remove('show');document.getElementById('cancel-draw-btn').classList.remove('show');document.getElementById('draw-status').style.display='none';updateLayers();}
-function deleteSelected(){if(selectedIndices.size===0)return;allShapes=allShapes.filter(s=>!selectedIndices.has(s.index));allShapes.forEach((s,i)=>s.index=i);selectedIndices.clear();selectionRevision++;document.getElementById('shape-count').textContent=allShapes.length>0?allShapes.length+' shapes':'No shapes loaded';updateLayers();updateSelectionInfo();}
-
-// ═══════════════════════════════════════════════════════════════════
-// Actions
-// ═══════════════════════════════════════════════════════════════════
-function loadShapeFile() {
-    const input = document.getElementById('shape-file');
-    if (!input.files.length) { setStatus('Select a file first'); return; }
-    const fd = new FormData();
-    fd.append('file', input.files[0]);
-    fd.append('session_id', sessionId);
-    fd.append('max_area', document.getElementById('max-area').value);
-    fetch('/api/load-shapes', { method: 'POST', body: fd })
-        .then(r => r.json()).then(d => {
-            if (d.error) { setStatus('Error: ' + d.error); return; }
-            loadShapesFromGeoJSON(d.geojson, parseFloat(document.getElementById('max-area').value));
-            setStatus('Loaded shapes from ' + d.filename);
-            setTimeout(()=>scanProgress(), 1000);
+        socket.on('scrape_progress', d => { setProgress(d.total > 0 ? (d.current / d.total * 100) : 0); });
+        socket.on('scrape_status', d => { document.getElementById('status-label').textContent = d.message; });
+        socket.on('point_found', d => { addPoint(d.lat, d.lon, d.panoid); });
+        socket.on('point_completed', d => { markCompleted(d.panoid); });
+        socket.on('scrape_stats', d => {
+            const foundSpd = d.found - _lastFound; const imgSpd = d.images - _lastImages;
+            _lastFound = d.found; _lastImages = d.images;
+            const panoSpd = (imgSpd / 6).toFixed(1);
+            document.getElementById('speed-label').textContent = `Speed: ${foundSpd} found/s | ${panoSpd} panos/s | ${imgSpd} views/s`;
+            if (d.p2_total > 0) {
+                document.getElementById('pano-count').textContent = `Found: ${d.found} | Downloading: ${d.p2_done}/${d.p2_total} panos | Views: ${d.images}`;
+                setProgress(d.p2_done / d.p2_total * 100);
+            } else {
+                document.getElementById('pano-count').textContent = `Found: ${d.found} | Written: ${d.written} | Views: ${d.images}`;
+                if (d.total_tiles > 0) setProgress(d.tiles / d.total_tiles * 100);
+            }
         });
-}
-function startScraping() {
-    const coords = getSelectedCoords();
-    if (coords.length === 0) { setStatus('Select at least one shape!'); return; }
-    clearPoints(); toggleControls(false); _lastFound=0; _lastImages=0;
-    fetch('/api/start-scrape', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ session_id: sessionId, selected_coords: coords })
-    }).then(r => r.json()).then(d => { if (d.error) { setStatus('Error: ' + d.error); toggleControls(true); } else setStatus('Scraping...'); });
-}
-function cancelScraping() {
-    fetch('/api/cancel-scrape', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ session_id: sessionId }) })
-        .then(()=> { setStatus('Cancelled'); toggleControls(true); flushPoints(); });
-}
-function startVPSDeploy() {
-    const coords = getSelectedCoords();
-    if (coords.length === 0) { setStatus('Select shapes first'); return; }
-    toggleControls(false);
-    fetch('/api/deploy-vps', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({
-            session_id: sessionId, selected_coords: coords,
-            r2_account: document.getElementById('r2-account').value,
-            r2_access: document.getElementById('r2-access').value,
-            r2_secret: document.getElementById('r2-secret').value,
-            r2_bucket: document.getElementById('r2-bucket').value,
-            vast_key: document.getElementById('vast-key').value,
-            region_path: document.getElementById('region-path').value,
-            num_workers: parseInt(document.getElementById('num-workers').value),
-            docker_image: document.getElementById('docker-image').value,
-            gpu_type: document.getElementById('gpu-type').value,
-            min_vram_gb: parseInt(document.getElementById('min-vram').value),
-            max_price: parseFloat(document.getElementById('max-price').value),
-            geo_filter: document.getElementById('geo-filter').value,
-            disk_gb: parseInt(document.getElementById('disk-gb').value),
-        })
-    }).then(r=>r.json()).then(d => { if (d.error) { setStatus('Error: ' + d.error); toggleControls(true); } });
-}
-function searchOffers() {
-    fetch('/api/search-offers', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ session_id: sessionId, vast_key: document.getElementById('vast-key').value,
-            gpu_type: document.getElementById('gpu-type').value, disk_gb: parseInt(document.getElementById('disk-gb').value),
-            max_price: parseFloat(document.getElementById('max-price').value), min_vram_gb: parseInt(document.getElementById('min-vram').value),
-            geo_filter: document.getElementById('geo-filter').value })
-    });
-}
-function startIndexBuild() {
-    document.getElementById('btn-build').disabled = true;
-    fetch('/api/build-index', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ session_id: sessionId, vast_key: document.getElementById('vast-key').value,
-            max_price: parseFloat(document.getElementById('builder-max-price').value),
-            min_disk: parseInt(document.getElementById('builder-disk').value) })
-    }).then(r=>r.json()).then(d => { if (d.error) { setStatus('Error: ' + d.error); document.getElementById('btn-build').disabled = false; } });
-}
-function mergeSelectedShapes() {
-    const sel = []; selectedIndices.forEach(i => { const s = allShapes[i]; if (s) sel.push(s.coordinates.map(c=>[c[1],c[0]])); });
-    if (sel.length !== 2) { setStatus('Select exactly 2 shapes to merge'); return; }
-    fetch('/api/merge-shapes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ coords_list: sel }) })
-        .then(r=>r.json()).then(d => {
-            if (d.error) { setStatus('Error: ' + d.error); return; }
-            // Remove old selected, add merged
-            allShapes = allShapes.filter(s => !selectedIndices.has(s.index));
-            const ni = allShapes.length;
-            allShapes.push({index:ni,coordinates:d.merged_coords,properties:{name:'Merged',area_sqkm:calculateAreaSqKm(d.merged_coords)},pruned:false});
-            allShapes.forEach((s,i) => s.index=i);
-            selectedIndices.clear(); selectedIndices.add(ni); selectionRevision++;
-            document.getElementById('shape-count').textContent = allShapes.length+' shapes';
-            updateLayers(); updateSelectionInfo(); setStatus('Merged 2 shapes into 1');
+        socket.on('scrape_finished', d => {
+            setStatus(`Complete! ${d.total_written} panoramas, ${d.total_images} views`);
+            document.getElementById('pano-count').textContent = `Panoramas: ${d.total_written.toLocaleString()} | Views: ${d.total_images.toLocaleString()}`;
+            setProgress(100);
+            toggleControls(true); flushPoints();
         });
-}
-function scanProgress() {
-    fetch('/api/scan-progress', { method: 'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ session_id: sessionId, shapes_data: allShapes,
-            r2_config: { account: document.getElementById('r2-account').value, access: document.getElementById('r2-access').value,
-                secret: document.getElementById('r2-secret').value, bucket: document.getElementById('r2-bucket').value }})
-    }).then(()=> setStatus('Scanning...'));
-}
-function destroyAll() {
-    if (!confirm('Destroy ALL running instances?')) return;
-    fetch('/api/destroy-all', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ session_id: sessionId }) })
-        .then(r=>r.json()).then(d => { setStatus(`Destroyed ${d.count} instances`); toggleControls(true); });
-}
-
-// Worker table
-function showWorkerTable(map) {
-    document.getElementById('vps-workers-group').classList.remove('hidden');
-    const tbody = document.querySelector('#worker-table tbody'); tbody.innerHTML = '';
-    for (const [iid, widx] of Object.entries(map).sort((a,b) => a[1]-b[1])) {
-        const tr = document.createElement('tr'); tr.dataset.worker = widx;
-        tr.innerHTML = `<td>#${widx}</td><td class="w-status" style="color:#aaa">Starting...</td><td class="w-progress">—</td><td class="w-speed">—</td><td class="w-eta">—</td>`;
-        tbody.appendChild(tr);
-    }
-}
-function updateWorkerRow(widx, d) {
-    const tr = document.querySelector(`#worker-table tbody tr[data-worker="${widx}"]`);
-    if (!tr) return;
-    const pct = d.total > 0 ? Math.floor(d.processed/d.total*100) : 0;
-    tr.querySelector('.w-status').textContent = d.status;
-    tr.querySelector('.w-status').style.color = d.status==='COMPLETED'?'#00cc00':d.status.startsWith('FAIL')?'#ff4444':'#00aaff';
-    tr.querySelector('.w-progress').textContent = `${pct}% (${d.processed.toLocaleString()}/${d.total.toLocaleString()})`;
-    tr.querySelector('.w-speed').textContent = d.speed > 0 ? d.speed.toFixed(1)+'/s' : '—';
-    const eta = d.eta; tr.querySelector('.w-eta').textContent = eta > 3600 ? Math.floor(eta/3600)+'h'+Math.floor((eta%3600)/60)+'m' : eta > 0 ? Math.floor(eta/60)+'m'+Math.floor(eta%60)+'s' : '—';
-    // Update overall bar
-    const rows = document.querySelectorAll('#worker-table tbody tr');
-    let tp=0, tt=0; rows.forEach(r=>{ const t=r.querySelector('.w-progress').textContent; const m=t.match(/(\d[\d,]*)\/([\d,]+)/); if(m){tp+=parseInt(m[1].replace(/,/g,''));tt+=parseInt(m[2].replace(/,/g,''));} });
-    if(tt>0){const p=tp/tt*100;document.getElementById('vps-progress-fill').style.width=p+'%';document.getElementById('vps-progress-text').textContent=Math.floor(p)+'%';}
-}
-
-// Offer modal
-function showOfferModal(offers, numNeeded, mode) {
-    _offerOffers = offers; _offerNumNeeded = numNeeded; _offerSelected = new Set();
-    document.getElementById('offer-modal-title').textContent = mode==='builder' ? 'Select Builder Instance' : `Select Vast.ai Offers (${numNeeded} needed)`;
-    document.getElementById('offer-selection-label').textContent = `Selected: 0 / ${numNeeded}`;
-    document.getElementById('offer-ok-btn').disabled = true;
-    document.getElementById('offer-ok-btn').dataset.mode = mode;
-    const tbody = document.querySelector('#offer-table tbody'); tbody.innerHTML = '';
-    offers.forEach((o, i) => {
-        const tr = document.createElement('tr'); tr.dataset.idx = i;
-        tr.innerHTML = `<td>${o.num_gpus}x ${o.gpu_name}</td><td>${(o.gpu_ram/1024).toFixed(0)}</td><td>${o.cpu_name||'?'}</td><td>${((o.ram||0)/1024).toFixed(0)}</td><td>${(o.disk||0).toFixed(0)}</td><td>$${(o.price_per_hr||0).toFixed(3)}</td><td>${(o.inet_down||0).toFixed(0)}</td><td>${((o.reliability||0)*100).toFixed(0)}%</td><td>${o.location||'?'}</td>`;
-        tr.onclick = () => toggleOfferRow(i, tr);
-        tbody.appendChild(tr);
-    });
-    document.getElementById('offer-modal').classList.add('show');
-}
-function toggleOfferRow(idx, tr) {
-    if (_offerSelected.has(idx)) { _offerSelected.delete(idx); tr.classList.remove('selected'); }
-    else if (_offerSelected.size < _offerNumNeeded) { _offerSelected.add(idx); tr.classList.add('selected'); }
-    document.getElementById('offer-selection-label').textContent = `Selected: ${_offerSelected.size} / ${_offerNumNeeded}`;
-    document.getElementById('offer-ok-btn').disabled = _offerSelected.size !== _offerNumNeeded;
-}
-function closeOfferModal() { document.getElementById('offer-modal').classList.remove('show'); toggleControls(true); }
-function confirmOfferSelection() {
-    const mode = document.getElementById('offer-ok-btn').dataset.mode;
-    const selected = Array.from(_offerSelected).map(i => _offerOffers[i]);
-    document.getElementById('offer-modal').classList.remove('show');
-    if (mode === 'deploy') {
-        const numWorkers = parseInt(document.getElementById('num-workers').value);
-        const indices = Array.from({length: numWorkers}, (_, i) => i + 1);
-        fetch('/api/create-instances', { method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ session_id: sessionId, selected_offers: selected, worker_indices: indices, total_workers: numWorkers })
+        socket.on('scrape_error', d => { setStatus('Error: ' + d.error); toggleControls(true); });
+        // VPS events
+        socket.on('vps_status', d => { setStatus(d.message); });
+        socket.on('vps_geocode_done', d => { setStatus(`VPS: ${d.country}/${d.state}/${d.city}`); });
+        // Store R2 scan results for the missing-workers modal
+        let _r2SegmentCount = 0;
+        let _r2Completed = [];
+        let _r2Missing = [];
+        socket.on('vps_r2_checked', d => {
+            if (d.segment_count > 0) {
+                const completed = new Set(d.completed);
+                const all = Array.from({ length: d.segment_count }, (_, i) => i + 1);
+                const missing = all.filter(i => !completed.has(i));
+                _r2SegmentCount = d.segment_count;
+                _r2Completed = d.completed;
+                _r2Missing = missing;
+                if (missing.length === 0) {
+                    setStatus(`All ${d.segment_count} workers complete. Nothing to deploy.`);
+                    toggleControls(true);
+                    return;
+                }
+                if (d.completed.length > 0) {
+                    // Some done, some missing — show dialog
+                    showMissingWorkersModal(d.segment_count, d.completed, missing);
+                } else {
+                    // No features yet — deploy all workers directly
+                    setStatus(`${d.segment_count} CSVs, 0 complete — deploying all...`);
+                    _vpsWorkerIndices = all;
+                    _vpsTotalWorkers = d.segment_count;
+                    searchOffers(all, d.segment_count);
+                }
+            } else {
+                setStatus('No CSVs in R2 — starting fresh scrape + upload...');
+                fetch('/api/vps-scrape-upload', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId })
+                }).then(r => r.json()).then(d => {
+                    if (d.error) { setStatus('Error: ' + d.error); toggleControls(true); }
+                });
+            }
         });
-    } else if (mode === 'builder') {
-        fetch('/api/create-builder', { method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ session_id: sessionId, offer: selected[0],
-                r2_account: document.getElementById('r2-account').value, r2_access: document.getElementById('r2-access').value,
-                r2_secret: document.getElementById('r2-secret').value, r2_bucket: document.getElementById('r2-bucket').value,
-                vast_key: document.getElementById('vast-key').value,
-                builder_image: document.getElementById('builder-image').value, disk_gb: parseInt(document.getElementById('builder-disk').value),
-                path_override: document.getElementById('builder-path').value,
-                index_type: document.getElementById('index-type').value, nlist: parseInt(document.getElementById('nlist').value),
-                m: parseInt(document.getElementById('m-param').value), nbits: parseInt(document.getElementById('nbits').value),
-                train_samples: parseInt(document.getElementById('train-samples').value), niter: parseInt(document.getElementById('niter').value) })
+        socket.on('vps_scrape_progress', d => {
+            if (d.total > 0) setProgress(d.current / d.total * 100);
         });
-    }
-}
+        // Store server-provided worker metadata so confirmOfferSelection can use them
+        let _vpsWorkerIndices = [];
+        let _vpsTotalWorkers = 0;
+        socket.on('vps_offers_found', d => {
+            _vpsWorkerIndices = d.worker_indices || Array.from({ length: parseInt(document.getElementById('num-workers').value) }, (_, i) => i + 1);
+            _vpsTotalWorkers = d.total_workers || _vpsWorkerIndices.length;
+            showOfferModal(d.offers, _vpsWorkerIndices.length, 'deploy');
+        });
+        socket.on('vps_creation_started', d => {
+            // Show all planned workers immediately with CREATING status
+            showWorkerTableAll(d.worker_indices);
+            setStatus(`Creating ${d.worker_indices.length} instances...`);
+        });
+        socket.on('vps_worker_created', d => {
+            // Update individual worker row when instance is created
+            const tr = document.querySelector(`#worker-table tbody tr[data-worker="${d.worker_idx}"]`);
+            if (tr) { tr.querySelector('.w-status').textContent = 'STARTING'; tr.querySelector('.w-status').style.color = '#888'; }
+        });
+        socket.on('vps_worker_create_failed', d => {
+            const tr = document.querySelector(`#worker-table tbody tr[data-worker="${d.worker_idx}"]`);
+            if (tr) { tr.querySelector('.w-status').textContent = 'FAILED'; tr.querySelector('.w-status').style.color = '#ff4444'; tr.querySelector('.w-progress').textContent = d.message || 'All retries exhausted'; }
+        });
+        socket.on('vps_instances_created', d => {
+            const ok = Object.keys(d.instance_worker_map).length;
+            const total = d.total_workers || ok;
+            const failed = total - ok;
+            setStatus(`${ok}/${total} instances created${failed > 0 ? ` (${failed} failed)` : ''}. Monitoring started.`);
+        });
+        socket.on('vps_worker_progress', d => { updateWorkerRow(d.worker_idx, d); });
+        socket.on('vps_worker_finished', d => {
+            const tr = document.querySelector(`#worker-table tbody tr[data-worker="${d.worker_idx}"]`);
+            if (tr) { tr.querySelector('.w-status').textContent = d.status; tr.querySelector('.w-status').style.color = d.status === 'COMPLETED' ? '#00cc00' : '#cc0000'; }
+        });
+        socket.on('vps_log', d => { setStatus('VPS: ' + d.message); });
+        socket.on('vps_error', d => { setStatus('VPS Error: ' + d.error); toggleControls(true); });
+        // Builder events
+        socket.on('builder_offers_found', d => { showOfferModal(d.offers, 1, 'builder'); });
+        socket.on('builder_progress', d => {
+            document.getElementById('builder-group').classList.remove('hidden');
+            document.getElementById('builder-status').textContent = `${d.status} — ${d.step}`;
+            document.getElementById('builder-step').textContent = d.detail;
+            setBuilderProgress(d.pct);
+        });
+        socket.on('builder_finished', d => { document.getElementById('builder-status').textContent = d.status === 'COMPLETED' ? 'Index built!' : 'Builder failed'; document.getElementById('btn-build').disabled = false; });
+        socket.on('builder_error', d => { setStatus('Builder Error: ' + d.error); document.getElementById('btn-build').disabled = false; });
+        socket.on('scan_complete', d => { const sm = d.status_map || {}; const count = Object.keys(sm).length; if (count > 0) setShapesStatus(sm); setStatus(`Scan: ${count} tracked regions`); });
 
-// Init
-initDeckGL();
-</script>
+        // ═══════════════════════════════════════════════════════════════════
+        // UI Helpers
+        // ═══════════════════════════════════════════════════════════════════
+        function setStatus(msg) { document.getElementById('status-bar').textContent = msg; }
+        function setProgress(pct) { pct = Math.min(100, Math.max(0, pct)); document.getElementById('progress-fill').style.width = pct + '%'; document.getElementById('progress-text').textContent = Math.floor(pct) + '%'; }
+        function setBuilderProgress(pct) { document.getElementById('builder-progress-fill').style.width = pct + '%'; document.getElementById('builder-progress-text').textContent = pct + '%'; }
+        function switchTab(name) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById('tab-' + name).classList.add('active');
+        }
+        function toggleControls(enabled) {
+            document.getElementById('btn-scrape').disabled = !enabled;
+            document.getElementById('btn-cancel').disabled = enabled;
+            document.getElementById('btn-deploy').disabled = !enabled;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // DeckGL Map (ported from ui.py DeckGLMapView)
+        // ═══════════════════════════════════════════════════════════════════
+        // Hex binning removed — using ScatterplotLayer for points
+        function initDeckGL() {
+            deckgl = new deck.DeckGL({
+                container: 'map-container', initialViewState: currentViewState, controller: true,
+                onViewStateChange: ({ viewState }) => {
+                    currentViewState = viewState;
+                    return viewState;
+                },
+                layers: [new deck.TileLayer({ id: 'base-map', data: 'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png', minZoom: 0, maxZoom: 19, tileSize: 256, renderSubLayers: p => { const { bbox: { west, south, east, north } } = p.tile; return new deck.BitmapLayer(p, { data: null, image: p.data, bounds: [west, south, east, north] }); } })],
+                onClick: handleClick, onHover: handleHover
+            });
+        }
+        function handleClick(info) {
+            if (isDrawing) { if (info.coordinate) { drawingCoords.push([info.coordinate[0], info.coordinate[1]]); drawRevision++; const ds = document.getElementById('draw-status'); ds.textContent = drawingCoords.length + ' vertices' + (drawingCoords.length < 3 ? ' (need 3+)' : ''); updateLayers(); } return; }
+            if (!info.object || info.layer.id === 'base-map' || info.layer.id === 'main-outlines') return;
+            const idx = info.object.index; if (idx === undefined) return;
+            if (selectedIndices.has(idx)) selectedIndices.delete(idx); else selectedIndices.add(idx);
+            selectionRevision++; updateLayers(); updateSelectionInfo();
+        }
+        function handleHover(info) {
+            const tt = document.getElementById('tooltip');
+            if (info.object && info.layer.id !== 'base-map') { const p = info.object.properties || {}; const l = p.city || p.name || p.NAME || 'Shape'; const a = p.area_sqkm ? p.area_sqkm.toFixed(1) + ' km²' : ''; tt.innerHTML = '<b>' + l + '</b>' + (a ? '<br>Area: ' + a : ''); tt.style.display = 'block'; tt.style.left = (info.x + 10) + 'px'; tt.style.top = (info.y + 10) + 'px'; }
+            else tt.style.display = 'none';
+        }
+        function updateLayers() {
+            if (!deckgl) return;
+            const layers = [new deck.TileLayer({ id: 'base-map', data: 'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png', minZoom: 0, maxZoom: 19, tileSize: 256, renderSubLayers: p => { const { bbox: { west, south, east, north } } = p.tile; return new deck.BitmapLayer(p, { data: null, image: p.data, bounds: [west, south, east, north] }); } })];
+            if (allShapes.length > 0) {
+                layers.push(new deck.PolygonLayer({
+                    id: 'shapes', data: allShapes, getPolygon: d => d.coordinates,
+                    getFillColor: d => { if (selectedIndices.has(d.index)) return [255, 105, 180, 150]; const s = d.properties.status; if (s === 'complete') return [0, 200, 0, 150]; if (s === 'features') return [255, 200, 0, 150]; if (s === 'csv') return [255, 0, 0, 150]; return [0, 100, 255, 100]; },
+                    getLineColor: d => { if (selectedIndices.has(d.index)) return [255, 105, 180, 255]; const s = d.properties.status; if (s === 'complete') return [0, 200, 0, 255]; if (s === 'features') return [255, 200, 0, 255]; if (s === 'csv') return [255, 0, 0, 255]; return [0, 150, 255, 200]; },
+                    lineWidthMinPixels: 2, pickable: true, filled: true, stroked: true,
+                    updateTriggers: { getFillColor: [selectionRevision, dataRevision], getLineColor: [selectionRevision, dataRevision] }
+                }));
+            }
+            if (isIntersectionMode && mainShapes.length > 0) {
+                layers.push(new deck.PolygonLayer({ id: 'main-outlines', data: mainShapes, getPolygon: d => d.coordinates, getFillColor: [0, 0, 0, 0], getLineColor: [255, 255, 255, 200], lineWidthMinPixels: 3, filled: true, stroked: true, pickable: false }));
+            }
+            if (showPoints && scrapedPoints.length > 0) {
+                layers.push(new deck.ScatterplotLayer({
+                    id: 'scraped-points', data: scrapedPoints,
+                    getPosition: d => [d.lon, d.lat],
+                    getFillColor: [255, 105, 180],
+                    getRadius: 30, radiusMinPixels: 2, radiusMaxPixels: 6,
+                    pickable: false,
+                    updateTriggers: { getPosition: dataRevision }
+                }));
+            }
+            if (isDrawing && drawingCoords.length > 0) {
+                if (drawingCoords.length >= 2) layers.push(new deck.PathLayer({ id: 'drawing-line', data: [{ path: [...drawingCoords, drawingCoords[0]] }], getPath: d => d.path, getColor: [255, 200, 0, 220], widthMinPixels: 2, getDashArray: [6, 4], dashJustified: true, extensions: [new deck.PathStyleExtension({ dash: true })], updateTriggers: { getPath: drawRevision } }));
+                layers.push(new deck.ScatterplotLayer({ id: 'drawing-vertices', data: drawingCoords.map((c, i) => ({ pos: c, i })), getPosition: d => d.pos, getFillColor: [255, 200, 0, 255], getRadius: 200, radiusMinPixels: 5, radiusMaxPixels: 8, pickable: false, updateTriggers: { getPosition: drawRevision } }));
+            }
+            deckgl.setProps({ layers });
+        }
+        function updateSelectionInfo() { const el = document.getElementById('selection-info'); const n = selectedIndices.size; if (n > 0) { el.style.display = 'block'; el.textContent = n + ' shape(s) selected'; } else el.style.display = 'none'; }
+        function calculateAreaSqKm(coords) {
+            if (!coords || coords.length < 3) return 0; const toRad = Math.PI / 180; const R = 6371; let t = 0;
+            for (let i = 0; i < coords.length; i++) { const j = (i + 1) % coords.length; t += (coords[j][0] - coords[i][0]) * toRad * (2 + Math.sin(coords[i][1] * toRad) + Math.sin(coords[j][1] * toRad)); }
+            return Math.abs(t * R * R / 2);
+        }
+        function loadShapesFromGeoJSON(geojsonData, maxArea) {
+            allShapes = []; selectedIndices.clear(); showPoints = false; scrapedPoints = []; pointsByPanoid = {}; if (typeof geojsonData === 'string') geojsonData = JSON.parse(geojsonData);
+            if (!geojsonData.features) return; let loaded = 0, pruned = 0;
+            geojsonData.features.forEach(f => {
+                if (!f.geometry) return; let sets = [];
+                try {
+                    if (f.geometry.type === 'MultiPolygon') f.geometry.coordinates.forEach(p => { if (p && p[0]) sets.push(p[0]); });
+                    else if (f.geometry.type === 'Polygon' && f.geometry.coordinates && f.geometry.coordinates[0]) sets.push(f.geometry.coordinates[0]);
+                } catch (e) { return; }
+                sets.forEach(raw => {
+                    if (!raw || raw.length < 3) return; const coords = [];
+                    for (let i = 0; i < raw.length; i++) { const c = raw[i]; if (c && c.length >= 2) { const lng = parseFloat(c[0]), lat = parseFloat(c[1]); if (!isNaN(lng) && !isNaN(lat) && lng >= -180 && lng <= 180 && lat >= -90 && lat <= 90) coords.push([lng, lat]); } }
+                    if (coords.length < 3) return; const a = calculateAreaSqKm(coords); if (a > maxArea) { pruned++; return; } loaded++;
+                    allShapes.push({ index: allShapes.length, coordinates: coords, properties: { ...f.properties, area_sqkm: a }, pruned: false });
+                });
+            });
+            document.getElementById('shape-count').textContent = loaded + ' shapes' + (pruned > 0 ? ' (' + pruned + ' pruned)' : '');
+            mainShapes = allShapes.map(s => ({ ...s })); isIntersectionMode = false; updateLayers();
+            if (allShapes.length > 0) fitToBounds();
+        }
+        function fitToBounds() {
+            if (allShapes.length === 0) return; let mnLng = 180, mxLng = -180, mnLat = 90, mxLat = -90;
+            allShapes.forEach(s => s.coordinates.forEach(c => { if (c[0] < mnLng) mnLng = c[0]; if (c[0] > mxLng) mxLng = c[0]; if (c[1] < mnLat) mnLat = c[1]; if (c[1] > mxLat) mxLat = c[1]; }));
+            const d = Math.max(mxLng - mnLng, mxLat - mnLat); let z = d < 0.5 ? 10 : d < 1 ? 8 : d < 5 ? 6 : d < 20 ? 4 : d < 50 ? 3 : 2;
+            currentViewState = { longitude: (mnLng + mxLng) / 2, latitude: (mnLat + mxLat) / 2, zoom: z, pitch: 0, bearing: 0, transitionDuration: 1000 };
+            deckgl.setProps({ initialViewState: currentViewState });
+        }
+        function selectAll() { selectedIndices.clear(); allShapes.forEach(s => selectedIndices.add(s.index)); selectionRevision++; updateLayers(); updateSelectionInfo(); }
+        function clearSelection() { selectedIndices.clear(); selectionRevision++; updateLayers(); updateSelectionInfo(); }
+        function getSelectedCoords() { const c = []; selectedIndices.forEach(i => { const s = allShapes[i]; if (s) c.push(s.coordinates.map(p => [p[1], p[0]])); }); return c; }
+        function addPoint(lat, lon, panoid) { scrapedPoints.push({ lat, lon, panoid, completed: false }); pointsByPanoid[panoid] = scrapedPoints.length - 1; dataRevision++; updateLayers(); }
+        function markCompleted(panoid) { const i = pointsByPanoid[panoid]; if (i !== undefined && scrapedPoints[i]) scrapedPoints[i].completed = true; dataRevision++; updateLayers(); }
+        function flushPoints() { dataRevision++; updateLayers(); }
+        function clearPoints() { scrapedPoints = []; pointsByPanoid = {}; showPoints = false; updateLayers(); }
+        function unloadShapes() { allShapes = []; mainShapes = []; isIntersectionMode = false; selectedIndices.clear(); selectionRevision++; showPoints = false; scrapedPoints = []; pointsByPanoid = {}; document.getElementById('shape-count').textContent = 'No shapes loaded'; updateLayers(); updateSelectionInfo(); }
+        function setShapesStatus(statusMap) { Object.entries(statusMap).forEach(([idx, status]) => { const i = parseInt(idx); if (allShapes[i]) allShapes[i].properties.status = status; }); dataRevision++; updateLayers(); }
+        function toggleDrawing() { if (isDrawing) { cancelDrawing(); return; } isDrawing = true; drawingCoords = []; drawRevision++; document.getElementById('draw-btn').classList.add('active'); document.getElementById('finish-btn').classList.add('show'); document.getElementById('cancel-draw-btn').classList.add('show'); const ds = document.getElementById('draw-status'); ds.style.display = 'block'; ds.textContent = 'Click map to place vertices'; updateLayers(); }
+        function finishDrawing() { if (drawingCoords.length < 3) { document.getElementById('draw-status').textContent = 'Need 3+ vertices!'; return; } const coords = [...drawingCoords]; const a = calculateAreaSqKm(coords); drawnShapeCount++; const ni = allShapes.length; allShapes.push({ index: ni, coordinates: coords, properties: { name: 'Drawn Shape ' + drawnShapeCount, area_sqkm: a, drawn: true }, pruned: false }); selectedIndices.add(ni); selectionRevision++; isDrawing = false; drawingCoords = []; document.getElementById('draw-btn').classList.remove('active'); document.getElementById('finish-btn').classList.remove('show'); document.getElementById('cancel-draw-btn').classList.remove('show'); document.getElementById('draw-status').style.display = 'none'; document.getElementById('shape-count').textContent = allShapes.length + ' shapes'; updateLayers(); updateSelectionInfo(); }
+        function cancelDrawing() { isDrawing = false; drawingCoords = []; drawRevision++; document.getElementById('draw-btn').classList.remove('active'); document.getElementById('finish-btn').classList.remove('show'); document.getElementById('cancel-draw-btn').classList.remove('show'); document.getElementById('draw-status').style.display = 'none'; updateLayers(); }
+        function deleteSelected() { if (selectedIndices.size === 0) return; allShapes = allShapes.filter(s => !selectedIndices.has(s.index)); allShapes.forEach((s, i) => s.index = i); selectedIndices.clear(); selectionRevision++; showPoints = false; scrapedPoints = []; pointsByPanoid = {}; document.getElementById('shape-count').textContent = allShapes.length > 0 ? allShapes.length + ' shapes' : 'No shapes loaded'; updateLayers(); updateSelectionInfo(); }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Actions
+        // ═══════════════════════════════════════════════════════════════════
+        function loadShapeFile() {
+            const input = document.getElementById('shape-file');
+            if (!input.files.length) { setStatus('Select a file first'); return; }
+            const fd = new FormData();
+            fd.append('file', input.files[0]);
+            fd.append('session_id', sessionId);
+            fd.append('max_area', document.getElementById('max-area').value);
+            fetch('/api/load-shapes', { method: 'POST', body: fd })
+                .then(r => r.json()).then(d => {
+                    if (d.error) { setStatus('Error: ' + d.error); return; }
+                    loadShapesFromGeoJSON(d.geojson, parseFloat(document.getElementById('max-area').value));
+                    setStatus('Loaded shapes from ' + d.filename);
+                    setTimeout(() => scanProgress(), 1000);
+                });
+        }
+        function startScraping() {
+            const coords = getSelectedCoords();
+            if (coords.length === 0) { setStatus('Select at least one shape!'); return; }
+            clearPoints(); showPoints = true; toggleControls(false); _lastFound = 0; _lastImages = 0;
+            fetch('/api/start-scrape', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: sessionId, selected_coords: coords })
+            }).then(r => r.json()).then(d => { if (d.error) { setStatus('Error: ' + d.error); toggleControls(true); } else setStatus('Scraping...'); });
+        }
+        function cancelScraping() {
+            fetch('/api/cancel-scrape', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId }) })
+                .then(() => { setStatus('Cancelled'); toggleControls(true); showPoints = false; scrapedPoints = []; pointsByPanoid = {}; updateLayers(); });
+        }
+        function startVPSDeploy() {
+            const coords = getSelectedCoords();
+            if (coords.length === 0) { setStatus('Select shapes first'); return; }
+            toggleControls(false); showPoints = true;
+            fetch('/api/deploy-vps', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: sessionId, selected_coords: coords,
+                    r2_account: document.getElementById('r2-account').value,
+                    r2_access: document.getElementById('r2-access').value,
+                    r2_secret: document.getElementById('r2-secret').value,
+                    r2_bucket: document.getElementById('r2-bucket').value,
+                    vast_key: document.getElementById('vast-key').value,
+                    region_path: document.getElementById('region-path').value,
+                    num_workers: parseInt(document.getElementById('num-workers').value),
+                    docker_image: document.getElementById('docker-image').value,
+                    gpu_type: document.getElementById('gpu-type').value,
+                    min_vram_gb: parseInt(document.getElementById('min-vram').value),
+                    max_price: parseFloat(document.getElementById('max-price').value),
+                    geo_filter: document.getElementById('geo-filter').value,
+                    disk_gb: parseInt(document.getElementById('disk-gb').value),
+                })
+            }).then(r => r.json()).then(d => { if (d.error) { setStatus('Error: ' + d.error); toggleControls(true); } });
+        }
+        function searchOffers(workerIndices, totalWorkers) {
+            const payload = {
+                session_id: sessionId, vast_key: document.getElementById('vast-key').value,
+                gpu_type: document.getElementById('gpu-type').value, disk_gb: parseInt(document.getElementById('disk-gb').value),
+                max_price: parseFloat(document.getElementById('max-price').value), min_vram_gb: parseInt(document.getElementById('min-vram').value),
+                geo_filter: document.getElementById('geo-filter').value
+            };
+            if (workerIndices) payload.worker_indices_to_deploy = workerIndices;
+            if (totalWorkers) payload.total_workers = totalWorkers;
+            fetch('/api/search-offers', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+        }
+        // Missing workers modal functions
+        function showMissingWorkersModal(segmentCount, completed, missing) {
+            document.getElementById('missing-summary').textContent =
+                `R2 has ${segmentCount} CSV segments. ${completed.length} workers have completed features, ${missing.length} are missing.`;
+            const completeList = document.getElementById('missing-complete-list');
+            completeList.innerHTML = completed.sort((a, b) => a - b).map(i => `<span class="worker-badge complete">#${i}</span>`).join('');
+            const missingList = document.getElementById('missing-missing-list');
+            missingList.innerHTML = missing.map(i => `<span class="worker-badge missing">#${i}</span>`).join('');
+            document.getElementById('missing-deploy-btn').textContent = `Deploy Missing (${missing.length})`;
+            document.getElementById('missing-rerun-btn').textContent = `Re-run All (${segmentCount})`;
+            document.getElementById('missing-complete-section').style.display = completed.length > 0 ? 'block' : 'none';
+            document.getElementById('missing-modal').classList.add('show');
+        }
+        function closeMissingModal() {
+            document.getElementById('missing-modal').classList.remove('show');
+            toggleControls(true);
+        }
+        function missingModalDeployMissing() {
+            document.getElementById('missing-modal').classList.remove('show');
+            _vpsWorkerIndices = _r2Missing;
+            _vpsTotalWorkers = _r2SegmentCount;
+            setStatus(`Deploying ${_r2Missing.length} missing workers...`);
+            searchOffers(_r2Missing, _r2SegmentCount);
+        }
+        function missingModalRerunAll() {
+            document.getElementById('missing-modal').classList.remove('show');
+            const all = Array.from({ length: _r2SegmentCount }, (_, i) => i + 1);
+            _vpsWorkerIndices = all;
+            _vpsTotalWorkers = _r2SegmentCount;
+            setStatus(`Re-running all ${_r2SegmentCount} workers...`);
+            searchOffers(all, _r2SegmentCount);
+        }
+        function startIndexBuild() {
+            document.getElementById('btn-build').disabled = true;
+            fetch('/api/build-index', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: sessionId, vast_key: document.getElementById('vast-key').value,
+                    max_price: parseFloat(document.getElementById('builder-max-price').value),
+                    min_disk: parseInt(document.getElementById('builder-disk').value)
+                })
+            }).then(r => r.json()).then(d => { if (d.error) { setStatus('Error: ' + d.error); document.getElementById('btn-build').disabled = false; } });
+        }
+        function mergeSelectedShapes() {
+            const sel = []; selectedIndices.forEach(i => { const s = allShapes[i]; if (s) sel.push(s.coordinates.map(c => [c[1], c[0]])); });
+            if (sel.length !== 2) { setStatus('Select exactly 2 shapes to merge'); return; }
+            fetch('/api/merge-shapes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coords_list: sel }) })
+                .then(r => r.json()).then(d => {
+                    if (d.error) { setStatus('Error: ' + d.error); return; }
+                    // Remove old selected, add merged
+                    allShapes = allShapes.filter(s => !selectedIndices.has(s.index));
+                    const ni = allShapes.length;
+                    allShapes.push({ index: ni, coordinates: d.merged_coords, properties: { name: 'Merged', area_sqkm: calculateAreaSqKm(d.merged_coords) }, pruned: false });
+                    allShapes.forEach((s, i) => s.index = i);
+                    selectedIndices.clear(); selectedIndices.add(ni); selectionRevision++;
+                    document.getElementById('shape-count').textContent = allShapes.length + ' shapes';
+                    updateLayers(); updateSelectionInfo(); setStatus('Merged 2 shapes into 1');
+                });
+        }
+        function scanProgress() {
+            fetch('/api/scan-progress', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: sessionId, shapes_data: allShapes,
+                    r2_config: {
+                        account: document.getElementById('r2-account').value, access: document.getElementById('r2-access').value,
+                        secret: document.getElementById('r2-secret').value, bucket: document.getElementById('r2-bucket').value
+                    }
+                })
+            }).then(() => setStatus('Scanning...'));
+        }
+        function destroyAll() {
+            if (!confirm('Destroy ALL running instances?')) return;
+            fetch('/api/destroy-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId }) })
+                .then(r => r.json()).then(d => { setStatus(`Destroyed ${d.count} instances`); toggleControls(true); });
+        }
+
+        // Worker table
+        function showWorkerTableAll(workerIndices) {
+            document.getElementById('vps-workers-group').classList.remove('hidden');
+            const tbody = document.querySelector('#worker-table tbody'); tbody.innerHTML = '';
+            for (const widx of workerIndices.sort((a, b) => a - b)) {
+                const tr = document.createElement('tr'); tr.dataset.worker = widx;
+                tr.innerHTML = `<td>#${widx}</td><td class="w-status" style="color:#888">CREATING</td><td class="w-progress">—</td><td class="w-speed">—</td><td class="w-eta">—</td>`;
+                tbody.appendChild(tr);
+            }
+        }
+        function showWorkerTable(map) {
+            document.getElementById('vps-workers-group').classList.remove('hidden');
+            const tbody = document.querySelector('#worker-table tbody'); tbody.innerHTML = '';
+            for (const [iid, widx] of Object.entries(map).sort((a, b) => a[1] - b[1])) {
+                const tr = document.createElement('tr'); tr.dataset.worker = widx;
+                tr.innerHTML = `<td>#${widx}</td><td class="w-status" style="color:#aaa">Starting...</td><td class="w-progress">—</td><td class="w-speed">—</td><td class="w-eta">—</td>`;
+                tbody.appendChild(tr);
+            }
+        }
+        function updateWorkerRow(widx, d) {
+            const tr = document.querySelector(`#worker-table tbody tr[data-worker="${widx}"]`);
+            if (!tr) return;
+            const s = d.status;
+            const pct = d.total > 0 ? Math.floor(d.processed / d.total * 100) : 0;
+            tr.querySelector('.w-status').textContent = s;
+            // Color based on status
+            const vastStates = ['LOADING', 'PULLING', 'CREATING', 'STARTING', 'WAITING'];
+            if (s === 'COMPLETED') tr.querySelector('.w-status').style.color = '#00cc00';
+            else if (s.startsWith('FAIL') || s === 'EXITED' || s === 'ERROR') tr.querySelector('.w-status').style.color = '#ff4444';
+            else if (s === 'UPLOADING' || s.startsWith('UPLOADING_')) tr.querySelector('.w-status').style.color = '#ffaa00';
+            else if (vastStates.includes(s)) tr.querySelector('.w-status').style.color = '#888';
+            else tr.querySelector('.w-status').style.color = '#00aaff';
+            // Progress display
+            const isUpload = s === 'UPLOADING' || (s.startsWith('UPLOADING_') && !s.endsWith('_RETRY'));
+            const isVastState = vastStates.includes(s);
+            if (isVastState) {
+                tr.querySelector('.w-progress').textContent = '—';
+            } else if (isUpload && d.total > 0) {
+                const gbDone = (d.processed / (1024 ** 3)).toFixed(2);
+                const gbTotal = (d.total / (1024 ** 3)).toFixed(2);
+                tr.querySelector('.w-progress').textContent = `${pct}% (${gbDone}/${gbTotal} GB)`;
+            } else if (d.total > 0) {
+                tr.querySelector('.w-progress').textContent = `${pct}% (${d.processed.toLocaleString()}/${d.total.toLocaleString()})`;
+            }
+            // Speed
+            if (isVastState) tr.querySelector('.w-speed').textContent = '—';
+            else tr.querySelector('.w-speed').textContent = isUpload && d.speed > 0 ? d.speed.toFixed(1) + ' MB/s' : d.speed > 0 ? d.speed.toFixed(1) + '/s' : '—';
+            // ETA
+            if (isVastState) tr.querySelector('.w-eta').textContent = '—';
+            else { const eta = d.eta; tr.querySelector('.w-eta').textContent = eta > 3600 ? Math.floor(eta / 3600) + 'h' + Math.floor((eta % 3600) / 60) + 'm' : eta > 0 ? Math.floor(eta / 60) + 'm' + Math.floor(eta % 60) + 's' : '—'; }
+            // Update overall bar (skip vast-state rows)
+            const rows = document.querySelectorAll('#worker-table tbody tr');
+            let tp = 0, tt = 0; rows.forEach(r => { const t = r.querySelector('.w-progress').textContent; const m = t.match(/(\d[\d,]*)\/([\d,]+)/); if (m) { tp += parseInt(m[1].replace(/,/g, '')); tt += parseInt(m[2].replace(/,/g, '')); } });
+            if (tt > 0) { const p = tp / tt * 100; document.getElementById('vps-progress-fill').style.width = p + '%'; document.getElementById('vps-progress-text').textContent = Math.floor(p) + '%'; }
+        }
+
+        // Offer modal
+        function showOfferModal(offers, numNeeded, mode) {
+            _offerOffers = offers; _offerNumNeeded = numNeeded; _offerSelected = new Set();
+            const maxSelect = mode === 'builder' ? 1 : Math.min(numNeeded, offers.length);
+            document.getElementById('offer-modal-title').textContent = mode === 'builder' ? 'Select Builder Instance' : `Select Vast.ai Offers (${numNeeded} workers, ${offers.length} available)`;
+            document.getElementById('offer-selection-label').textContent = `Selected: 0 / ${maxSelect}`;
+            document.getElementById('offer-ok-btn').disabled = true;
+            document.getElementById('offer-ok-btn').dataset.mode = mode;
+            const tbody = document.querySelector('#offer-table tbody'); tbody.innerHTML = '';
+            offers.forEach((o, i) => {
+                const tr = document.createElement('tr'); tr.dataset.idx = i;
+                tr.innerHTML = `<td>${o.num_gpus}x ${o.gpu_name}</td><td>${(o.gpu_ram / 1024).toFixed(0)}</td><td>${o.cpu_name || '?'}</td><td>${((o.ram || 0) / 1024).toFixed(0)}</td><td>${(o.disk || 0).toFixed(0)}</td><td>$${(o.price_per_hr || 0).toFixed(3)}</td><td>${(o.inet_down || 0).toFixed(0)}</td><td>${((o.reliability || 0) * 100).toFixed(0)}%</td><td>${o.location || '?'}</td>`;
+                tr.onclick = () => toggleOfferRow(i, tr);
+                tbody.appendChild(tr);
+            });
+            document.getElementById('offer-modal').classList.add('show');
+        }
+        function toggleOfferRow(idx, tr) {
+            const maxSelect = Math.min(_offerNumNeeded, _offerOffers.length);
+            if (_offerSelected.has(idx)) { _offerSelected.delete(idx); tr.classList.remove('selected'); }
+            else if (_offerSelected.size < maxSelect) { _offerSelected.add(idx); tr.classList.add('selected'); }
+            document.getElementById('offer-selection-label').textContent = `Selected: ${_offerSelected.size} / ${maxSelect}`;
+            // Enable OK when at least 1 offer is selected (offers reused round-robin across workers)
+            document.getElementById('offer-ok-btn').disabled = _offerSelected.size === 0;
+        }
+        function closeOfferModal() {
+            document.getElementById('offer-modal').classList.remove('show');
+            toggleControls(true);
+            // Tell backend to clear pending offers so they don't reappear on reconnect
+            fetch('/api/dismiss-offers', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: sessionId })
+            });
+        }
+        function confirmOfferSelection() {
+            const mode = document.getElementById('offer-ok-btn').dataset.mode;
+            const selected = Array.from(_offerSelected).map(i => _offerOffers[i]);
+            document.getElementById('offer-modal').classList.remove('show');
+            if (mode === 'deploy') {
+                fetch('/api/create-instances', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId, selected_offers: selected, worker_indices: _vpsWorkerIndices, total_workers: _vpsTotalWorkers })
+                });
+            } else if (mode === 'builder') {
+                fetch('/api/create-builder', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        session_id: sessionId, offer: selected[0],
+                        r2_account: document.getElementById('r2-account').value, r2_access: document.getElementById('r2-access').value,
+                        r2_secret: document.getElementById('r2-secret').value, r2_bucket: document.getElementById('r2-bucket').value,
+                        vast_key: document.getElementById('vast-key').value,
+                        builder_image: document.getElementById('builder-image').value, disk_gb: parseInt(document.getElementById('builder-disk').value),
+                        path_override: document.getElementById('builder-path').value,
+                        index_type: document.getElementById('index-type').value, nlist: parseInt(document.getElementById('nlist').value),
+                        m: parseInt(document.getElementById('m-param').value), nbits: parseInt(document.getElementById('nbits').value),
+                        train_samples: parseInt(document.getElementById('train-samples').value), niter: parseInt(document.getElementById('niter').value)
+                    })
+                });
+            }
+        }
+
+        // Init
+        initDeckGL();
+    </script>
 </body>
+
 </html>

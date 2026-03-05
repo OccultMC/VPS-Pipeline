@@ -1,0 +1,141 @@
+@import 'theme.css';
+
+
+/* Workaround for removing that parameter vomit which Sphinx generates
+ * for dataclass constructors.
+ */
+
+ #streetlevel\.dataclasses\.Link + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+ #streetlevel\.dataclasses\.Size + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+ #streetlevel\.dataclasses\.Tile + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+
+
+#streetlevel\.streetview\.panorama\.StreetViewPanorama + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.streetview\.panorama\.CaptureDate + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.streetview\.panorama\.UploadDate + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.streetview\.panorama\.DepthMap + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.streetview\.panorama\.LocalizedString + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.streetview\.panorama\.BuildingLevel + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.streetview\.panorama\.Place + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.streetview\.panorama\.Artwork + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.streetview\.panorama\.ArtworkLink + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.streetview\.panorama\.StreetLabel + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+
+
+#streetlevel\.streetside\.panorama\.StreetsidePanorama + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+
+
+#streetlevel\.mapy\.panorama\.MapyPanorama + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+
+
+#streetlevel\.lookaround\.panorama\.LookaroundPanorama + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.lookaround\.panorama\.CameraMetadata + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.lookaround\.panorama\.LensProjection + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.lookaround\.panorama\.OrientedPosition + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.lookaround\.panorama\.CoverageTile + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+
+
+#streetlevel\.yandex\.panorama\.YandexPanorama + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.yandex\.panorama\.Place + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.yandex\.panorama\.Address + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.yandex\.panorama\.Marker + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+
+
+#streetlevel\.kakao\.panorama\.KakaoPanorama + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+
+
+#streetlevel\.naver\.model\.Model + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.naver\.panorama\.NaverPanorama + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.naver\.panorama\.Neighbors + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.naver\.panorama\.Overlay + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+
+
+#streetlevel\.ja\.panorama\.JaPanorama + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.ja\.panorama\.Address + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.ja\.panorama\.CaptureDate + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+
+#streetlevel\.baidu\.panorama\.BaiduPanorama + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.baidu\.panorama\.PanoInteriorMetadata + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.baidu\.panorama\.PanoInteriorPoint + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.baidu\.panorama\.InteriorMetadata + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.baidu\.panorama\.InteriorPoint + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.baidu\.panorama\.Floor + dd > dl:first-of-type.field-list {
+  display:none !important;
+}
+#streetlevel\.baidu\.panorama\.User + dd > dl:first-of-type.field-list {
+  display:none !important;
+}

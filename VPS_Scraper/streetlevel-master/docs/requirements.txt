@@ -1,0 +1,17 @@
+numpy
+Pillow
+pyproj
+requests
+pytest
+protobuf
+pyfrpc
+scipy
+aiohttp
+pycryptodome
+sphinx_rtd_theme
+pyequilib
+torch
+torchvision
+bd09convertor
+CoordinatesConverter
+pyexiv2

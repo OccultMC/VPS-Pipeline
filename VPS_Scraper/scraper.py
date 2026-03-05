@@ -16,16 +16,7 @@ from dataclasses import dataclass, field
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from aiohttp import ClientSession, TCPConnector, ClientTimeout
 
-# Try high-performance event loops
-try:
-    import winloop
-    asyncio.set_event_loop_policy(winloop.EventLoopPolicy())
-except ImportError:
-    try:
-        import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except ImportError:
-        pass
+# Use default asyncio event loop (winloop/uvloop disabled — SSL issues on Windows)
 
 # Add Stage 1 to path for streetlevel imports (append, not insert(0),
 # so that Stage_0/scraper.py is found before Stage_1/scraper.py when
