@@ -2,12 +2,13 @@
 """
 VPS Pipeline: Google Street View Downloader → MegaLoc Feature Extraction → R2 Upload
 
-Distributed worker version — no FAISS, hardcoded view settings.
-Downloads its assigned CSV segment from R2, processes panos,
-extracts MegaLoc features, uploads results to R2, and self-destructs.
+Queue-based distributed worker — pulls 1K-pano chunks from a shared Redis queue,
+processes each chunk, uploads results to R2, and grabs the next chunk.
+
+Workers self-destruct when the queue is empty and all tasks are done.
 
 Progress is logged to stdout in structured format for vastai logs polling:
-    PROGRESS|{worker_index}|{processed}|{total}|{eta_seconds}|{speed}|{status}
+    PROGRESS|{instance_id}|{chunk_id}|{processed}|{total}|{status}
 """
 
 import asyncio
@@ -33,14 +34,6 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
-
-# ── Uvloop Disabled (Stability Issues) ──────────────────────────────────────────
-# try:
-#     import uvloop
-#     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-#     print("[INFO] Using uvloop")
-# except ImportError:
-#     pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -70,8 +63,9 @@ HARDCODED_CONFIG = {
 # Environment Variables
 # ═══════════════════════════════════════════════════════════════════════════════
 
-WORKER_INDEX = int(os.environ.get('WORKER_INDEX', '1'))
-NUM_WORKERS = int(os.environ.get('NUM_WORKERS', '1'))
+REDIS_URL = os.environ.get('REDIS_URL', '')
+REDIS_TOKEN = os.environ.get('REDIS_TOKEN', '')
+REGION = os.environ.get('REGION', '')
 CSV_BUCKET_PREFIX = os.environ.get('CSV_BUCKET_PREFIX', 'CSV')
 FEATURES_BUCKET_PREFIX = os.environ.get('FEATURES_BUCKET_PREFIX', 'Features')
 CITY_NAME = os.environ.get('CITY_NAME', 'Unknown')
@@ -110,94 +104,10 @@ from PIL import Image
 from r2_storage import R2Client
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# R2 Status Reporter
+# Redis Task Queue
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class R2StatusReporter:
-    """Uploads structured status JSON to R2 for UI polling."""
-
-    def __init__(self, r2_client, worker_index: int, total: int,
-                 status_prefix: str, instance_id: str = '',
-                 interval: float = 15.0):
-        self.r2 = r2_client
-        self.worker_index = worker_index
-        self.total = total
-        self.status_prefix = status_prefix
-        self.instance_id = instance_id
-        self.interval = interval
-        self.processed = 0
-        self.start_time = time.time()
-        self._last_report = 0.0
-        self._status_key = f"Status/{status_prefix}/worker_{worker_index}.json"
-
-    def update(self, processed: int, status: str = "EXTRACTING"):
-        self.processed = processed
-        now = time.time()
-        if now - self._last_report >= self.interval:
-            self._report(status)
-            self._last_report = now
-
-    def _report(self, status: str):
-        elapsed = time.time() - self.start_time
-        speed = self.processed / elapsed if elapsed > 0 else 0
-        remaining = self.total - self.processed
-        eta = remaining / speed if speed > 0 else 0
-        data = {
-            'worker': self.worker_index,
-            'status': status,
-            'processed': self.processed,
-            'total': self.total,
-            'speed': round(speed, 2),
-            'eta': round(eta),
-            'instance_id': self.instance_id,
-            'timestamp': time.time(),
-        }
-        # Print to stdout as well for debugging
-        print(f"PROGRESS|{self.worker_index}|{self.processed}|{self.total}|{eta:.0f}|{speed:.2f}|{status}", flush=True)
-        try:
-            self.r2.upload_json(self._status_key, data)
-        except Exception as e:
-            print(f"[WARN] Status upload failed: {e}")
-
-    def report_final(self, status: str):
-        """Force a final status report."""
-        self._report(status)
-
-    def report_upload(self, bytes_done: int, bytes_total: int,
-                      speed_mb: float, eta: float, label: str = ""):
-        """Report upload byte-progress to R2 and stdout.
-
-        Args:
-            bytes_done: Bytes transferred so far.
-            bytes_total: Total file size in bytes.
-            speed_mb: Current transfer speed in MB/s.
-            eta: Estimated seconds remaining.
-            label: File label for stdout (e.g. 'NPY', 'META').
-        """
-        status = f"UPLOADING_{label}" if label else "UPLOADING"
-        data = {
-            'worker': self.worker_index,
-            'status': 'UPLOADING',
-            'processed': bytes_done,
-            'total': bytes_total,
-            'speed': round(speed_mb, 2),
-            'eta': round(eta),
-            'instance_id': self.instance_id,
-            'timestamp': time.time(),
-        }
-        pct = int(bytes_done / bytes_total * 100) if bytes_total > 0 else 0
-        mb_done = bytes_done / (1024 * 1024)
-        mb_total = bytes_total / (1024 * 1024)
-        print(
-            f"PROGRESS|{self.worker_index}|{bytes_done}|{bytes_total}"
-            f"|{eta:.0f}|{speed_mb:.2f}|{status}"
-            f"  [{pct}%  {mb_done:.0f}/{mb_total:.0f} MB  {speed_mb:.1f} MB/s]",
-            flush=True,
-        )
-        try:
-            self.r2.upload_json(self._status_key, data)
-        except Exception as e:
-            print(f"[WARN] Upload status report failed: {e}")
+from redis_queue import TaskQueue
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -262,6 +172,9 @@ class SharedState:
 # GPU Feature Extractor
 # ═══════════════════════════════════════════════════════════════════════════════
 
+GPU_INIT_TIMEOUT = int(os.environ.get('GPU_INIT_TIMEOUT', '300'))  # 5 min default
+
+
 class _InitWatchdog:
     """Watchdog that kills the process if init hangs too long."""
     def __init__(self, timeout_sec: int, stage: str = "unknown"):
@@ -286,19 +199,6 @@ class _InitWatchdog:
         msg = (f"[FATAL] Watchdog timeout after {self.timeout}s during: {self.stage}. "
                f"Process is stuck — forcing exit.")
         print(msg, flush=True)
-        # Report failure to R2 before dying
-        try:
-            r2 = R2Client()
-            status_key = f"Status/{FEATURES_BUCKET_PREFIX}/worker_{WORKER_INDEX}.json"
-            r2.upload_json(status_key, {
-                'worker': WORKER_INDEX,
-                'status': f'FAILED:watchdog_timeout_{self.stage}',
-                'detail': msg,
-                'timestamp': time.time(),
-                'instance_id': INSTANCE_ID,
-            })
-        except Exception:
-            pass
         try:
             upload_logs_to_r2()
         except Exception:
@@ -333,9 +233,6 @@ def _run_with_timeout(fn, timeout_sec: int, stage: str):
     return result_container[0]
 
 
-GPU_INIT_TIMEOUT = int(os.environ.get('GPU_INIT_TIMEOUT', '300'))  # 5 min default
-
-
 class GpuExtractor:
     def __init__(self):
         t0 = time.time()
@@ -349,18 +246,7 @@ class GpuExtractor:
 
     @staticmethod
     def _load_baked_model():
-        """Load MegaLoc model from weights baked into the Docker image.
-
-        The CI workflow downloads model.safetensors from R2 and the
-        Dockerfile COPYs it in. No network access is needed at runtime.
-
-        We instantiate the MegaLoc class directly (pure PyTorch, no
-        downloads) instead of calling hubconf.get_trained_model() which
-        calls hf_hub_download() — a call that can stall on cloud
-        instances and trigger the watchdog timeout.
-
-        Returns the loaded model (on CPU).
-        """
+        """Load MegaLoc model from weights baked into the Docker image."""
         from safetensors.torch import load_file
 
         model_path = Path('/app/models/megaloc/model.safetensors')
@@ -384,8 +270,6 @@ class GpuExtractor:
         sys.path.insert(0, str(hub_dir))
         try:
             import importlib
-            # Import MegaLoc class directly — avoids hubconf.get_trained_model()
-            # which calls hf_hub_download() and can stall on cloud instances.
             megaloc_module = importlib.import_module('megaloc_model')
             model = megaloc_module.MegaLoc()
             model.load_state_dict(state_dict, strict=False)
@@ -484,23 +368,18 @@ class GpuExtractor:
             torch.cuda.synchronize()
             print(f"[INIT]   Warmup done in {time.time() - warmup_start:.1f}s", flush=True)
         except Exception as e:
-            # torch.compile inductor can crash on low-VRAM GPUs (BrokenProcessPool).
-            # Fall back to eager mode — this is safe, just slower compilation.
             print(f"[WARN] Compiled warmup failed: {type(e).__name__}: {e}", flush=True)
             print(f"[WARN] Falling back to eager mode (disabling torch.compile)...", flush=True)
 
-            # Reset dynamo state and unwrap the compiled model
             try:
                 torch._dynamo.reset()
             except Exception:
                 pass
 
-            # Get the original uncompiled model
             if hasattr(model, '_orig_mod'):
                 model = model._orig_mod
                 print(f"[WARN] Unwrapped compiled model to original module", flush=True)
 
-            # Retry warmup in eager mode
             try:
                 torch.cuda.empty_cache()
                 dummy = torch.randn(1, 3, 322, 322, device=self.device)
@@ -556,7 +435,6 @@ class GpuExtractor:
             free = torch.cuda.mem_get_info(0)[0]
             max_batch = max(8, int(free * 0.75 / per_image))
             max_batch = min(max_batch, 512)
-            # Round down to nearest power of 2 for alignment
             max_batch = 2 ** int(math.log2(max_batch))
 
             print(f"[INIT]   Auto batch size: {max_batch} "
@@ -577,18 +455,12 @@ class GpuExtractor:
             return None
 
     def start_decode(self, items: List[ViewItem]) -> list:
-        """Non-blocking: submit JPEG decode for all items; return list of futures.
-        Call infer_prefetched() later to collect results and run GPU inference."""
+        """Non-blocking: submit JPEG decode for all items; return list of futures."""
         return [self.executor.submit(self._decode_item, item) for item in items]
 
     def _run_inference(self, items: List[ViewItem], valid_tensors: list, valid_indices: list):
-        """GPU inference with pin_memory transfer, fp16 autocast, and OOM auto-retry.
-
-        On OutOfMemoryError the batch is split in two and each half retried;
-        self.batch_size is also shrunk so future batches stay safe.
-        """
+        """GPU inference with pin_memory transfer, fp16 autocast, and OOM auto-retry."""
         try:
-            # pin_memory() → page-locked host buffer → async DMA to GPU
             images = torch.stack(valid_tensors).pin_memory().to(self.device, non_blocking=True)
             images = torch.nn.functional.interpolate(
                 images, size=(322, 322), mode='bilinear', align_corners=False
@@ -600,7 +472,6 @@ class GpuExtractor:
                     feats = self.model(images)
             del images
 
-            # Convert fp16 → fp32 for storage (L2-normalised anyway, no accuracy loss)
             feats_np = feats.float().cpu().numpy()
             metadata_batch = [
                 {'panoid': items[i].panoid, 'lat': items[i].lat, 'lng': items[i].lng}
@@ -824,7 +695,7 @@ def wait_for_disk_space(path: str = '/', min_gb: float = MIN_FREE_GB):
 # Log Capture & Upload
 # ═══════════════════════════════════════════════════════════════════════════════
 
-LOG_FILE = f"/tmp/worker_{WORKER_INDEX}.log"
+LOG_FILE = f"/tmp/worker_{INSTANCE_ID or 'unknown'}.log"
 
 
 class TeeWriter:
@@ -847,7 +718,6 @@ class TeeWriter:
         except Exception:
             pass
 
-    # Delegate everything else to original stream
     def __getattr__(self, name):
         return getattr(self.original, name)
 
@@ -867,12 +737,11 @@ def _start_log_capture():
 def upload_logs_to_r2():
     """Upload the captured log file to R2."""
     try:
-        # Flush before uploading
         sys.stdout.flush()
         sys.stderr.flush()
 
         r2 = R2Client()
-        log_key = f"Logs/{FEATURES_BUCKET_PREFIX}/worker_{WORKER_INDEX}.log"
+        log_key = f"Logs/{FEATURES_BUCKET_PREFIX}/worker_{INSTANCE_ID}.log"
         r2.upload_file(LOG_FILE, log_key)
         print(f"[INFO] Uploaded logs to R2: {log_key}")
     except Exception as e:
@@ -883,60 +752,31 @@ def upload_logs_to_r2():
 # Self-Destruct
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _detect_instance_id():
-    """Detect this worker's instance ID from R2 (written by the UI at creation time).
-
-    The old approach of `vastai show instances` + `instances[0]` was broken:
-    with multiple workers, ALL of them would pick the same first instance,
-    causing workers to destroy each other instead of themselves.
-    """
-    # Method 1: Read from R2 (reliable — UI writes worker-specific instance ID)
-    # The scraper writes: Status/_lookup_{city}_{worker}.{total}.json
-    try:
-        r2 = R2Client()
-        key = f"Status/_lookup_{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.json"
-        data = r2.download_json(key)
-        if data and data.get('instance_id'):
-            detected = str(data['instance_id'])
-            print(f"[INFO] Got INSTANCE_ID from R2 lookup ({key}): {detected}")
-            return detected
-    except Exception as e:
-        print(f"[WARN] R2 instance ID lookup failed: {e}")
-
-    # Method 2: Fallback — only safe if there's exactly one instance
-    if not VAST_API_KEY:
-        return None
-    try:
-        result = subprocess.run(
-            ["vastai", "--api-key", VAST_API_KEY, "show", "instances", "--raw"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            import json as _json
-            instances = _json.loads(result.stdout.strip())
-            if instances and len(instances) == 1:
-                detected = str(instances[0].get('id', ''))
-                if detected:
-                    print(f"[INFO] Auto-detected INSTANCE_ID (sole instance): {detected}")
-                    return detected
-            if instances and len(instances) > 1:
-                print(f"[WARN] {len(instances)} instances running — cannot auto-detect safely. "
-                      "INSTANCE_ID should be set via R2 or env var.")
-    except Exception as e:
-        print(f"[WARN] Instance ID auto-detect failed: {e}")
-    return None
-
-
 def self_destruct():
     """Destroy this Vast.ai instance — retries forever until the instance is gone."""
-    instance_id = _detect_instance_id() or INSTANCE_ID
+    instance_id = INSTANCE_ID
 
     if not instance_id:
-        print("[WARN] Cannot self-destruct: unable to determine INSTANCE_ID — sleeping forever to prevent restart loop")
+        # Fallback: try to detect from vastai CLI
+        if VAST_API_KEY:
+            try:
+                result = subprocess.run(
+                    ["vastai", "--api-key", VAST_API_KEY, "show", "instances", "--raw"],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    instances = json.loads(result.stdout.strip())
+                    if instances and len(instances) == 1:
+                        instance_id = str(instances[0].get('id', ''))
+            except Exception as e:
+                print(f"[WARN] Instance ID auto-detect failed: {e}")
+
+    if not instance_id:
+        print("[WARN] Cannot self-destruct: unable to determine INSTANCE_ID — sleeping forever")
         while True:
             time.sleep(3600)
     if not VAST_API_KEY:
-        print("[WARN] Cannot self-destruct: VAST_API_KEY not set — sleeping forever to prevent restart loop")
+        print("[WARN] Cannot self-destruct: VAST_API_KEY not set — sleeping forever")
         while True:
             time.sleep(3600)
 
@@ -960,253 +800,52 @@ def self_destruct():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Resume Helpers
+# Upload with Retry
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def find_last_written_row(features_path: str) -> int:
-    """
-    Scan .npy backwards to find the last non-zero row.
-    Returns the index of the NEXT writable position (last_nonzero + 1).
-    If file is all zeros, returns 0.
-    """
-    print("[RESUME] Scanning features.npy for last written row...")
-    features = np.load(features_path, mmap_mode='r')
-    n_rows = features.shape[0]
-
-    block_size = 1000
-    last_nonzero = -1
-
-    for block_start in range(max(0, n_rows - block_size), -1, -block_size):
-        block_end = min(block_start + block_size, n_rows)
-        block = np.array(features[block_start:block_end])
-        row_sums = np.abs(block).sum(axis=1)
-        nonzero_mask = row_sums > 0
-        if np.any(nonzero_mask):
-            last_in_block = np.where(nonzero_mask)[0][-1]
-            last_nonzero = block_start + last_in_block
-            break
-
-    del features
-    gc.collect()
-
-    if last_nonzero == -1:
-        print("[RESUME]   Features file is all zeros — no valid data.")
-        return 0
-
-    resume_from = last_nonzero + 1
-    print(f"[RESUME]   Last non-zero row: {last_nonzero}")
-    print(f"[RESUME]   Next writable index: {resume_from}")
-    return resume_from
+MAX_EXTENDED_RETRIES = 30
 
 
-def truncate_metadata_file(metadata_path: str, keep_lines: int) -> Set[str]:
-    """
-    Truncate metadata JSONL to exactly `keep_lines` lines.
-    Returns set of panoids from the kept lines.
-    """
-    kept_panoids: Set[str] = set()
-    kept_lines_data = []
+def upload_with_retry(r2, local_path, bucket_key, label="FILE", max_attempts=5):
+    """Upload a file to R2 with exponential backoff and extended retry."""
+    file_size = os.path.getsize(local_path)
 
-    if not os.path.exists(metadata_path):
-        return kept_panoids
+    for attempt in range(1, max_attempts + 1):
+        print(f"[INFO] Uploading {label} ({file_size / (1024**2):.1f} MB), attempt {attempt}/{max_attempts}...")
+        if r2.upload_file(local_path, bucket_key, max_retries=1):
+            return True
+        print(f"[WARN] Upload attempt {attempt}/{max_attempts} failed for {bucket_key}")
+        if attempt < max_attempts:
+            wait = min(2 ** attempt, 120)
+            time.sleep(wait)
 
-    with open(metadata_path, 'r', encoding='utf-8') as f:
-        for i, line in enumerate(f):
-            if i >= keep_lines:
-                break
-            kept_lines_data.append(line)
-            try:
-                data = json.loads(line)
-                kept_panoids.add(data.get('panoid', ''))
-            except Exception:
-                pass
+    # Extended retry with client reset
+    for retry_count in range(1, MAX_EXTENDED_RETRIES + 1):
+        print(f"[WARN] Extended retry #{retry_count}/{MAX_EXTENDED_RETRIES} for {bucket_key}")
+        r2.reset_client()
+        time.sleep(60)
+        if r2.upload_file(local_path, bucket_key, max_retries=1):
+            return True
 
-    # Rewrite file with only the kept lines
-    with open(metadata_path, 'w', encoding='utf-8') as f:
-        for line in kept_lines_data:
-            f.write(line)
-
-    print(f"[RESUME] Truncated metadata to {len(kept_lines_data)} lines ({len(kept_panoids)} panoids)")
-    return kept_panoids
-
-
-def check_and_resume(r2, work_dir: Path):
-    """
-    Check R2 status and local files to determine resume strategy.
-
-    Returns:
-        (strategy, rows_done, done_panoids)
-        strategy: "FRESH" | "RESUME" | "EXIT"
-        rows_done: int — number of valid rows to start from
-        done_panoids: Set[str] — panoids already processed (for filtering records)
-    """
-    status_key = f"Status/{FEATURES_BUCKET_PREFIX}/worker_{WORKER_INDEX}.json"
-    features_file = str(work_dir / 'features.npy')
-    metadata_file = str(work_dir / 'metadata.jsonl')
-    failed_file = str(work_dir / 'failed.jsonl')
-
-    print("[RESUME] ── Checking R2 status for prior run ──")
-    status_data = r2.download_json(status_key)
-
-    if not status_data:
-        print("[RESUME] No prior status found. Starting fresh.")
-        return "FRESH", 0, set()
-
-    prev_status = status_data.get('status', 'UNKNOWN')
-    prev_processed = status_data.get('processed', 0)
-    prev_total = status_data.get('total', 0)
-    print(f"[RESUME] Prior status: {prev_status}, processed: {prev_processed}/{prev_total}")
-
-    # ── Case 1: Already completed → self-destruct ──
-    if prev_status == "COMPLETED":
-        print("[RESUME] Previous run COMPLETED. Self-destructing...")
-        upload_logs_to_r2()
-        self_destruct()
-        sys.exit(0)
-
-    # ── Case 2: Failed or unknown → just restart fresh ──
-    if prev_status.startswith("FAILED") or prev_status == "UNKNOWN":
-        print(f"[RESUME] Prior status is '{prev_status}'. Clearing status and starting fresh.")
-        r2.delete_object(status_key)
-        # Also clear any stale local files
-        for f in [features_file, metadata_file, failed_file]:
-            if os.path.exists(f):
-                os.remove(f)
-                print(f"[RESUME]   Removed stale {os.path.basename(f)}")
-        return "FRESH", 0, set()
-
-    # ── Case 3: Has progress ──
-    if prev_processed > 0:
-        has_features = os.path.exists(features_file) and os.path.getsize(features_file) > 0
-        has_metadata = os.path.exists(metadata_file) and os.path.getsize(metadata_file) > 0
-
-        if not has_features or not has_metadata:
-            # Status says progress but no local files → wipe and restart
-            print("[RESUME] Status shows progress but no local files found!")
-            print("[RESUME] Clearing R2 status and starting fresh.")
-            r2.delete_object(status_key)
-            for f in [features_file, metadata_file, failed_file]:
-                if os.path.exists(f):
-                    os.remove(f)
-            return "FRESH", 0, set()
-
-        # Both files exist → compute safe resume point with rollback
-        print("[RESUME] Local files found. Computing safe resume point...")
-
-        # Count metadata lines
-        meta_count = 0
-        with open(metadata_file, 'r', encoding='utf-8') as f:
-            for _ in f:
-                meta_count += 1
-        print(f"[RESUME]   metadata.jsonl has {meta_count} lines")
-
-        # Scan features for last written row
-        feat_count = find_last_written_row(features_file)
-        print(f"[RESUME]   features.npy has {feat_count} written rows")
-
-        # Take the minimum to be safe (metadata and features must align)
-        safe_count = min(meta_count, feat_count)
-
-        # Roll back by one batch for safety (crash may have been mid-batch)
-        batch_size = HARDCODED_CONFIG['batch_size']
-        rollback = min(batch_size, safe_count)
-        safe_count = max(0, safe_count - rollback)
-        print(f"[RESUME]   Rolled back {rollback} rows → safe_count = {safe_count}")
-
-        if safe_count == 0:
-            # Rollback brought us to zero → just start fresh
-            print("[RESUME] Rollback brought count to 0. Starting fresh.")
-            r2.delete_object(status_key)
-            for f in [features_file, metadata_file, failed_file]:
-                if os.path.exists(f):
-                    os.remove(f)
-            return "FRESH", 0, set()
-
-        # Truncate metadata to safe_count lines & collect panoids
-        done_panoids = truncate_metadata_file(metadata_file, safe_count)
-
-        # Also collect panoids from failed.jsonl (don't retry known failures)
-        if os.path.exists(failed_file):
-            with open(failed_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                        if 'panoid' in data:
-                            done_panoids.add(data['panoid'])
-                    except Exception:
-                        pass
-
-        print(f"[RESUME] ✓ Will resume from row {safe_count} ({len(done_panoids)} panoids done)")
-        return "RESUME", safe_count, done_panoids
-
-    # ── Case 4: No progress yet (status like DOWNLOADING_CSV, INITIALIZING) ──
-    print("[RESUME] Prior run had no progress. Starting fresh.")
-    r2.delete_object(status_key)
-    return "FRESH", 0, set()
+    print(f"[ERROR] Upload permanently failed for {bucket_key}")
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Main Pipeline
+# Process a Single Chunk
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    work_dir = Path('/app/work')
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[INFO] Worker {WORKER_INDEX}/{NUM_WORKERS} starting")
-    print(f"[INFO] City: {CITY_NAME}")
-    print(f"[INFO] CSV prefix: {CSV_BUCKET_PREFIX}")
-    print(f"[INFO] Features prefix: {FEATURES_BUCKET_PREFIX}")
-
-    # ── Step 0: Check for prior run & decide resume strategy ──
-    r2 = R2Client()
-    status_prefix = FEATURES_BUCKET_PREFIX
-
-    # Resolve correct instance ID early (R2 lookup, then env var fallback)
-    global INSTANCE_ID
-    resolved_id = _detect_instance_id() or INSTANCE_ID
-    if resolved_id and resolved_id != INSTANCE_ID:
-        print(f"[INFO] Overriding INSTANCE_ID: env={INSTANCE_ID!r} → R2={resolved_id!r}")
-        INSTANCE_ID = resolved_id
-
-    # ── Pre-check: are the output files already in R2? ──
-    # This handles restart loops — if work is done, self-destruct immediately
-    # regardless of local state or status JSON.
-    npy_key  = f"{FEATURES_BUCKET_PREFIX}/{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.npy"
-    meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.jsonl"
-    print(f"[PRE-CHECK] Checking R2 for existing outputs...")
-    print(f"[PRE-CHECK]   npy  key: {npy_key}")
-    print(f"[PRE-CHECK]   meta key: {meta_key}")
-    if r2.file_exists(npy_key) and r2.file_exists(meta_key):
-        print(f"[PRE-CHECK] ✓ Both output files already in R2 — worker {WORKER_INDEX} is DONE.")
-        reporter = R2StatusReporter(r2, WORKER_INDEX, 0, status_prefix, INSTANCE_ID)
-        reporter.report_final("COMPLETED")
-        upload_logs_to_r2()
-        self_destruct()
-        sys.exit(0)
-    else:
-        print(f"[PRE-CHECK] Output files not yet in R2 — proceeding with pipeline.")
-
-    resume_strategy, rows_done, done_panoids = check_and_resume(r2, work_dir)
-    print(f"[INFO] Resume strategy: {resume_strategy}, rows_done: {rows_done}")
-
-    # ── Step 1: Download CSV segment from R2 ──
-    reporter = R2StatusReporter(r2, WORKER_INDEX, 0, status_prefix, INSTANCE_ID)
-    reporter.report_final("DOWNLOADING_CSV")
-
-    csv_filename = f"{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.csv"
+def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, work_dir: Path):
+    """Download CSV chunk, process all panos, upload NPY + metadata to R2."""
+    city = CITY_NAME
+    csv_filename = f"{city}_{chunk_id}.csv"
     csv_key = f"{CSV_BUCKET_PREFIX}/{csv_filename}"
     local_csv = str(work_dir / csv_filename)
 
-    # Only download CSV if we don't already have it locally
-    if not os.path.exists(local_csv):
-        print(f"[INFO] Downloading {csv_key} from R2...")
-        if not r2.download_file(csv_key, local_csv, max_retries=5):
-            print(f"[ERROR] Failed to download CSV: {csv_key}")
-            reporter.report_final("FAILED:csv_download")
-            sys.exit(1)
-    else:
-        print(f"[INFO] CSV already exists locally: {local_csv}")
+    # ── Step 1: Download CSV chunk from R2 ──
+    print(f"[CHUNK {chunk_id}] Downloading {csv_key}...")
+    if not r2.download_file(csv_key, local_csv, max_retries=3):
+        raise RuntimeError(f"Failed to download {csv_key}")
 
     # ── Step 2: Load CSV ──
     records, metadata_map = load_csv(local_csv)
@@ -1215,182 +854,106 @@ def main():
     total_views_est = total_records * views_per_pano
     feature_dim = 8448
 
-    print(f"[INFO] {total_records} panoids, ~{total_views_est} views expected")
-    reporter = R2StatusReporter(r2, WORKER_INDEX, total_views_est, status_prefix, INSTANCE_ID)
-    reporter.report_final("INITIALIZING")
+    print(f"[CHUNK {chunk_id}] {total_records} panos, ~{total_views_est} views expected")
+
+    if total_records == 0:
+        print(f"[CHUNK {chunk_id}] Empty chunk, skipping")
+        _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+        return
 
     # ── Step 3: Setup output files ──
-    features_file = str(work_dir / 'features.npy')
-    metadata_file = str(work_dir / 'metadata.jsonl')
-    failed_file = str(work_dir / 'failed.jsonl')
+    features_file = str(work_dir / f"{city}_{chunk_id}.npy")
+    metadata_file = str(work_dir / f"Metadata_{city}_{chunk_id}.jsonl")
+    failed_file = str(work_dir / f"failed_{chunk_id}.jsonl")
 
-    # If FRESH start, done_panoids is empty.
-    # If RESUME, done_panoids and rows_done were set by check_and_resume.
-    if resume_strategy == "FRESH":
-        done_panoids = set()
-        rows_done = 0
+    # ~270MB for 1K panos × 8 views × 8448 dim × 4 bytes
+    features_memmap = np.lib.format.open_memmap(
+        features_file, mode='w+', dtype='float32',
+        shape=(total_views_est, feature_dim)
+    )
 
-    # For fresh starts, also check local metadata for backward compat
-    if resume_strategy == "FRESH" and os.path.exists(metadata_file):
-        with open(metadata_file, 'r', encoding='utf-8') as f:
-            for line in f:
+    shared_state = SharedState(features_memmap, metadata_file, failed_file, start_idx=0)
+
+    # ── Step 4: Download + extract ──
+    dl_config = dict(HARDCODED_CONFIG)
+    dl_config['_required_tile_rows'] = compute_required_tile_rows(
+        dl_config['zoom_level'], dl_config['view_fov'], dl_config['augment']
+    )
+
+    item_queue = queue.Queue(maxsize=dl_config['queue_size'])
+    stats = {'dl_ok': 0, 'dl_fail': 0, 'ext_ok': 0, 'views_produced': 0, 'dl_done': False}
+
+    dl_thread = threading.Thread(
+        target=downloader_thread,
+        args=(records, dl_config, item_queue, metadata_map, stats, shared_state)
+    )
+    dl_thread.start()
+
+    # ── Extraction loop ──
+    loop_start = time.time()
+    last_progress_time = time.time()
+    last_progress_count = 0
+    last_log_time = time.time()
+    last_heartbeat_time = time.time()
+    batch_times = []
+    STALL_TIMEOUT = int(os.environ.get('STALL_TIMEOUT', '600'))
+    LOG_INTERVAL = 30
+    HEARTBEAT_INTERVAL = 30
+
+    print(f"[CHUNK {chunk_id}] Starting extraction (batch_size={extractor.batch_size})", flush=True)
+
+    pending_batch: List[ViewItem] = []
+    pending_futures = None
+
+    try:
+        while True:
+            wait_for_disk_space(str(work_dir), MIN_FREE_GB)
+
+            now = time.time()
+
+            # ── Redis heartbeat ──
+            if now - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                 try:
-                    data = json.loads(line)
-                    done_panoids.add(data['panoid'])
-                    rows_done += 1
-                except Exception:
-                    pass
-        if rows_done > 0:
-            print(f"[INFO] Fresh start but found local metadata: {rows_done} views already done")
+                    tq.heartbeat(REGION, INSTANCE_ID, chunk_id)
+                except Exception as e:
+                    print(f"[WARN] Heartbeat failed: {e}", flush=True)
+                last_heartbeat_time = now
 
-    if resume_strategy == "FRESH" and os.path.exists(failed_file):
-        with open(failed_file, 'r', encoding='utf-8') as f:
-            for line in f:
+            # ── Stall detection ──
+            since_progress = now - last_progress_time
+            if since_progress > STALL_TIMEOUT and stats['ext_ok'] == last_progress_count:
+                msg = (f"[FATAL] Chunk {chunk_id} stalled — no progress for {since_progress:.0f}s")
+                print(msg, flush=True)
+                raise RuntimeError(msg)
+
+            # ── Periodic status log ──
+            if now - last_log_time >= LOG_INTERVAL:
+                elapsed = now - loop_start
+                speed = stats['ext_ok'] / elapsed if elapsed > 0 else 0
+                remaining = total_views_est - stats['ext_ok']
+                eta = remaining / speed if speed > 0 else 0
+                pct = int(stats['ext_ok'] / total_views_est * 100) if total_views_est > 0 else 0
+                print(f"PROGRESS|{INSTANCE_ID}|{chunk_id}|{stats['ext_ok']}|{total_views_est}|EXTRACTING", flush=True)
+                print(f"[STATS] chunk={chunk_id} | "
+                      f"views={stats['ext_ok']:,}/{total_views_est:,} ({pct}%) | "
+                      f"speed={speed:.1f} views/s | eta={eta/60:.1f}min | "
+                      f"dl_ok={stats['dl_ok']} | dl_fail={stats['dl_fail']} | "
+                      f"queue={item_queue.qsize()}", flush=True)
+                last_log_time = now
+
+            # ── Fill next batch ──
+            current_batch: List[ViewItem] = []
+            while len(current_batch) < extractor.batch_size:
                 try:
-                    data = json.loads(line)
-                    if 'panoid' in data:
-                        done_panoids.add(data['panoid'])
-                except Exception:
-                    pass
+                    item = item_queue.get(timeout=0.01)
+                    if item is _SENTINEL:
+                        continue
+                    current_batch.append(item)
+                except queue.Empty:
+                    break
 
-    to_process = [r for r in records if r['panoid'] not in done_panoids]
-    print(f"[INFO] Processing {len(to_process)}/{total_records} panoids (rows_done={rows_done})")
-
-    if not to_process:
-        print("[INFO] All panoids already processed, skipping to upload")
-    else:
-        # Create or open memmap
-        if os.path.exists(features_file):
-            features_memmap = np.lib.format.open_memmap(features_file, mode='r+')
-        else:
-            features_memmap = np.lib.format.open_memmap(
-                features_file, mode='w+', dtype='float32',
-                shape=(total_views_est, feature_dim)
-            )
-
-        # Build config
-        dl_config = dict(HARDCODED_CONFIG)
-        dl_config['_required_tile_rows'] = compute_required_tile_rows(
-            dl_config['zoom_level'], dl_config['view_fov'], dl_config['augment']
-        )
-
-        # Shared state — start writing from rows_done
-        shared_state = SharedState(features_memmap, metadata_file, failed_file, start_idx=rows_done)
-
-        # Queue & stats
-        item_queue = queue.Queue(maxsize=dl_config['queue_size'])
-        stats = {'dl_ok': 0, 'dl_fail': 0, 'ext_ok': rows_done, 'views_produced': 0, 'dl_done': False}
-
-        # Init GPU extractor
-        print("[INFO] Initializing GPU extractor...")
-        extractor = GpuExtractor()
-
-        # Start downloader thread
-        dl_thread = threading.Thread(
-            target=downloader_thread,
-            args=(to_process, dl_config, item_queue, metadata_map, stats, shared_state)
-        )
-        dl_thread.start()
-
-        # ── Extraction loop ──
-        loop_start = time.time()
-        last_progress_time = time.time()
-        last_progress_count = rows_done
-        last_log_time = time.time()
-        batch_times = []
-        STALL_TIMEOUT = int(os.environ.get('STALL_TIMEOUT', '600'))  # 10 min default
-        LOG_INTERVAL = 30  # Log stats every 30s
-
-        print(f"[INFO] Starting extraction loop (batch_size={extractor.batch_size}, stall_timeout={STALL_TIMEOUT}s)", flush=True)
-
-        # Prefetch pipeline: decode batch N+1 in the thread pool while the GPU
-        # runs inference on batch N, eliminating CPU-GPU idle time.
-        pending_batch: List[ViewItem] = []
-        pending_futures = None
-
-        try:
-            while True:
-                # Check disk space
-                wait_for_disk_space(str(work_dir), MIN_FREE_GB)
-
-                # ── Stall detection ──
-                now = time.time()
-                since_progress = now - last_progress_time
-                if since_progress > STALL_TIMEOUT and stats['ext_ok'] == last_progress_count:
-                    msg = (f"[FATAL] Pipeline stalled — no progress for {since_progress:.0f}s "
-                           f"(threshold: {STALL_TIMEOUT}s). ext_ok={stats['ext_ok']}, "
-                           f"dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']}, "
-                           f"queue_size={item_queue.qsize()}, dl_alive={dl_thread.is_alive()}")
-                    print(msg, flush=True)
-                    reporter.report_final(f"FAILED:stall_timeout_{STALL_TIMEOUT}s")
-                    upload_logs_to_r2()
-                    raise RuntimeError(msg)
-
-                # ── Periodic status log ──
-                if now - last_log_time >= LOG_INTERVAL:
-                    elapsed = now - loop_start
-                    speed = (stats['ext_ok'] - rows_done) / elapsed if elapsed > 0 else 0
-                    avg_batch = sum(batch_times[-50:]) / len(batch_times[-50:]) if batch_times else 0
-                    remaining = total_views_est - stats['ext_ok']
-                    eta = remaining / speed if speed > 0 else 0
-                    vram_used = torch.cuda.memory_allocated(0) / (1024**3) if torch.cuda.is_available() else 0
-                    panos_done = stats['ext_ok'] // HARDCODED_CONFIG['num_views']
-                    pct = int(stats['ext_ok'] / total_views_est * 100) if total_views_est > 0 else 0
-                    elapsed_min = elapsed / 60
-                    print(f"[STATS] worker={WORKER_INDEX}/{NUM_WORKERS} | "
-                          f"views={stats['ext_ok']:,}/{total_views_est:,} ({pct}%) | "
-                          f"panos~{panos_done:,}/{total_records:,} | "
-                          f"speed={speed:.1f} views/s | eta={eta/60:.1f}min | "
-                          f"elapsed={elapsed_min:.1f}min | "
-                          f"dl_ok={stats['dl_ok']} | dl_fail={stats['dl_fail']} | "
-                          f"queue={item_queue.qsize()} | avg_batch={avg_batch:.2f}s | "
-                          f"vram={vram_used:.2f}GB | dl_alive={dl_thread.is_alive()}", flush=True)
-                    last_log_time = now
-
-                # ── Fill next batch (extractor.batch_size may shrink after an OOM) ──
-                current_batch: List[ViewItem] = []
-                while len(current_batch) < extractor.batch_size:
-                    try:
-                        item = item_queue.get(timeout=0.01)
-                        if item is _SENTINEL:
-                            continue
-                        current_batch.append(item)
-                    except queue.Empty:
-                        break
-
-                # ── No new items: drain any pending batch then check for exit ──
-                if not current_batch:
-                    if pending_batch and pending_futures is not None:
-                        batch_start = time.time()
-                        try:
-                            feats_np, meta_batch, _ = extractor.infer_prefetched(pending_batch, pending_futures)
-                            if feats_np is not None and len(meta_batch) > 0:
-                                shared_state.write_batch(feats_np, meta_batch)
-                                stats['ext_ok'] += len(meta_batch)
-                                reporter.update(stats['ext_ok'], "EXTRACTING")
-                                last_progress_time = time.time()
-                                last_progress_count = stats['ext_ok']
-                                del feats_np, meta_batch
-                            batch_times.append(time.time() - batch_start)
-                            if stats['ext_ok'] % 5000 == 0:
-                                gc.collect()
-                        except Exception as e:
-                            print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
-                            import traceback
-                            traceback.print_exc()
-                        finally:
-                            pending_batch = []
-                            pending_futures = None
-                    if not dl_thread.is_alive():
-                        break
-                    continue
-
-                # ── Submit decode of current_batch immediately (non-blocking) ──
-                # These JPEG decodes run in the thread pool while the GPU processes
-                # the previous (pending) batch — that is the prefetch overlap.
-                current_futures = extractor.start_decode(current_batch)
-
-                # ── GPU inference on the previously decoded (pending) batch ──
+            # ── No new items: drain pending then check for exit ──
+            if not current_batch:
                 if pending_batch and pending_futures is not None:
                     batch_start = time.time()
                     try:
@@ -1398,7 +961,6 @@ def main():
                         if feats_np is not None and len(meta_batch) > 0:
                             shared_state.write_batch(feats_np, meta_batch)
                             stats['ext_ok'] += len(meta_batch)
-                            reporter.update(stats['ext_ok'], "EXTRACTING")
                             last_progress_time = time.time()
                             last_progress_count = stats['ext_ok']
                             del feats_np, meta_batch
@@ -1409,122 +971,208 @@ def main():
                         print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
                         import traceback
                         traceback.print_exc()
+                    finally:
+                        pending_batch = []
+                        pending_futures = None
+                if not dl_thread.is_alive():
+                    break
+                continue
 
-                # ── Promote current batch to pending (its decode continues in bg) ──
-                pending_batch = current_batch
-                pending_futures = current_futures
+            # ── Submit decode of current batch ──
+            current_futures = extractor.start_decode(current_batch)
 
-        except KeyboardInterrupt:
-            print("[WARN] Interrupted", flush=True)
+            # ── GPU inference on pending batch ──
+            if pending_batch and pending_futures is not None:
+                batch_start = time.time()
+                try:
+                    feats_np, meta_batch, _ = extractor.infer_prefetched(pending_batch, pending_futures)
+                    if feats_np is not None and len(meta_batch) > 0:
+                        shared_state.write_batch(feats_np, meta_batch)
+                        stats['ext_ok'] += len(meta_batch)
+                        last_progress_time = time.time()
+                        last_progress_count = stats['ext_ok']
+                        del feats_np, meta_batch
+                    batch_times.append(time.time() - batch_start)
+                    if stats['ext_ok'] % 5000 == 0:
+                        gc.collect()
+                except Exception as e:
+                    print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
 
-        dl_thread.join()
-        final_count = shared_state.write_idx
-        shared_state.close()
+            # ── Promote current batch to pending ──
+            pending_batch = current_batch
+            pending_futures = current_futures
 
-        # Truncate memmap to actual size
-        del features_memmap
-        gc.collect()
+    except KeyboardInterrupt:
+        print("[WARN] Interrupted", flush=True)
 
-        if final_count == 0 and total_records > 0:
-            print(f"[ERROR] 0 features extracted from {total_records} records! Marking as FAILED.")
-            reporter.report_final("FAILED:zero_features_extracted")
-            # Clean up empty files
-            try:
-                os.remove(features_file)
-                os.remove(metadata_file)
-            except OSError:
-                pass
-            sys.exit(1)
+    dl_thread.join()
+    final_count = shared_state.write_idx
+    shared_state.close()
 
-        if final_count > 0 and final_count < total_views_est:
-            print(f"[INFO] Truncating features: {total_views_est} → {final_count}")
-            mm = np.lib.format.open_memmap(features_file, mode='r+')
-            truncated = mm[:final_count].copy()
-            del mm
-            np.save(features_file, truncated)
-            del truncated
+    # ── Truncate memmap to actual size ──
+    del features_memmap
+    gc.collect()
 
-        print(f"[INFO] Extraction complete: {final_count} features extracted")
+    if final_count == 0 and total_records > 0:
+        print(f"[ERROR] Chunk {chunk_id}: 0 features from {total_records} panos!")
+        _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+        raise RuntimeError(f"Zero features extracted from chunk {chunk_id}")
 
-    # ── Step 4: Upload to R2 ──
-    reporter.report_final("UPLOADING")
-    print("[INFO] Uploading features to R2...")
+    if final_count > 0 and final_count < total_views_est:
+        print(f"[CHUNK {chunk_id}] Truncating features: {total_views_est} → {final_count}")
+        mm = np.lib.format.open_memmap(features_file, mode='r+')
+        truncated = mm[:final_count].copy()
+        del mm
+        np.save(features_file, truncated)
+        del truncated
 
-    npy_key = f"{FEATURES_BUCKET_PREFIX}/{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.npy"
-    meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{CITY_NAME}_{WORKER_INDEX}.{NUM_WORKERS}.jsonl"
+    print(f"[CHUNK {chunk_id}] Extraction complete: {final_count} features")
 
-    # Upload with progress reporting and capped retry for large files
-    MAX_EXTENDED_RETRIES = 30  # ~30 min of extended retries before giving up
+    # ── Step 5: Upload chunk outputs to R2 ──
+    npy_key = f"{FEATURES_BUCKET_PREFIX}/{city}_{chunk_id}.npy"
+    meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{city}_{chunk_id}.jsonl"
 
-    def upload_with_retry(local_path, bucket_key, label="FILE", max_attempts=5):
-        file_size = os.path.getsize(local_path)
-        _last_r2_report = [0.0]
-        _upload_start = [time.time()]
-
-        def _progress_cb(bytes_done, bytes_total):
-            now = time.time()
-            elapsed = max(now - _upload_start[0], 0.001)
-            mb_done = bytes_done / (1024 * 1024)
-            speed_mb = mb_done / elapsed
-            remaining_mb = (bytes_total - bytes_done) / (1024 * 1024)
-            eta = remaining_mb / speed_mb if speed_mb > 0 else 0
-            # Throttle R2 status reports to every 30s
-            if now - _last_r2_report[0] >= 30.0:
-                reporter.report_upload(bytes_done, bytes_total, speed_mb, eta, label)
-                _last_r2_report[0] = now
-
-        for attempt in range(1, max_attempts + 1):
-            print(f"[INFO] Uploading {label} ({file_size / (1024**3):.2f} GB), attempt {attempt}/{max_attempts}...")
-            _upload_start[0] = time.time()
-            _last_r2_report[0] = 0.0
-            if r2.upload_file(local_path, bucket_key, max_retries=1,
-                              progress_callback=_progress_cb):
-                reporter.report_upload(file_size, file_size, 0, 0, label)
-                return True
-            print(f"[WARN] Upload attempt {attempt}/{max_attempts} failed for {bucket_key}")
-            reporter.report_upload(0, file_size, 0, 0, f"{label}_RETRY")
-            if attempt < max_attempts:
-                wait = min(2 ** attempt, 120)
-                print(f"[INFO] Retrying in {wait}s...")
-                time.sleep(wait)
-
-        # Extended retry with cap — reset S3 client each round to clear stale connections
-        for retry_count in range(1, MAX_EXTENDED_RETRIES + 1):
-            print(f"[WARN] Extended retry #{retry_count}/{MAX_EXTENDED_RETRIES} for {bucket_key} (60s cooldown)...")
-            reporter.report_upload(0, file_size, 0, 0, f"{label}_RETRY")
-            r2.reset_client()
-            time.sleep(60)
-            _upload_start[0] = time.time()
-            _last_r2_report[0] = 0.0
-            if r2.upload_file(local_path, bucket_key, max_retries=1,
-                              progress_callback=_progress_cb):
-                reporter.report_upload(file_size, file_size, 0, 0, label)
-                return True
-
-        print(f"[ERROR] Upload permanently failed after {max_attempts + MAX_EXTENDED_RETRIES} total attempts for {bucket_key}")
-        return False
-
-    success = True
     if os.path.exists(features_file) and os.path.getsize(features_file) > 0:
-        if not upload_with_retry(features_file, npy_key, label="NPY"):
-            success = False
+        if not upload_with_retry(r2, features_file, npy_key, label="NPY"):
+            raise RuntimeError(f"Failed to upload NPY for chunk {chunk_id}")
     if os.path.exists(metadata_file) and os.path.getsize(metadata_file) > 0:
-        if not upload_with_retry(metadata_file, meta_key, label="META"):
-            success = False
+        if not upload_with_retry(r2, metadata_file, meta_key, label="META"):
+            raise RuntimeError(f"Failed to upload metadata for chunk {chunk_id}")
 
-    if success:
-        reporter.report_final("COMPLETED")
-        print("[INFO] Upload complete! Self-destructing...")
-    else:
-        reporter.report_final("FAILED:upload")
-        print("[ERROR] Upload failed after all retries. Self-destructing to stop billing.")
+    print(f"[CHUNK {chunk_id}] Upload complete")
 
-    # Cleanup local files
-    for f in [features_file, metadata_file, failed_file, local_csv]:
+    # ── Step 6: Cleanup local files ──
+    _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+
+
+def _cleanup_chunk_files(work_dir: Path, chunk_id: str, local_csv: str = None):
+    """Delete local files for a processed chunk to free disk space."""
+    city = CITY_NAME
+    for f in [
+        str(work_dir / f"{city}_{chunk_id}.npy"),
+        str(work_dir / f"Metadata_{city}_{chunk_id}.jsonl"),
+        str(work_dir / f"failed_{chunk_id}.jsonl"),
+    ]:
         try:
             os.remove(f)
-        except Exception:
+        except OSError:
             pass
+    if local_csv:
+        try:
+            os.remove(local_csv)
+        except OSError:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main Pipeline — Chunk Queue Loop
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    work_dir = Path('/app/work')
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[INFO] Worker {INSTANCE_ID} starting")
+    print(f"[INFO] City: {CITY_NAME}")
+    print(f"[INFO] Region: {REGION}")
+    print(f"[INFO] CSV prefix: {CSV_BUCKET_PREFIX}")
+    print(f"[INFO] Features prefix: {FEATURES_BUCKET_PREFIX}")
+    print(f"[INFO] Redis: {REDIS_URL[:40]}...")
+
+    # ── Init R2 client ──
+    r2 = R2Client()
+
+    # ── Init Redis task queue ──
+    if not REDIS_URL or not REDIS_TOKEN:
+        print("[FATAL] REDIS_URL and REDIS_TOKEN must be set")
+        sys.exit(1)
+    if not REGION:
+        print("[FATAL] REGION must be set (e.g. 'AU/Queensland/Brisbane')")
+        sys.exit(1)
+
+    tq = TaskQueue(REDIS_URL, REDIS_TOKEN)
+
+    # Verify connection and job exists
+    progress = tq.get_progress(REGION)
+    print(f"[INFO] Job status: {progress}")
+    if progress['total_chunks'] == 0:
+        print("[FATAL] No job found in Redis for this region")
+        sys.exit(1)
+
+    # ── Init GPU extractor ONCE (expensive — 30-60s) ──
+    print("[INFO] Initializing GPU extractor...")
+    extractor = GpuExtractor()
+
+    # ── Chunk queue loop ──
+    chunks_done = 0
+    chunks_failed = 0
+    idle_cycles = 0
+    MAX_IDLE_CYCLES = 6  # 6 × 30s = 3 min of idle before checking job completion
+
+    while True:
+        # Try to claim a task
+        try:
+            chunk_id = tq.claim_task(REGION, INSTANCE_ID)
+        except Exception as e:
+            print(f"[WARN] Redis claim_task failed: {e} — retrying in 10s")
+            time.sleep(10)
+            continue
+
+        if chunk_id is None:
+            # No todo tasks available
+            try:
+                if tq.is_complete(REGION):
+                    print(f"[INFO] Job complete! Processed {chunks_done} chunks. Self-destructing.")
+                    break
+            except Exception as e:
+                print(f"[WARN] Redis is_complete check failed: {e}")
+
+            idle_cycles += 1
+            if idle_cycles >= MAX_IDLE_CYCLES:
+                # Check one more time after waiting
+                try:
+                    if tq.is_complete(REGION):
+                        print(f"[INFO] Job complete after idle wait. Self-destructing.")
+                        break
+                except Exception:
+                    pass
+                # Still tasks in progress — keep waiting (stale monitor will reclaim them)
+                print(f"[INFO] No tasks available but {idle_cycles} idle cycles. "
+                      "Waiting for in-progress tasks to finish or be reclaimed...")
+                idle_cycles = 0
+            time.sleep(30)
+            continue
+
+        idle_cycles = 0
+        print(f"\n{'='*60}")
+        print(f"[INFO] Claimed chunk: {chunk_id} (completed so far: {chunks_done})")
+        print(f"{'='*60}")
+
+        try:
+            process_chunk(r2, tq, extractor, chunk_id, work_dir)
+            tq.complete_task(REGION, chunk_id, INSTANCE_ID)
+            chunks_done += 1
+            print(f"[INFO] Completed chunk {chunk_id} ({chunks_done} total)")
+        except Exception as e:
+            chunks_failed += 1
+            error_msg = f"{type(e).__name__}: {str(e)[:200]}"
+            print(f"[ERROR] Chunk {chunk_id} failed: {error_msg}")
+            import traceback
+            traceback.print_exc()
+            try:
+                tq.fail_task(REGION, chunk_id, INSTANCE_ID, error_msg)
+            except Exception as re:
+                print(f"[WARN] Failed to return chunk to queue: {re}")
+            _cleanup_chunk_files(work_dir, chunk_id)
+
+        # Force GC between chunks
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # ── Done — self-destruct ──
+    print(f"\n[INFO] Final stats: {chunks_done} chunks completed, {chunks_failed} failed")
     upload_logs_to_r2()
     self_destruct()
 
@@ -1538,14 +1186,5 @@ if __name__ == '__main__':
         print(f"[CRITICAL] {error_type}: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        # Truncate error message for status key (R2 keys have limits)
-        short_err = f"{error_type}:{str(e)[:100]}"
         upload_logs_to_r2()
-        # Report failure to R2
-        try:
-            r2 = R2Client()
-            reporter = R2StatusReporter(r2, WORKER_INDEX, 0, FEATURES_BUCKET_PREFIX, INSTANCE_ID)
-            reporter.report_final(f"FAILED:{short_err}")
-        except Exception as r2e:
-            print(f"[CRITICAL] Could not report failure to R2: {r2e}", flush=True)
         sys.exit(1)

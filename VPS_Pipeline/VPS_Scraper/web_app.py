@@ -12,7 +12,6 @@ import os
 import sys
 import json
 import uuid
-import math
 import asyncio
 import datetime
 import time
@@ -30,10 +29,9 @@ from scraper import UnifiedScraper, UnifiedScraperConfig
 
 try:
     from r2_storage import R2Client
-    from csv_splitter import split_csv, split_csv_chunks, upload_csv_segments
+    from csv_splitter import split_csv, upload_csv_segments
     from vast_manager import VastManager, ContainerNotFoundError
-    from log_monitor_web import R2StatusMonitorThread, RedisQueueMonitorThread
-    from redis_queue import TaskQueue
+    from log_monitor_web import R2StatusMonitorThread
     VPS_AVAILABLE = True
 except ImportError:
     VPS_AVAILABLE = False
@@ -62,41 +60,6 @@ sessions: Dict[str, Dict[str, Any]] = {}
 
 def _sanitize_geo(s):
     return "".join(c for c in str(s) if c.isalnum() or c in (' ', '_', '-')).strip().replace(' ', '_')
-
-
-TRACKER_KEY = "status/shapes_tracker.json"
-
-
-def _update_tracker_json(r2_client, country: str, state: str, city: str,
-                          field: str, lat: float = None, lon: float = None):
-    """
-    Read-modify-write the shapes tracker JSON on R2.
-
-    Args:
-        r2_client: R2Client instance
-        country, state, city: Path components
-        field: Which flag to set True ('csv', 'features', 'index')
-        lat, lon: Centroid coordinates (required when field='csv')
-    """
-    tracker = r2_client.download_json(TRACKER_KEY)  # returns {} on failure
-
-    region_key = f"{country}/{state}/{city}"
-
-    if region_key not in tracker:
-        tracker[region_key] = {
-            'lat': lat or 0,
-            'lon': lon or 0,
-            'csv': False,
-            'features': False,
-            'index': False,
-        }
-
-    tracker[region_key][field] = True
-    if lat is not None and lon is not None:
-        tracker[region_key]['lat'] = lat
-        tracker[region_key]['lon'] = lon
-
-    r2_client.upload_json(TRACKER_KEY, tracker)
 
 
 def _reverse_geocode(lat: float, lon: float):
@@ -171,10 +134,6 @@ def _get_session(sid: str) -> Dict[str, Any]:
             'builder_monitor': None,
             'shapes_data': [],
             'status': 'Ready',
-            'pending_offers': None,
-            # Job state: idle | scraping | searching_offers | awaiting_offer_selection
-            #          | creating_instances | monitoring | building_index | done | error
-            'job_state': 'idle',
         }
     return sessions[sid]
 
@@ -196,7 +155,11 @@ class ScraperThread(threading.Thread):
 
     def run(self):
         try:
-            loop = asyncio.new_event_loop()
+            try:
+                import winloop
+                loop = winloop.new_event_loop()
+            except ImportError:
+                loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
             if self.mode == "polygon":
@@ -216,9 +179,6 @@ class ScraperThread(threading.Thread):
                 result = []
 
             loop.close()
-            sess = _get_session(self.session_id)
-            if sess.get('job_state') == 'scraping':
-                sess['job_state'] = 'idle'
             socketio.emit('scrape_finished', {
                 'total_written': self.scraper.total_written,
                 'total_images': self.scraper.total_images,
@@ -226,7 +186,6 @@ class ScraperThread(threading.Thread):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            _get_session(self.session_id)['job_state'] = 'error'
             socketio.emit('scrape_error', {'error': str(e)}, room=self.session_id)
 
     def cancel(self):
@@ -250,8 +209,6 @@ class VPSDeployThread(threading.Thread):
             elif self.mode == "provision":
                 self._do_search_offers()
         except Exception as e:
-            sess = _get_session(self.session_id)
-            sess['job_state'] = 'error'
             socketio.emit('vps_error', {'error': str(e)}, room=self.session_id)
 
     def _do_geocode_and_r2_check(self):
@@ -347,19 +304,9 @@ class VPSDeployThread(threading.Thread):
         sess = _get_session(self.session_id)
         sess['vast_manager'] = manager
 
-        worker_indices = ctx.get('worker_indices_to_deploy',
-                                  list(range(1, ctx.get('actual_workers', ctx.get('num_workers', 10)) + 1)))
-        total_workers = ctx.get('total_workers', ctx.get('actual_workers', len(worker_indices)))
-        offers_data = {
-            'offers': offers if offers else [],
-            'worker_indices': worker_indices,
-            'total_workers': total_workers,
-        }
-        # Persist so frontend can recover after websocket reconnect
-        sess = _get_session(self.session_id)
-        sess['pending_offers'] = offers_data
-        sess['job_state'] = 'awaiting_offer_selection'
-        socketio.emit('vps_offers_found', offers_data, room=self.session_id)
+        socketio.emit('vps_offers_found', {
+            'offers': offers if offers else []
+        }, room=self.session_id)
 
 
 class InstanceCreateThread(threading.Thread):
@@ -385,40 +332,20 @@ class InstanceCreateThread(threading.Thread):
             features_prefix = f"Features/{self.ctx['country']}/{self.ctx['state']}/{self.ctx['city']}"
             instance_worker_map = {}
 
-            # Show all workers in the table immediately
-            socketio.emit('vps_creation_started', {
-                'worker_indices': self.worker_indices,
-            }, room=self.session_id)
-
-            # Track offers claimed across ALL workers so each gets a different machine
-            globally_used_offer_ids = set()
-
             for i, worker_idx in enumerate(self.worker_indices):
+                offer = self.selected_offers[i % len(self.selected_offers)]
                 env_vars = {
                     'R2_ACCOUNT_ID': self.ctx['r2_account'],
                     'R2_ACCESS_KEY_ID': self.ctx['r2_access'],
                     'R2_SECRET_ACCESS_KEY': self.ctx['r2_secret'],
                     'R2_BUCKET_NAME': self.ctx['r2_bucket'],
+                    'WORKER_INDEX': str(worker_idx),
+                    'NUM_WORKERS': str(self.total_workers),
                     'CSV_BUCKET_PREFIX': f"CSV/{self.ctx['country']}/{self.ctx['state']}/{self.ctx['city']}",
                     'FEATURES_BUCKET_PREFIX': features_prefix,
                     'CITY_NAME': self.ctx['city'],
                     'VAST_API_KEY': self.ctx['vast_key'],
-                    'REDIS_URL': self.ctx.get('redis_url', ''),
-                    'REDIS_TOKEN': self.ctx.get('redis_token', ''),
-                    'REGION': self.ctx.get('region', f"{self.ctx['country']}/{self.ctx['state']}/{self.ctx['city']}"),
                 }
-
-                # Pick an offer not yet claimed by another worker
-                offer = None
-                for candidate in self.selected_offers:
-                    if candidate['id'] not in globally_used_offer_ids:
-                        offer = candidate
-                        break
-                if offer is None:
-                    offer = self.selected_offers[i % len(self.selected_offers)]
-                globally_used_offer_ids.add(offer['id'])
-
-                label = f"({i+1}/{len(self.worker_indices)})"
                 instance_id = self.vast_manager.create_instance(
                     offer_id=offer['id'],
                     docker_image=self.ctx['docker_image'],
@@ -427,98 +354,25 @@ class InstanceCreateThread(threading.Thread):
                     onstart_cmd="bash /app/entrypoint.sh",
                     template_hash=VastManager.GEOAXIS_TEMPLATE_HASH,
                 )
-
                 if instance_id:
                     instance_worker_map[instance_id] = worker_idx
-                    socketio.emit('vps_worker_created', {
-                        'worker_idx': worker_idx,
-                        'instance_id': instance_id,
-                    }, room=self.session_id)
+                    try:
+                        r2.upload_json(
+                            f"Status/{features_prefix}/worker_{worker_idx}_instance.json",
+                            {'instance_id': instance_id, 'worker_index': worker_idx},
+                        )
+                    except Exception:
+                        pass
                     socketio.emit('vps_status', {
-                        'message': f"Worker {worker_idx} {label}: created instance {instance_id} on {offer['gpu_name']}"
-                    }, room=self.session_id)
-                else:
-                    socketio.emit('vps_worker_create_failed', {
-                        'worker_idx': worker_idx,
-                        'message': f"Failed to create instance on offer {offer['id']}",
-                    }, room=self.session_id)
-                    socketio.emit('vps_status', {
-                        'message': f"Worker {worker_idx} {label} — creation FAILED"
+                        'message': f"Created worker {worker_idx} ({i+1}/{len(self.worker_indices)}) — instance {instance_id}"
                     }, room=self.session_id)
 
             socketio.emit('vps_instances_created', {
-                'instance_worker_map': instance_worker_map,
-                'total_workers': len(self.worker_indices),
+                'instance_worker_map': instance_worker_map
             }, room=self.session_id)
 
-            # Auto-start monitoring immediately
-            if instance_worker_map:
-                self._start_monitoring(r2, instance_worker_map)
-
         except Exception as e:
-            _get_session(self.session_id)['job_state'] = 'error'
             socketio.emit('vps_error', {'error': str(e)}, room=self.session_id)
-
-    def _start_monitoring(self, r2, instance_worker_map):
-        """Start Redis queue monitor + Vast.ai status polling after instances are created."""
-        sid = self.session_id
-        sess = _get_session(sid)
-
-        def on_progress(progress_data):
-            socketio.emit('vps_queue_progress', progress_data, room=sid)
-
-        def on_complete():
-            socketio.emit('vps_job_complete', {}, room=sid)
-            try:
-                country = self.ctx.get('country', '')
-                state = self.ctx.get('state', '')
-                city = self.ctx.get('city', '')
-                if country and state and city:
-                    _update_tracker_json(r2, country, state, city, 'features')
-            except Exception as e:
-                logger.warning(f"Failed to update tracker after features: {e}")
-
-        def on_log(message):
-            socketio.emit('vps_log', {'message': message}, room=sid)
-
-        # Use Redis-based queue monitor
-        tq = sess.get('task_queue')
-        region = self.ctx.get('region', f"{self.ctx['country']}/{self.ctx['state']}/{self.ctx['city']}")
-
-        if tq is None:
-            redis_url = self.ctx.get('redis_url', os.environ.get('REDIS_URL', ''))
-            redis_token = self.ctx.get('redis_token', os.environ.get('REDIS_TOKEN', ''))
-            if redis_url and redis_token:
-                tq = TaskQueue(redis_url, redis_token)
-                sess['task_queue'] = tq
-
-        if tq:
-            monitor = RedisQueueMonitorThread(
-                task_queue=tq,
-                region=region,
-                instance_ids=list(instance_worker_map.keys()),
-                poll_interval=10.0,
-                stale_interval=60.0,
-                on_progress=on_progress,
-                on_complete=on_complete,
-                on_log=on_log,
-                vast_manager=self.vast_manager,
-            )
-        else:
-            # Fallback to R2-based monitoring if no Redis
-            monitor = R2StatusMonitorThread(
-                r2_client=r2, city_name=self.ctx['city'],
-                instance_worker_map=instance_worker_map,
-                poll_interval=10.0,
-                on_progress=on_progress,
-                on_worker_finished=lambda w, s: None,
-                on_log_message=on_log,
-                vast_manager=self.vast_manager,
-            )
-
-        sess['log_monitor'] = monitor
-        sess['job_state'] = 'monitoring'
-        monitor.start()
 
 
 class BuilderSearchThread(threading.Thread):
@@ -580,15 +434,13 @@ class BuilderSearchThread(threading.Thread):
 
 
 class BuilderMonitorThread(threading.Thread):
-    """Poll R2 for builder progress using flat status key."""
+    """Poll R2 for builder progress."""
 
-    def __init__(self, session_id, r2_client, city_name, instance_id, poll_interval=10.0):
+    def __init__(self, session_id, r2_client, status_prefix, poll_interval=10.0):
         super().__init__(daemon=True)
         self.session_id = session_id
         self.r2_client = r2_client
-        self.city_name = city_name
-        self.instance_id = instance_id
-        self.status_key = f"Status/INDEX_{city_name}_{instance_id}.json"
+        self.status_key = f"Status/{status_prefix}/builder.json"
         self.poll_interval = poll_interval
         self._running = True
 
@@ -600,30 +452,12 @@ class BuilderMonitorThread(threading.Thread):
                     step = data.get('step', '')
                     detail = data.get('detail', '')
                     pct = data.get('pct', 0)
-                    status = data.get('s', data.get('status', 'UNKNOWN'))
+                    status = data.get('status', 'UNKNOWN')
                     socketio.emit('builder_progress', {
                         'step': step, 'detail': detail, 'pct': pct, 'status': status
                     }, room=self.session_id)
-                    if status in ("COMPLETED", "FAILED") or status.startswith("FAILED"):
+                    if status in ("COMPLETED", "FAILED"):
                         socketio.emit('builder_finished', {'status': status}, room=self.session_id)
-                        if status == "COMPLETED":
-                            try:
-                                sess = _get_session(self.session_id)
-                                region = sess.get('builder_region', {})
-                                if not region:
-                                    ctx = sess.get('vps_context', {})
-                                    region = {'country': ctx.get('country', ''),
-                                              'state': ctx.get('state', ''),
-                                              'city': ctx.get('city', self.city_name)}
-                                if region.get('country') and region.get('state') and region.get('city'):
-                                    _update_tracker_json(
-                                        self.r2_client,
-                                        region['country'], region['state'], region['city'],
-                                        'index'
-                                    )
-                            except Exception as e:
-                                logger.warning(f"Failed to update tracker after index build: {e}")
-                        self._cleanup()
                         return
             except Exception:
                 pass
@@ -631,17 +465,6 @@ class BuilderMonitorThread(threading.Thread):
 
     def stop(self):
         self._running = False
-
-    def _cleanup(self):
-        """Delete builder status and lookup files from R2."""
-        for key in [
-            f"Status/INDEX_{self.city_name}_{self.instance_id}.json",
-            f"Status/INDEX_{self.city_name}_lookup.json",
-        ]:
-            try:
-                self.r2_client.delete_file(key)
-            except Exception:
-                pass
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -764,11 +587,8 @@ def start_scrape():
         )
 
     sess['scraper_thread'] = thread
-    sess['job_state'] = 'scraping'
 
     # Start speed stats emitter
-    thread.start()  # Start scraper first so is_alive() is True
-
     def speed_stats_loop():
         while thread.is_alive():
             time.sleep(1.0)
@@ -785,20 +605,10 @@ def start_scrape():
                     'tiles': tiles, 'total_tiles': total_tiles,
                     'p2_done': p2_done, 'p2_total': p2_total,
                 }, room=sid)
-        # Emit one final stats update after thread finishes
-        if scraper:
-            socketio.emit('scrape_stats', {
-                'found': len(scraper.found_panos) if hasattr(scraper, 'found_panos') else 0,
-                'written': scraper.total_written if hasattr(scraper, 'total_written') else 0,
-                'images': scraper.total_images if hasattr(scraper, 'total_images') else 0,
-                'tiles': scraper.tiles_processed if hasattr(scraper, 'tiles_processed') else 0,
-                'total_tiles': scraper.total_tiles if hasattr(scraper, 'total_tiles') else 0,
-                'p2_done': scraper.phase2_completed if hasattr(scraper, 'phase2_completed') else 0,
-                'p2_total': scraper.phase2_total if hasattr(scraper, 'phase2_total') else 0,
-            }, room=sid)
 
     stats_thread = threading.Thread(target=speed_stats_loop, daemon=True)
     stats_thread.start()
+    thread.start()
 
     return jsonify({'status': 'started'})
 
@@ -810,15 +620,7 @@ def cancel_scrape():
     sess = _get_session(sid)
     thread = sess.get('scraper_thread')
     if thread and thread.is_alive():
-        if isinstance(thread, ScraperThread):
-            thread.cancel()
-        else:
-            # Plain threading.Thread (e.g. from vps-scrape-upload) —
-            # cancel via the scraper object directly.
-            scraper = sess.get('scraper')
-            if scraper and hasattr(scraper, 'cancel'):
-                scraper.cancel()
-    sess['job_state'] = 'idle'
+        thread.cancel()
     return jsonify({'status': 'cancelled'})
 
 
@@ -872,206 +674,10 @@ def deploy_vps():
     }
     sess['vps_context'] = ctx
 
-    sess['job_state'] = 'searching_offers'
-    sess['pending_offers'] = None
-
     thread = VPSDeployThread(sid, ctx, mode="full")
     thread.start()
 
     return jsonify({'status': 'deploying'})
-
-
-@app.route('/api/vps-scrape-upload', methods=['POST'])
-def vps_scrape_upload():
-    """Fresh scrape → split CSV → upload to R2 → search offers.
-
-    This is the flow triggered when R2 has no existing CSVs.  The original
-    PyQt6 ui.py ran the scraper locally (CSV-only metadata pass), split the
-    resulting CSV into per-worker segments, uploaded them to R2, and then
-    searched for VPS offers.  The web_app was missing this entire pipeline.
-    """
-    if not VPS_AVAILABLE:
-        return jsonify({'error': 'VPS modules not available'}), 400
-
-    data = request.json
-    sid = data.get('session_id', '')
-    sess = _get_session(sid)
-    ctx = sess.get('vps_context', {})
-
-    if not ctx:
-        return jsonify({'error': 'No VPS context — call deploy-vps first'}), 400
-
-    selected_coords = ctx.get('selected_coords', [])
-    if not selected_coords:
-        return jsonify({'error': 'No shapes in VPS context'}), 400
-
-    country = ctx['country']
-    state = ctx['state']
-    city = ctx['city']
-
-    # Build scraper (CSV-only, no images)
-    config = UnifiedScraperConfig(concurrency=1000, proxy_file=None)
-    scraper = UnifiedScraper(config)
-    sess['scraper'] = scraper
-
-    # Callbacks that emit Socket.IO events
-    def on_progress(c, t):
-        socketio.emit('vps_scrape_progress', {'current': c, 'total': t}, room=sid)
-
-    def on_status(s):
-        socketio.emit('vps_status', {'message': f'CSV Scrape: {s}'}, room=sid)
-
-    def on_point_found(lat, lon, panoid):
-        socketio.emit('point_found', {'lat': lat, 'lon': lon, 'panoid': panoid}, room=sid)
-
-    scraper.set_progress_callback(on_progress)
-    scraper.set_status_callback(on_status)
-    scraper.set_point_callback(on_point_found)
-
-    project_root = Path(__file__).parent.parent
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_dir = project_root / "Output" / "CSV" / country / state / city
-    images_dir = project_root / "Output" / "Images" / country / state / city
-
-    if len(selected_coords) == 1:
-        csv_path = str(csv_dir / f"{timestamp}.csv")
-        scraper.init_csv(csv_path)
-        scraper.init_images_dir(str(images_dir))
-        mode = "polygon"
-        kwargs = {'polygon_coords': selected_coords[0]}
-    else:
-        merged_csv_path = str(csv_dir / f"Merged_{timestamp}.csv")
-        scraper.init_csv(merged_csv_path)
-        scraper.init_images_dir(str(images_dir))
-        csv_path = merged_csv_path
-        mode = "multi_polygon"
-        kwargs = {
-            'polygon_list': selected_coords,
-            'csv_paths': [merged_csv_path] * len(selected_coords),
-            'images_dirs': [str(images_dir)] * len(selected_coords),
-            'merge_csv': True,
-        }
-
-    def _scrape_split_upload():
-        """Background thread: scrape → split → upload → search offers."""
-        try:
-            # Phase 1: Scrape
-            socketio.emit('vps_status', {'message': 'VPS Deploy: Scraping CSV...'}, room=sid)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            if mode == "polygon":
-                loop.run_until_complete(
-                    scraper.scrape_area_two_phase(kwargs['polygon_coords'])
-                )
-            else:
-                loop.run_until_complete(
-                    scraper.scrape_multiple_polygons_two_phase(
-                        kwargs['polygon_list'],
-                        csv_paths=kwargs.get('csv_paths'),
-                        images_dirs=kwargs.get('images_dirs'),
-                        merge_csv=kwargs.get('merge_csv', False),
-                    )
-                )
-            loop.close()
-
-            # Close CSV handle
-            if scraper.csv_file_handle and not scraper.csv_file_handle.closed:
-                scraper.csv_file_handle.flush()
-                scraper.csv_file_handle.close()
-
-            socketio.emit('vps_status', {
-                'message': f'VPS Deploy: CSV scraping complete ({scraper.total_written} panos). Splitting...'
-            }, room=sid)
-
-            # Phase 2: Split CSV into 1K-pano chunks + auto-calculate workers
-            CHUNK_SIZE = 1000
-            PANOS_PER_WORKER = 50000
-            total_panos = scraper.total_written
-            num_workers = max(1, math.ceil(total_panos / PANOS_PER_WORKER))
-
-            socketio.emit('vps_status', {
-                'message': f'VPS Deploy: Splitting {total_panos} panos into {CHUNK_SIZE}-pano chunks, {num_workers} workers'
-            }, room=sid)
-
-            chunks = split_csv_chunks(
-                csv_path, chunk_size=CHUNK_SIZE, city_name=city,
-                output_dir=str(Path(csv_path).parent / "chunks"),
-            )
-            if not chunks:
-                socketio.emit('vps_error', {'error': 'No data in CSV to split'}, room=sid)
-                return
-
-            total_chunks = len(chunks)
-            ctx['actual_workers'] = num_workers
-            ctx['total_workers'] = num_workers
-            ctx['total_chunks'] = total_chunks
-            ctx['worker_indices_to_deploy'] = list(range(1, num_workers + 1))
-
-            socketio.emit('vps_status', {
-                'message': f'VPS Deploy: Split into {total_chunks} chunks. Uploading to R2...'
-            }, room=sid)
-
-            # Phase 3: Upload chunks to R2
-            r2 = R2Client(ctx['r2_account'], ctx['r2_access'], ctx['r2_secret'], ctx['r2_bucket'])
-            uploaded = upload_csv_segments(chunks, r2, country, state, city)
-            if len(uploaded) != total_chunks:
-                socketio.emit('vps_status', {
-                    'message': f'VPS Deploy: Warning — only {len(uploaded)}/{total_chunks} chunks uploaded'
-                }, room=sid)
-
-            # Phase 3b: Initialize Redis task queue
-            redis_url = os.environ.get('REDIS_URL', '')
-            redis_token = os.environ.get('REDIS_TOKEN', '')
-            if not redis_url or not redis_token:
-                socketio.emit('vps_error', {'error': 'REDIS_URL and REDIS_TOKEN must be set in .env'}, room=sid)
-                return
-
-            region = f"{country}/{state}/{city}"
-            chunk_ids = [f"chunk_{i+1:04d}" for i in range(total_chunks)]
-            tq = TaskQueue(redis_url, redis_token)
-            tq.init_job(region, chunk_ids, total_panos, city)
-            ctx['redis_url'] = redis_url
-            ctx['redis_token'] = redis_token
-            ctx['region'] = region
-            sess['task_queue'] = tq
-
-            socketio.emit('vps_status', {
-                'message': f'VPS Deploy: Redis queue initialized with {total_chunks} chunks'
-            }, room=sid)
-
-            # Update tracker JSON with CSV status
-            try:
-                with open(segments[0], 'r', encoding='utf-8') as fh:
-                    fh.readline()  # skip header
-                    first_line = fh.readline()
-                    parts = first_line.split(',')
-                    csv_lat, csv_lon = float(parts[1]), float(parts[2])
-                _update_tracker_json(r2, country, state, city, 'csv', csv_lat, csv_lon)
-            except Exception as e:
-                logger.warning(f"Failed to update tracker after CSV upload: {e}")
-
-            socketio.emit('vps_status', {
-                'message': 'VPS Deploy: CSV uploaded. Searching Vast.ai offers...'
-            }, room=sid)
-
-            # Phase 4: Search offers (reuse VPSDeployThread logic)
-            thread = VPSDeployThread(sid, ctx, mode="provision")
-            thread.run()  # run synchronously in this thread
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            socketio.emit('vps_error', {'error': str(e)}, room=sid)
-
-    sess['job_state'] = 'scraping'
-    sess['pending_offers'] = None
-
-    bg = threading.Thread(target=_scrape_split_upload, daemon=True)
-    bg.start()
-    sess['scraper_thread'] = bg
-
-    return jsonify({'status': 'scraping'})
 
 
 @app.route('/api/search-offers', methods=['POST'])
@@ -1085,17 +691,6 @@ def search_offers():
     sess = _get_session(sid)
     ctx = sess.get('vps_context', {})
     ctx.update({k: data[k] for k in data if k != 'session_id'})
-
-    # Accept worker subset from frontend (missing-workers dialog)
-    if 'worker_indices_to_deploy' in data:
-        ctx['worker_indices_to_deploy'] = data['worker_indices_to_deploy']
-    if 'total_workers' in data:
-        ctx['total_workers'] = data['total_workers']
-        ctx['actual_workers'] = len(ctx.get('worker_indices_to_deploy',
-                                             list(range(1, data['total_workers'] + 1))))
-
-    sess['job_state'] = 'searching_offers'
-    sess['pending_offers'] = None
 
     thread = VPSDeployThread(sid, ctx, mode="provision")
     thread.start()
@@ -1122,10 +717,6 @@ def create_instances():
     worker_indices = data.get('worker_indices', [])
     total_workers = data.get('total_workers', len(worker_indices))
 
-    # Offers have been consumed — clear them so reconnect doesn't re-show the modal
-    sess['pending_offers'] = None
-    sess['job_state'] = 'creating_instances'
-
     thread = InstanceCreateThread(sid, vast_manager, selected_offers, worker_indices, total_workers, ctx)
     thread.start()
 
@@ -1145,8 +736,7 @@ def start_monitoring():
     instance_worker_map = data.get('instance_worker_map', {})
 
     r2 = R2Client(ctx['r2_account'], ctx['r2_access'], ctx['r2_secret'], ctx['r2_bucket'])
-    total_workers = len(instance_worker_map)
-    finished_count = [0]
+    status_prefix = f"Features/{ctx['country']}/{ctx['state']}/{ctx['city']}"
 
     def on_progress(worker_idx, processed, total, eta, speed, status):
         socketio.emit('vps_worker_progress', {
@@ -1158,32 +748,20 @@ def start_monitoring():
         socketio.emit('vps_worker_finished', {
             'worker_idx': worker_idx, 'status': status
         }, room=sid)
-        if status == 'COMPLETED':
-            finished_count[0] += 1
-            if finished_count[0] >= total_workers:
-                try:
-                    country = ctx.get('country', '')
-                    state_name = ctx.get('state', '')
-                    city_name = ctx.get('city', '')
-                    if country and state_name and city_name:
-                        _update_tracker_json(r2, country, state_name, city_name, 'features')
-                except Exception as e:
-                    logger.warning(f"Failed to update tracker after features: {e}")
 
     def on_log(message):
         socketio.emit('vps_log', {'message': message}, room=sid)
 
     monitor = R2StatusMonitorThread(
-        r2_client=r2, city_name=ctx['city'],
+        r2_client=r2, status_prefix=status_prefix,
+        num_workers=len(instance_worker_map),
         instance_worker_map=instance_worker_map,
         poll_interval=10.0,
         on_progress=on_progress,
         on_worker_finished=on_finished,
         on_log_message=on_log,
-        vast_manager=sess.get('vast_manager'),
     )
     sess['log_monitor'] = monitor
-    sess['job_state'] = 'monitoring'
     monitor.start()
 
     return jsonify({'status': 'monitoring'})
@@ -1207,9 +785,6 @@ def destroy_all():
     count = 0
     if vm:
         count = vm.destroy_all()
-
-    sess['job_state'] = 'idle'
-    sess['pending_offers'] = None
 
     return jsonify({'status': 'destroyed', 'count': count})
 
@@ -1262,20 +837,9 @@ def create_builder():
     if path_override:
         features_prefix = f"Features/{path_override}"
         city_name = path_override.split('/')[-1]
-        path_parts = path_override.split('/')
-        sess['builder_region'] = {
-            'country': path_parts[0] if len(path_parts) > 0 else '',
-            'state': path_parts[1] if len(path_parts) > 1 else '',
-            'city': path_parts[2] if len(path_parts) > 2 else city_name,
-        }
     else:
         features_prefix = f"Features/{ctx['country']}/{ctx['state']}/{ctx['city']}"
         city_name = ctx.get('city', 'Unknown')
-        sess['builder_region'] = {
-            'country': ctx.get('country', ''),
-            'state': ctx.get('state', ''),
-            'city': city_name,
-        }
 
     env_vars = {
         'R2_ACCOUNT_ID': r2_account,
@@ -1285,20 +849,20 @@ def create_builder():
         'FEATURES_BUCKET_PREFIX': features_prefix,
         'CITY_NAME': city_name,
         'VAST_API_KEY': vast_key,
-        'INDEX_TYPE': data.get('index_type', 'pq'),
+        'INDEX_TYPE': data.get('index_type', 'IVF_PQ'),
         'NLIST': str(data.get('nlist', 4096)),
-        'M': str(data.get('m', 256)),
+        'M': str(data.get('m', 64)),
         'NBITS': str(data.get('nbits', 8)),
-        'TRAIN_SAMPLES': str(data.get('train_samples', 1000000)),
-        'NITER': str(data.get('niter', 100)),
+        'TRAIN_SAMPLES': str(data.get('train_samples', 500000)),
+        'NITER': str(data.get('niter', 25)),
     }
 
     try:
         instance_id = vm.create_instance(
             offer_id=offer['id'],
-            docker_image=data.get('builder_image', 'ghcr.io/occultmc/indbuilder:latest'),
+            docker_image=data.get('builder_image', 'ghcr.io/occultmc/geoaxisbuilder:latest'),
             env_vars=env_vars,
-            disk_gb=data.get('disk_gb', 700),
+            disk_gb=data.get('disk_gb', 500),
             onstart_cmd="bash /app/entrypoint.sh",
         )
         if not instance_id:
@@ -1306,12 +870,16 @@ def create_builder():
 
         r2 = R2Client(r2_account, r2_access, r2_secret, r2_bucket)
         r2.upload_json(
-            f"Status/INDEX_{city_name}_lookup.json",
-            {'instance_id': instance_id, 'city_name': city_name},
+            f"Status/{features_prefix}/builder_instance.json",
+            {'instance_id': instance_id, 'worker': 'builder'},
         )
+        try:
+            r2.delete_file(f"Status/{features_prefix}/builder.json")
+        except Exception:
+            pass
 
         # Start monitoring
-        monitor = BuilderMonitorThread(sid, r2, city_name, instance_id, poll_interval=10.0)
+        monitor = BuilderMonitorThread(sid, r2, features_prefix, poll_interval=10.0)
         sess['builder_monitor'] = monitor
         monitor.start()
 
@@ -1322,13 +890,16 @@ def create_builder():
 
 @app.route('/api/scan-progress', methods=['POST'])
 def scan_progress():
-    """Scan for completed shapes using tracker JSON (fast) or local CSV fallback."""
+    """Scan for completed shapes (local CSV or R2)."""
     data = request.json
     sid = data.get('session_id', '')
     shapes_data = data.get('shapes_data', [])
 
     if not shapes_data:
-        return jsonify({'status_map': {}})
+        return jsonify({'done_indices': []})
+
+    project_root = Path(__file__).parent.parent
+    output_dir = str(project_root / "Output" / "CSV")
 
     r2_client = None
     r2_config = data.get('r2_config', {})
@@ -1341,42 +912,53 @@ def scan_progress():
         except Exception:
             pass
 
+    # Run scan in background
     def scan_thread():
         try:
             from shapely.geometry import Point, Polygon
+            import glob
 
             polygons = []
             for shape in shapes_data:
                 coords = shape.get('coordinates', [])
-                polygons.append(Polygon(coords) if coords else None)
+                if coords:
+                    polygons.append(Polygon(coords))
+                else:
+                    polygons.append(None)
 
-            status_map = {}  # {shape_index_str: 'csv'|'features'|'complete'}
+            done_indices = set()
 
             if r2_client:
-                # Fast path: fetch single tracker JSON
-                tracker = r2_client.download_json(TRACKER_KEY)
-                for region_key, info in tracker.items():
-                    lat = info.get('lat', 0)
-                    lon = info.get('lon', 0)
-                    if lat == 0 and lon == 0:
-                        continue
-                    point = Point(lon, lat)
-                    for idx, poly in enumerate(polygons):
-                        if str(idx) in status_map:
+                try:
+                    files = r2_client.list_files(prefix="CSV/")
+                    for file_obj in files:
+                        key = file_obj['key']
+                        if not key.lower().endswith('.csv'):
                             continue
-                        if poly and poly.contains(point):
-                            if info.get('index'):
-                                status_map[str(idx)] = 'complete'
-                            elif info.get('features'):
-                                status_map[str(idx)] = 'features'
-                            elif info.get('csv'):
-                                status_map[str(idx)] = 'csv'
-                            break
+                        try:
+                            resp = r2_client.s3.get_object(
+                                Bucket=r2_client.bucket_name, Key=key, Range='bytes=0-1024')
+                            chunk = resp['Body'].read().decode('utf-8', errors='ignore')
+                            lines = chunk.splitlines()
+                            if len(lines) < 2:
+                                continue
+                            parts = lines[1].split(',')
+                            if len(parts) < 3:
+                                continue
+                            lat, lon = float(parts[1]), float(parts[2])
+                            point = Point(lon, lat)
+                            for idx, poly in enumerate(polygons):
+                                if idx in done_indices:
+                                    continue
+                                if poly and poly.contains(point):
+                                    done_indices.add(idx)
+                                    break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
             else:
-                # Local fallback: scan Output/CSV directory
                 import glob as _glob
-                project_root = Path(__file__).parent.parent
-                output_dir = str(project_root / "Output" / "CSV")
                 csv_files = _glob.glob(os.path.join(output_dir, "**/*.csv"), recursive=True)
                 for csv_path in csv_files:
                     try:
@@ -1391,15 +973,15 @@ def scan_progress():
                             lat, lon = float(parts[1]), float(parts[2])
                             point = Point(lon, lat)
                             for idx, poly in enumerate(polygons):
-                                if str(idx) in status_map:
+                                if idx in done_indices:
                                     continue
                                 if poly and poly.contains(point):
-                                    status_map[str(idx)] = 'csv'
+                                    done_indices.add(idx)
                                     break
                     except Exception:
                         continue
 
-            socketio.emit('scan_complete', {'status_map': status_map}, room=sid)
+            socketio.emit('scan_complete', {'done_indices': list(done_indices)}, room=sid)
         except Exception as e:
             socketio.emit('scan_error', {'error': str(e)}, room=sid)
 
@@ -1450,41 +1032,6 @@ def env_defaults():
     })
 
 
-@app.route('/api/pending-offers', methods=['POST'])
-def pending_offers():
-    """Return stored offers that the frontend may have missed due to websocket reconnect."""
-    data = request.json
-    sid = data.get('session_id', '')
-    sess = _get_session(sid)
-    # Only return offers if we're actually waiting for the user to select them
-    if sess.get('job_state') == 'awaiting_offer_selection':
-        offers_data = sess.get('pending_offers')
-        if offers_data:
-            return jsonify(offers_data)
-    return jsonify({'offers': []})
-
-
-@app.route('/api/dismiss-offers', methods=['POST'])
-def dismiss_offers():
-    """User dismissed the offer modal without selecting — clear pending state."""
-    data = request.json
-    sid = data.get('session_id', '')
-    sess = _get_session(sid)
-    sess['pending_offers'] = None
-    if sess.get('job_state') == 'awaiting_offer_selection':
-        sess['job_state'] = 'idle'
-    return jsonify({'status': 'ok'})
-
-
-@app.route('/api/job-state', methods=['POST'])
-def job_state():
-    """Return current job state so frontend can restore UI on reconnect."""
-    data = request.json
-    sid = data.get('session_id', '')
-    sess = _get_session(sid)
-    return jsonify({'job_state': sess.get('job_state', 'idle')})
-
-
 # ═════════════════════════════════════════════════════════════════════════
 # Main
 # ═════════════════════════════════════════════════════════════════════════
@@ -1492,7 +1039,7 @@ def job_state():
 if __name__ == '__main__':
     print("=" * 60)
     print("  VPS Scraper Web GUI")
-    print("  Open http://localhost:5050 in your browser")
+    print("  Open http://localhost:5000 in your browser")
     print("  Each tab gets its own independent session")
     print("=" * 60)
-    socketio.run(app, host='0.0.0.0', port=5050, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)

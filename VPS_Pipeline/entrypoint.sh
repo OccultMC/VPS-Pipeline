@@ -3,9 +3,10 @@ set -e
 
 date -u
 echo "=== Hypervision VPS Pipeline ==="
-echo "Worker: ${WORKER_INDEX}/${NUM_WORKERS}"
-echo "City: ${CITY_NAME}"
 echo "Instance: ${INSTANCE_ID}"
+echo "City: ${CITY_NAME}"
+echo "Region: ${REGION}"
+echo "Redis: ${REDIS_URL:0:40}..."
 
 # ── GPU diagnostics ──
 echo "── GPU Diagnostics ──"

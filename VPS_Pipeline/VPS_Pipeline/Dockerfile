@@ -16,14 +16,14 @@ RUN pip install --no-cache-dir vastai
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Cache MegaLoc architecture (hubconf.py + model code) — no weights downloaded
+# Cache MegaLoc architecture (hubconf.py + model code)
 RUN python -c "import torch; torch.hub._get_cache_or_reload('gmberton/MegaLoc', force_reload=False, trust_repo=True, calling_fn='load')"
 
-# MegaLoc model weights — downloaded from R2 by CI workflow, COPYd into image
+# MegaLoc model weights - downloaded from R2 by CI workflow, copied into image
 COPY models/megaloc/model.safetensors /app/models/megaloc/model.safetensors
 
 # Application code
-COPY pipeline.py r2_storage.py redis_queue.py entrypoint.sh ./
+COPY pipeline.py r2_storage.py entrypoint.sh ./
 COPY gsvpd/ ./gsvpd/
 
 RUN dos2unix entrypoint.sh && chmod +x entrypoint.sh
