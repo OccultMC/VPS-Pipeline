@@ -74,6 +74,17 @@ VAST_API_KEY = os.environ.get('VAST_API_KEY', '')
 
 MAX_DISK_GB = 100
 MIN_FREE_GB = 5
+TOTAL_CHUNKS = 0  # Set from Redis metadata at startup
+
+
+def _chunk_num(chunk_id: str) -> int:
+    """Convert Redis chunk ID to 1-based number: 'chunk_0001' → 1."""
+    return int(chunk_id.split('_')[1])
+
+
+def _output_base(city: str, chunk_id: str) -> str:
+    """Return '{city}_{N}.{total}' for output filenames."""
+    return f"{city}_{_chunk_num(chunk_id)}.{TOTAL_CHUNKS}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Imports: Street View Downloader
@@ -876,8 +887,9 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
         return None
 
     # ── Step 3: Setup output files ──
-    features_file = str(work_dir / f"{city}_{chunk_id}.npy")
-    metadata_file = str(work_dir / f"Metadata_{city}_{chunk_id}.jsonl")
+    out_base = _output_base(city, chunk_id)
+    features_file = str(work_dir / f"{out_base}.npy")
+    metadata_file = str(work_dir / f"Metadata_{out_base}.jsonl")
     failed_file = str(work_dir / f"failed_{chunk_id}.jsonl")
 
     # ~270MB for 1K panos × 8 views × 8448 dim × 4 bytes
@@ -1066,9 +1078,10 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
 def _cleanup_chunk_files(work_dir: Path, chunk_id: str, local_csv: str = None):
     """Delete local files for a processed chunk to free disk space."""
     city = CITY_NAME
+    out_base = _output_base(city, chunk_id)
     for f in [
-        str(work_dir / f"{city}_{chunk_id}.npy"),
-        str(work_dir / f"Metadata_{city}_{chunk_id}.jsonl"),
+        str(work_dir / f"{out_base}.npy"),
+        str(work_dir / f"Metadata_{out_base}.jsonl"),
         str(work_dir / f"failed_{chunk_id}.jsonl"),
     ]:
         try:
@@ -1090,8 +1103,9 @@ def upload_chunk_files(r2, chunk_id: str, features_file: str, metadata_file: str
                        local_csv: str, work_dir: Path):
     """Upload NPY + metadata to R2 in parallel, then cleanup local files."""
     city = CITY_NAME
-    npy_key = f"{FEATURES_BUCKET_PREFIX}/{city}_{chunk_id}.npy"
-    meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{city}_{chunk_id}.jsonl"
+    out_base = _output_base(city, chunk_id)
+    npy_key = f"{FEATURES_BUCKET_PREFIX}/{out_base}.npy"
+    meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{out_base}.jsonl"
 
     errors = []
 
@@ -1181,18 +1195,21 @@ def reconcile_with_r2(r2, tq: TaskQueue):
         f"{FEATURES_BUCKET_PREFIX}/Metadata_{city}_", suffix='.jsonl'
     ))
 
-    # Extract chunk IDs from NPY filenames: "Features/Austin_chunk_0001.npy" → "chunk_0001"
+    # Extract chunk IDs from NPY filenames: "Features/KansasCity_1.11.npy" → "chunk_0001"
+    import re as _re
+    npy_pattern = _re.compile(rf'^{_re.escape(city)}_(\d+)\.\d+\.npy$')
     done_chunks = set()
     for key in npy_keys:
-        filename = key.rsplit('/', 1)[-1]           # "Austin_chunk_0001.npy"
-        chunk_part = filename[len(city) + 1:]        # "chunk_0001.npy"
-        chunk_part = chunk_part.replace('.npy', '')   # "chunk_0001"
-        if not chunk_part.startswith('chunk_'):
+        filename = key.rsplit('/', 1)[-1]
+        m = npy_pattern.match(filename)
+        if not m:
             continue
+        chunk_num = int(m.group(1))
+        chunk_id = f"chunk_{chunk_num:04d}"
         # Verify metadata also exists
-        expected_meta = f"{FEATURES_BUCKET_PREFIX}/Metadata_{city}_{chunk_part}.jsonl"
+        expected_meta = f"{FEATURES_BUCKET_PREFIX}/Metadata_{city}_{chunk_num}.{TOTAL_CHUNKS}.jsonl"
         if expected_meta in meta_keys:
-            done_chunks.add(chunk_part)
+            done_chunks.add(chunk_id)
 
     if done_chunks:
         print(f"[RESUME] Found {len(done_chunks)} completed chunks on R2")
@@ -1280,6 +1297,11 @@ def main():
     if progress['total_chunks'] == 0:
         print("[FATAL] No job found in Redis for this region")
         sys.exit(1)
+
+    # Set TOTAL_CHUNKS so output filenames include the total
+    global TOTAL_CHUNKS
+    TOTAL_CHUNKS = progress['total_chunks']
+    print(f"[INFO] Total chunks: {TOTAL_CHUNKS} — output naming: {{city}}_N.{TOTAL_CHUNKS}.npy")
 
     # ── Resume: reconcile Redis state with R2 reality ──
     # Scans R2 for already-uploaded NPY files, marks them done in Redis,
