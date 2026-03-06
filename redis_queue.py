@@ -9,6 +9,7 @@ Redis key schema:
     job:{region}:active   → Hash   {chunk_id: "worker_id|timestamp"}
     job:{region}:done     → Set    {chunk_0001, chunk_0003, ...}
     job:{region}:meta     → Hash   {total_chunks, total_panos, city_name, created_at}
+    job:{region}:ws:{wid} → Hash   {status, chunk_id, chunks_done, processed, total, speed, eta, ts}
 """
 import time
 import logging
@@ -40,6 +41,9 @@ class TaskQueue:
 
     def _meta_key(self, region: str) -> str:
         return f"job:{region}:meta"
+
+    def _worker_status_key(self, region: str, worker_id: str) -> str:
+        return f"job:{region}:ws:{worker_id}"
 
     # ── Job lifecycle ─────────────────────────────────────────────────────
 
@@ -262,10 +266,76 @@ class TaskQueue:
         logger.info(f"Reconciled {count} chunks as done for {region}")
         return count
 
+    # ── Per-worker status ─────────────────────────────────────────────────
+
+    def report_status(
+        self,
+        region: str,
+        worker_id: str,
+        status: str,
+        chunk_id: str = "",
+        chunks_done: int = 0,
+        processed: int = 0,
+        total: int = 0,
+        speed: float = 0.0,
+        eta: float = 0.0,
+    ):
+        """Write per-worker status hash for monitoring."""
+        key = self._worker_status_key(region, worker_id)
+        self.redis.hset(key, values={
+            "s": status,
+            "cid": chunk_id,
+            "cd": str(chunks_done),
+            "p": str(processed),
+            "t": str(total),
+            "spd": f"{speed:.1f}",
+            "eta": f"{eta:.0f}",
+            "ts": f"{time.time():.1f}",
+        })
+
+    def get_all_worker_statuses(self, region: str) -> Dict[str, Dict]:
+        """Scan for all worker status hashes under this region.
+
+        Returns {worker_id: {status, chunk_id, chunks_done, processed, total, speed, eta, ts}}.
+        """
+        prefix = f"job:{region}:ws:"
+        result = {}
+        # Scan for matching keys
+        cursor = 0
+        while True:
+            cursor, keys = self.redis.scan(cursor, match=f"{prefix}*", count=100)
+            for key in keys:
+                worker_id = key[len(prefix):]
+                data = self.redis.hgetall(key)
+                if data:
+                    result[worker_id] = {
+                        "status": data.get("s", "UNKNOWN"),
+                        "chunk_id": data.get("cid", ""),
+                        "chunks_done": int(data.get("cd", "0")),
+                        "processed": int(data.get("p", "0")),
+                        "total": int(data.get("t", "0")),
+                        "speed": float(data.get("spd", "0")),
+                        "eta": float(data.get("eta", "0")),
+                        "ts": float(data.get("ts", "0")),
+                    }
+            if cursor == 0:
+                break
+        return result
+
     # ── Cleanup ───────────────────────────────────────────────────────────
 
     def cleanup(self, region: str):
         """Delete all Redis keys for a completed job."""
+        # Clean worker status keys
+        prefix = f"job:{region}:ws:"
+        cursor = 0
+        while True:
+            cursor, keys = self.redis.scan(cursor, match=f"{prefix}*", count=100)
+            if keys:
+                self.redis.delete(*keys)
+            if cursor == 0:
+                break
+
         self.redis.delete(
             self._todo_key(region),
             self._active_key(region),

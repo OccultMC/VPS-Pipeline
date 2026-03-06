@@ -67,7 +67,9 @@ REGION = os.environ.get('REGION', '')
 CSV_BUCKET_PREFIX = os.environ.get('CSV_BUCKET_PREFIX', 'CSV')
 FEATURES_BUCKET_PREFIX = os.environ.get('FEATURES_BUCKET_PREFIX', 'Features')
 CITY_NAME = os.environ.get('CITY_NAME', 'Unknown')
-INSTANCE_ID = os.environ.get('INSTANCE_ID', '')
+INSTANCE_ID = (os.environ.get('INSTANCE_ID', '')
+               or os.environ.get('CONTAINER_ID', '')
+               or os.environ.get('VAST_CONTAINERLABEL', ''))
 VAST_API_KEY = os.environ.get('VAST_API_KEY', '')
 
 MAX_DISK_GB = 100
@@ -835,7 +837,7 @@ def upload_with_retry(r2, local_path, bucket_key, label="FILE", max_attempts=5):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, work_dir: Path,
-                  preloaded=None):
+                  preloaded=None, chunks_done_so_far: int = 0):
     """
     Extract features for a chunk. Returns (features_file, metadata_file, local_csv)
     for async upload, or None if chunk was empty.
@@ -853,6 +855,10 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
         csv_key = f"{CSV_BUCKET_PREFIX}/{csv_filename}"
         local_csv = str(work_dir / csv_filename)
         print(f"[CHUNK {chunk_id}] Downloading {csv_key}...")
+        try:
+            tq.report_status(REGION, INSTANCE_ID, "DOWNLOADING", chunk_id=chunk_id)
+        except Exception:
+            pass
         if not r2.download_file(csv_key, local_csv, max_retries=3):
             raise RuntimeError(f"Failed to download {csv_key}")
         records, metadata_map = load_csv(local_csv)
@@ -909,6 +915,11 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
     HEARTBEAT_INTERVAL = 30
 
     print(f"[CHUNK {chunk_id}] Starting extraction (batch_size={extractor.batch_size})", flush=True)
+    try:
+        tq.report_status(REGION, INSTANCE_ID, "EXTRACTING", chunk_id=chunk_id,
+                         total=total_views_est)
+    except Exception:
+        pass
 
     pending_batch: List[ViewItem] = []
     pending_futures = None
@@ -919,10 +930,20 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
 
             now = time.time()
 
-            # ── Redis heartbeat ──
+            # ── Redis heartbeat + status report ──
             if now - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                 try:
                     tq.heartbeat(REGION, INSTANCE_ID, chunk_id)
+                    elapsed = now - loop_start
+                    _spd = stats['ext_ok'] / elapsed if elapsed > 0 else 0
+                    _rem = total_views_est - stats['ext_ok']
+                    _eta = _rem / _spd if _spd > 0 else 0
+                    tq.report_status(
+                        REGION, INSTANCE_ID, "EXTRACTING",
+                        chunk_id=chunk_id, chunks_done=chunks_done_so_far,
+                        processed=stats['ext_ok'], total=total_views_est,
+                        speed=_spd, eta=_eta,
+                    )
                 except Exception as e:
                     print(f"[WARN] Heartbeat failed: {e}", flush=True)
                 last_heartbeat_time = now
@@ -1200,10 +1221,35 @@ def reconcile_with_r2(r2, tq: TaskQueue):
 # Main Pipeline — Pipelined Chunk Queue Loop
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _detect_instance_id():
+    """Detect Vast.ai instance ID at runtime."""
+    global INSTANCE_ID
+    if INSTANCE_ID:
+        return
+    # Try Vast.ai CLI detection
+    if VAST_API_KEY:
+        try:
+            result = subprocess.run(
+                ["vastai", "--api-key", VAST_API_KEY, "show", "instances", "--raw"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                instances = json.loads(result.stdout.strip())
+                if instances and len(instances) == 1:
+                    INSTANCE_ID = str(instances[0].get('id', ''))
+        except Exception:
+            pass
+    # Final fallback: hostname
+    if not INSTANCE_ID:
+        import socket
+        INSTANCE_ID = socket.gethostname()
+
+
 def main():
     work_dir = Path('/app/work')
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    _detect_instance_id()
     print(f"[INFO] Worker {INSTANCE_ID} starting")
     print(f"[INFO] City: {CITY_NAME}")
     print(f"[INFO] Region: {REGION}")
@@ -1223,6 +1269,10 @@ def main():
         sys.exit(1)
 
     tq = TaskQueue(REDIS_URL, REDIS_TOKEN)
+    try:
+        tq.report_status(REGION, INSTANCE_ID, "STARTING")
+    except Exception:
+        pass
 
     # Verify connection and job exists
     progress = tq.get_progress(REGION)
@@ -1245,6 +1295,10 @@ def main():
 
     # ── Init GPU extractor ONCE (expensive — 30-60s) ──
     print("[INFO] Initializing GPU extractor...")
+    try:
+        tq.report_status(REGION, INSTANCE_ID, "LOADING_MODEL")
+    except Exception:
+        pass
     extractor = GpuExtractor()
 
     # ── Pipelined chunk queue loop ──
@@ -1301,6 +1355,11 @@ def main():
                     print(f"[WARN] Redis is_complete check failed: {e}")
 
                 idle_cycles += 1
+                try:
+                    tq.report_status(REGION, INSTANCE_ID, "IDLE",
+                                     chunks_done=chunks_done)
+                except Exception:
+                    pass
                 if idle_cycles >= MAX_IDLE_CYCLES:
                     try:
                         if tq.is_complete(REGION):
@@ -1332,7 +1391,8 @@ def main():
         # ── Process current chunk ──
         try:
             result = process_chunk(r2, tq, extractor, chunk_id, work_dir,
-                                   preloaded=preloaded_data)
+                                   preloaded=preloaded_data,
+                                   chunks_done_so_far=chunks_done)
 
             # Wait for prefetch to finish before starting upload
             pf_thread.join()
@@ -1356,6 +1416,11 @@ def main():
                 )
                 ul_thread.start()
                 pending_upload = (ul_thread, chunk_id, err_ref)
+                try:
+                    tq.report_status(REGION, INSTANCE_ID, "UPLOADING",
+                                     chunk_id=chunk_id, chunks_done=chunks_done)
+                except Exception:
+                    pass
                 # Loop immediately → start next chunk while upload runs
 
         except Exception as e:
@@ -1398,6 +1463,10 @@ def main():
 
     # ── Done — self-destruct ──
     print(f"\n[INFO] Final stats: {chunks_done} chunks completed, {chunks_failed} failed")
+    try:
+        tq.report_status(REGION, INSTANCE_ID, "DONE", chunks_done=chunks_done)
+    except Exception:
+        pass
     upload_logs_to_r2()
     self_destruct()
 
