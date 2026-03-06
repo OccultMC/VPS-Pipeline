@@ -250,7 +250,8 @@ class TaskQueue:
         done_key = self._done_key(region)
 
         # Skip chunks already marked done in Redis
-        already_done = self.redis.smembers(done_key) or set()
+        # Note: Upstash smembers() returns a list, not a set
+        already_done = set(self.redis.smembers(done_key) or [])
         need_reconcile = done_chunk_ids - already_done
 
         if not need_reconcile:
