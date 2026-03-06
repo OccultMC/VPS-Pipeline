@@ -845,13 +845,28 @@ def upload_with_retry(r2, local_path, bucket_key, label="FILE", max_attempts=5):
             wait = min(2 ** attempt, 120)
             time.sleep(wait)
 
-    # Extended retry with client reset
+    # Extended retry with client reset — check if file already landed on R2
+    # (upload may succeed server-side but connection resets before response)
     for retry_count in range(1, MAX_EXTENDED_RETRIES + 1):
+        try:
+            if r2.file_exists(bucket_key):
+                print(f"[INFO] File already on R2 (uploaded but response lost): {bucket_key}")
+                return True
+        except Exception:
+            pass
         print(f"[WARN] Extended retry #{retry_count}/{MAX_EXTENDED_RETRIES} for {bucket_key}")
         r2.reset_client()
         time.sleep(60)
         if r2.upload_file(local_path, bucket_key, max_retries=1):
             return True
+
+    # Final existence check before declaring permanent failure
+    try:
+        if r2.file_exists(bucket_key):
+            print(f"[INFO] File already on R2 after retries exhausted: {bucket_key}")
+            return True
+    except Exception:
+        pass
 
     print(f"[ERROR] Upload permanently failed for {bucket_key}")
     return False
@@ -1343,7 +1358,9 @@ def main():
     chunks_done = 0
     chunks_failed = 0
     idle_cycles = 0
+    idle_start_time = None
     MAX_IDLE_CYCLES = 6
+    MAX_IDLE_SECONDS = 600  # 10 min hard idle timeout → self-destruct
 
     # Pipeline state
     pending_upload = None   # (thread, chunk_id, error_ref)
@@ -1397,27 +1414,58 @@ def main():
                     print(f"[WARN] Redis is_complete check failed: {e}")
 
                 idle_cycles += 1
+                if idle_start_time is None:
+                    idle_start_time = time.time()
                 try:
                     tq.report_status(REGION, INSTANCE_ID, "IDLE",
                                      chunks_done=chunks_done)
                 except Exception:
                     pass
-                if idle_cycles >= MAX_IDLE_CYCLES:
+
+                # Periodically reclaim stale tasks from dead/stuck workers
+                if idle_cycles % MAX_IDLE_CYCLES == 0:
+                    try:
+                        reclaimed = tq.reclaim_stale(REGION)
+                        if reclaimed:
+                            print(f"[IDLE] Reclaimed {len(reclaimed)} stale tasks: {reclaimed}")
+                    except Exception:
+                        pass
                     try:
                         if tq.is_complete(REGION):
                             print(f"[INFO] Job complete after idle wait. Self-destructing.")
                             break
                     except Exception:
                         pass
-                    print(f"[INFO] No tasks available but {idle_cycles} idle cycles. "
-                          "Waiting for in-progress tasks to finish or be reclaimed...")
-                    idle_cycles = 0
+
+                # Hard idle timeout — self-destruct if idle too long
+                idle_elapsed = time.time() - idle_start_time
+                if idle_elapsed >= MAX_IDLE_SECONDS:
+                    print(f"[INFO] Idle for {idle_elapsed:.0f}s with no work. Self-destructing.")
+                    break
                 time.sleep(5)  # Reduced from 30s for faster queue response
                 continue
 
             preloaded_data = None
 
         idle_cycles = 0
+        idle_start_time = None
+
+        # ── Skip if output already exists on R2 (avoids re-extracting) ──
+        out_base = _output_base(CITY_NAME, chunk_id)
+        npy_key = f"{FEATURES_BUCKET_PREFIX}/{out_base}.npy"
+        try:
+            if r2.file_exists(npy_key):
+                print(f"[SKIP] Chunk {chunk_id} output already on R2 — marking done")
+                try:
+                    tq.complete_task(REGION, chunk_id, INSTANCE_ID)
+                except Exception:
+                    pass
+                chunks_done += 1
+                prefetched = None
+                continue
+        except Exception:
+            pass  # If check fails, process normally
+
         print(f"\n{'='*60}")
         print(f"[INFO] {'Pre-fetched' if preloaded_data else 'Claimed'} chunk: {chunk_id} "
               f"(completed so far: {chunks_done})")
