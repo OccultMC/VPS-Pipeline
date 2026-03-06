@@ -86,6 +86,20 @@ def _output_base(city: str, chunk_id: str) -> str:
     """Return '{city}_{N}.{total}' for output filenames."""
     return f"{city}_{_chunk_num(chunk_id)}.{TOTAL_CHUNKS}"
 
+
+def _redis_retry(fn, *args, retries=5, delay=3, label="redis"):
+    """Retry a Redis call with exponential backoff. Returns True on success."""
+    for attempt in range(1, retries + 1):
+        try:
+            fn(*args)
+            return True
+        except Exception as e:
+            print(f"[WARN] {label} attempt {attempt}/{retries} failed: {e}")
+            if attempt < retries:
+                time.sleep(delay * attempt)
+    print(f"[ERROR] {label} failed after {retries} attempts")
+    return False
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Imports: Street View Downloader
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1350,9 +1364,15 @@ def main():
                 except Exception:
                     pass
             else:
-                tq.complete_task(REGION, ul_chunk_id, INSTANCE_ID)
-                chunks_done += 1
-                print(f"[INFO] Completed chunk {ul_chunk_id} ({chunks_done} total)")
+                if _redis_retry(tq.complete_task, REGION, ul_chunk_id, INSTANCE_ID,
+                                label=f"complete_task({ul_chunk_id})"):
+                    chunks_done += 1
+                    print(f"[INFO] Completed chunk {ul_chunk_id} ({chunks_done} total)")
+                else:
+                    # Data is on R2 — reconcile will fix this on next worker startup
+                    print(f"[WARN] Could not mark {ul_chunk_id} done in Redis "
+                          "(data safe on R2, will reconcile)")
+                    chunks_done += 1
             pending_upload = None
 
         # ── Get next chunk: from prefetch or fresh claim ──
@@ -1479,9 +1499,14 @@ def main():
             except Exception:
                 pass
         else:
-            tq.complete_task(REGION, ul_chunk_id, INSTANCE_ID)
-            chunks_done += 1
-            print(f"[INFO] Final chunk {ul_chunk_id} completed ({chunks_done} total)")
+            if _redis_retry(tq.complete_task, REGION, ul_chunk_id, INSTANCE_ID,
+                            label=f"complete_task({ul_chunk_id})"):
+                chunks_done += 1
+                print(f"[INFO] Final chunk {ul_chunk_id} completed ({chunks_done} total)")
+            else:
+                print(f"[WARN] Could not mark final {ul_chunk_id} done in Redis "
+                      "(data safe on R2, will reconcile)")
+                chunks_done += 1
 
     # ── Done — self-destruct ──
     print(f"\n[INFO] Final stats: {chunks_done} chunks completed, {chunks_failed} failed")
