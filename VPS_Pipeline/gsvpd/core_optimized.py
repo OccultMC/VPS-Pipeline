@@ -280,13 +280,11 @@ def _stitch_and_process_tiles(
                         # Standard filename convention
                         fname = f"{panoid}_zoom{zoom_level}_view{i:02d}_{yaw:.0f}deg.jpg"
 
-                    # Encode to JPEG
+                    # BGR → RGB numpy array (no JPEG — final output is NPY)
                     te = _time.perf_counter()
-                    jpeg_q = config.get("jpeg_quality", 95)
-                    _, buffer = cv2.imencode('.jpg', view, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
+                    result["views"].append(cv2.cvtColor(view, cv2.COLOR_BGR2RGB))
                     encode_time += _time.perf_counter() - te
 
-                    result["views"].append(buffer.tobytes())
                     result["view_filenames"].append(fname)
 
             result["timings"]["  augmentation"] = aug_time
