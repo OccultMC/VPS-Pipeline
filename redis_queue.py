@@ -231,6 +231,37 @@ class TaskQueue:
         active = self.redis.hlen(self._active_key(region)) or 0
         return todo == 0 and active == 0
 
+    # ── Resume / Reconciliation ─────────────────────────────────────────
+
+    def reconcile_done(self, region: str, done_chunk_ids: set) -> int:
+        """
+        Mark chunks as done based on external verification (e.g., R2 upload check).
+        Removes from todo and active, adds to done. Returns count reconciled.
+        """
+        if not done_chunk_ids:
+            return 0
+
+        todo_key = self._todo_key(region)
+        active_key = self._active_key(region)
+        done_key = self._done_key(region)
+
+        # Skip chunks already marked done in Redis
+        already_done = self.redis.smembers(done_key) or set()
+        need_reconcile = done_chunk_ids - already_done
+
+        if not need_reconcile:
+            return 0
+
+        count = 0
+        for chunk_id in sorted(need_reconcile):
+            self.redis.lrem(todo_key, 0, chunk_id)
+            self.redis.hdel(active_key, chunk_id)
+            self.redis.sadd(done_key, chunk_id)
+            count += 1
+
+        logger.info(f"Reconciled {count} chunks as done for {region}")
+        return count
+
     # ── Cleanup ───────────────────────────────────────────────────────────
 
     def cleanup(self, region: str):

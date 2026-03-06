@@ -129,6 +129,17 @@ class R2Client:
                     time.sleep(2 ** attempt)
         return False
 
+    def list_objects(self, prefix: str, suffix: str = None) -> List[str]:
+        """List object keys under a prefix, optionally filtered by suffix."""
+        keys = []
+        paginator = self.s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                if suffix is None or key.endswith(suffix):
+                    keys.append(key)
+        return keys
+
     def file_exists(self, bucket_key: str) -> bool:
         """Check if an object exists in the bucket."""
         try:

@@ -14,7 +14,6 @@ Progress is logged to stdout in structured format for vastai logs polling:
 import asyncio
 import csv
 import gc
-import io
 import json
 import os
 import queue
@@ -53,7 +52,6 @@ HARDCODED_CONFIG = {
     'augment': False,
     'no_antialias': True,
     'interpolation': 'cubic',
-    'jpeg_quality': 95,
     'output_dir': None,
     'batch_size': 32,
     'queue_size': 512,
@@ -95,7 +93,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from torchvision import transforms
-from PIL import Image
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # R2 Storage
@@ -117,10 +114,10 @@ from redis_queue import TaskQueue
 _SENTINEL = None
 
 class ViewItem:
-    __slots__ = ('panoid', 'jpeg_bytes', 'lat', 'lng')
-    def __init__(self, panoid: str, jpeg_bytes: bytes, lat: float, lng: float):
+    __slots__ = ('panoid', 'view_data', 'lat', 'lng')
+    def __init__(self, panoid: str, view_data, lat: float, lng: float):
         self.panoid = panoid
-        self.jpeg_bytes = jpeg_bytes
+        self.view_data = view_data  # RGB numpy array (uint8 HWC)
         self.lat = lat
         self.lng = lng
 
@@ -149,8 +146,10 @@ class SharedState:
             self.write_idx = end
             self._batch_count += 1
             # Flush memmap to disk periodically to keep RSS low
+            # Run in background to avoid blocking the GPU thread
             if self._batch_count % 100 == 0:
-                self.memmap.flush()
+                mm = self.memmap
+                threading.Thread(target=lambda: mm.flush(), daemon=True).start()
 
     def log_failure(self, panoid: str, reason: str):
         with self.lock:
@@ -446,25 +445,25 @@ class GpuExtractor:
 
     @staticmethod
     def _decode_item(item: ViewItem):
-        """Decode a single ViewItem JPEG → float32 CHW CPU tensor."""
+        """Convert ViewItem RGB numpy array → float32 CHW CPU tensor."""
         try:
-            img = Image.open(io.BytesIO(item.jpeg_bytes)).convert('RGB')
-            return transforms.functional.to_tensor(img)
+            return transforms.functional.to_tensor(item.view_data)
         except Exception as e:
             print(f"[WARN] Decode failed panoid={item.panoid}: {type(e).__name__}: {e}", flush=True)
             return None
 
     def start_decode(self, items: List[ViewItem]) -> list:
-        """Non-blocking: submit JPEG decode for all items; return list of futures."""
+        """Non-blocking: submit numpy→tensor conversion for all items; return list of futures."""
         return [self.executor.submit(self._decode_item, item) for item in items]
 
     def _run_inference(self, items: List[ViewItem], valid_tensors: list, valid_indices: list):
         """GPU inference with pin_memory transfer, fp16 autocast, and OOM auto-retry."""
         try:
             images = torch.stack(valid_tensors).pin_memory().to(self.device, non_blocking=True)
-            images = torch.nn.functional.interpolate(
-                images, size=(322, 322), mode='bilinear', align_corners=False
-            )
+            if images.shape[-2:] != (322, 322):
+                images = torch.nn.functional.interpolate(
+                    images, size=(322, 322), mode='bilinear', align_corners=False
+                )
             images = (images - self.mean) / self.std
 
             with torch.no_grad():
@@ -631,8 +630,8 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
                     return
 
                 meta = metadata.get(panoid_str, {'lat': 0.0, 'lng': 0.0})
-                for view_bytes, _ in zip(result['views'], result['view_filenames']):
-                    item = ViewItem(panoid_str, view_bytes, meta['lat'], meta['lng'])
+                for view_data, _ in zip(result['views'], result['view_filenames']):
+                    item = ViewItem(panoid_str, view_data, meta['lat'], meta['lng'])
                     while True:
                         try:
                             item_queue.put(item, timeout=1.0)
@@ -835,21 +834,30 @@ def upload_with_retry(r2, local_path, bucket_key, label="FILE", max_attempts=5):
 # Process a Single Chunk
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, work_dir: Path):
-    """Download CSV chunk, process all panos, upload NPY + metadata to R2."""
+def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, work_dir: Path,
+                  preloaded=None):
+    """
+    Extract features for a chunk. Returns (features_file, metadata_file, local_csv)
+    for async upload, or None if chunk was empty.
+
+    preloaded: optional (local_csv, records, metadata_map) to skip CSV download.
+    """
     city = CITY_NAME
-    csv_filename = f"{city}_{chunk_id}.csv"
-    csv_key = f"{CSV_BUCKET_PREFIX}/{csv_filename}"
-    local_csv = str(work_dir / csv_filename)
 
-    # ── Step 1: Download CSV chunk from R2 ──
-    print(f"[CHUNK {chunk_id}] Downloading {csv_key}...")
-    if not r2.download_file(csv_key, local_csv, max_retries=3):
-        raise RuntimeError(f"Failed to download {csv_key}")
+    if preloaded:
+        local_csv, records, metadata_map = preloaded
+        total_records = len(records)
+        print(f"[CHUNK {chunk_id}] Using pre-fetched CSV ({total_records} panos)")
+    else:
+        csv_filename = f"{city}_{chunk_id}.csv"
+        csv_key = f"{CSV_BUCKET_PREFIX}/{csv_filename}"
+        local_csv = str(work_dir / csv_filename)
+        print(f"[CHUNK {chunk_id}] Downloading {csv_key}...")
+        if not r2.download_file(csv_key, local_csv, max_retries=3):
+            raise RuntimeError(f"Failed to download {csv_key}")
+        records, metadata_map = load_csv(local_csv)
+        total_records = len(records)
 
-    # ── Step 2: Load CSV ──
-    records, metadata_map = load_csv(local_csv)
-    total_records = len(records)
     views_per_pano = HARDCODED_CONFIG['num_views']
     total_views_est = total_records * views_per_pano
     feature_dim = 8448
@@ -859,7 +867,7 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
     if total_records == 0:
         print(f"[CHUNK {chunk_id}] Empty chunk, skipping")
         _cleanup_chunk_files(work_dir, chunk_id, local_csv)
-        return
+        return None
 
     # ── Step 3: Setup output files ──
     features_file = str(work_dir / f"{city}_{chunk_id}.npy")
@@ -1030,21 +1038,8 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
 
     print(f"[CHUNK {chunk_id}] Extraction complete: {final_count} features")
 
-    # ── Step 5: Upload chunk outputs to R2 ──
-    npy_key = f"{FEATURES_BUCKET_PREFIX}/{city}_{chunk_id}.npy"
-    meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{city}_{chunk_id}.jsonl"
-
-    if os.path.exists(features_file) and os.path.getsize(features_file) > 0:
-        if not upload_with_retry(r2, features_file, npy_key, label="NPY"):
-            raise RuntimeError(f"Failed to upload NPY for chunk {chunk_id}")
-    if os.path.exists(metadata_file) and os.path.getsize(metadata_file) > 0:
-        if not upload_with_retry(r2, metadata_file, meta_key, label="META"):
-            raise RuntimeError(f"Failed to upload metadata for chunk {chunk_id}")
-
-    print(f"[CHUNK {chunk_id}] Upload complete")
-
-    # ── Step 6: Cleanup local files ──
-    _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+    # Return file paths for async upload (caller handles upload + cleanup)
+    return features_file, metadata_file, local_csv
 
 
 def _cleanup_chunk_files(work_dir: Path, chunk_id: str, local_csv: str = None):
@@ -1067,7 +1062,142 @@ def _cleanup_chunk_files(work_dir: Path, chunk_id: str, local_csv: str = None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Main Pipeline — Chunk Queue Loop
+# Async Upload (parallel NPY + metadata)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def upload_chunk_files(r2, chunk_id: str, features_file: str, metadata_file: str,
+                       local_csv: str, work_dir: Path):
+    """Upload NPY + metadata to R2 in parallel, then cleanup local files."""
+    city = CITY_NAME
+    npy_key = f"{FEATURES_BUCKET_PREFIX}/{city}_{chunk_id}.npy"
+    meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{city}_{chunk_id}.jsonl"
+
+    errors = []
+
+    def _upload_npy():
+        if os.path.exists(features_file) and os.path.getsize(features_file) > 0:
+            if not upload_with_retry(r2, features_file, npy_key, label="NPY"):
+                errors.append(f"Failed to upload NPY for chunk {chunk_id}")
+
+    def _upload_meta():
+        if os.path.exists(metadata_file) and os.path.getsize(metadata_file) > 0:
+            if not upload_with_retry(r2, metadata_file, meta_key, label="META"):
+                errors.append(f"Failed to upload metadata for chunk {chunk_id}")
+
+    npy_t = threading.Thread(target=_upload_npy)
+    meta_t = threading.Thread(target=_upload_meta)
+    npy_t.start()
+    meta_t.start()
+    npy_t.join()
+    meta_t.join()
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+    _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+    print(f"[CHUNK {chunk_id}] Upload + cleanup complete")
+
+
+def _do_background_upload(error_ref, r2, chunk_id, features_file, metadata_file,
+                          local_csv, work_dir):
+    """Thread target: upload chunk files and store any error in error_ref[0]."""
+    try:
+        upload_chunk_files(r2, chunk_id, features_file, metadata_file, local_csv, work_dir)
+    except Exception as e:
+        error_ref[0] = e
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Prefetch Next Chunk (background CSV download during extraction)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _do_prefetch(result_ref, r2, tq, work_dir):
+    """Thread target: claim next chunk + download/parse CSV. Stores result in result_ref[0]."""
+    try:
+        next_id = tq.claim_task(REGION, INSTANCE_ID)
+        if next_id is None:
+            return
+
+        city = CITY_NAME
+        csv_fn = f"{city}_{next_id}.csv"
+        csv_key = f"{CSV_BUCKET_PREFIX}/{csv_fn}"
+        local_csv = str(work_dir / csv_fn)
+
+        print(f"[PREFETCH] Downloading CSV for next chunk {next_id}...")
+        if not r2.download_file(csv_key, local_csv, max_retries=3):
+            print(f"[PREFETCH] CSV download failed for {next_id}, returning to queue")
+            try:
+                tq.fail_task(REGION, next_id, INSTANCE_ID, "prefetch_csv_download_failed")
+            except Exception:
+                pass
+            return
+
+        records, metadata_map = load_csv(local_csv)
+        result_ref[0] = (next_id, local_csv, records, metadata_map)
+        print(f"[PREFETCH] Ready: chunk {next_id} ({len(records)} panos)")
+    except Exception as e:
+        print(f"[PREFETCH] Error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Resume — Reconcile Redis with R2 (source of truth)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def reconcile_with_r2(r2, tq: TaskQueue):
+    """
+    Scan R2 for already-uploaded NPY+metadata files and mark those chunks done
+    in Redis. Also reclaim stale active tasks and recover lost tasks.
+    This makes the pipeline fully resumable after worker crashes.
+    """
+    city = CITY_NAME
+    prefix = f"{FEATURES_BUCKET_PREFIX}/{city}_"
+
+    print(f"[RESUME] Scanning R2 for existing outputs under '{prefix}'...")
+
+    # List NPY and metadata files already in R2
+    npy_keys = set(r2.list_objects(prefix, suffix='.npy'))
+    meta_keys = set(r2.list_objects(
+        f"{FEATURES_BUCKET_PREFIX}/Metadata_{city}_", suffix='.jsonl'
+    ))
+
+    # Extract chunk IDs from NPY filenames: "Features/Austin_chunk_0001.npy" → "chunk_0001"
+    done_chunks = set()
+    for key in npy_keys:
+        filename = key.rsplit('/', 1)[-1]           # "Austin_chunk_0001.npy"
+        chunk_part = filename[len(city) + 1:]        # "chunk_0001.npy"
+        chunk_part = chunk_part.replace('.npy', '')   # "chunk_0001"
+        if not chunk_part.startswith('chunk_'):
+            continue
+        # Verify metadata also exists
+        expected_meta = f"{FEATURES_BUCKET_PREFIX}/Metadata_{city}_{chunk_part}.jsonl"
+        if expected_meta in meta_keys:
+            done_chunks.add(chunk_part)
+
+    if done_chunks:
+        print(f"[RESUME] Found {len(done_chunks)} completed chunks on R2")
+        reconciled = tq.reconcile_done(REGION, done_chunks)
+        if reconciled > 0:
+            print(f"[RESUME] Marked {reconciled} chunks as done in Redis (were stale/orphaned)")
+
+    # Reclaim active tasks from dead workers (stale > 5 min)
+    stale = tq.reclaim_stale(REGION)
+    if stale:
+        print(f"[RESUME] Reclaimed {len(stale)} stale tasks: {stale}")
+
+    # Recover any tasks that fell through the cracks (LPOP succeeded but HSET failed)
+    lost = tq.recover_lost_tasks(REGION)
+    if lost:
+        print(f"[RESUME] Recovered {len(lost)} lost tasks: {lost}")
+
+    progress = tq.get_progress(REGION)
+    print(f"[RESUME] After reconciliation — todo: {progress['todo']}, "
+          f"active: {progress['active']}, done: {progress['done']}/{progress['total_chunks']}")
+
+    return done_chunks
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main Pipeline — Pipelined Chunk Queue Loop
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -1101,60 +1231,133 @@ def main():
         print("[FATAL] No job found in Redis for this region")
         sys.exit(1)
 
+    # ── Resume: reconcile Redis state with R2 reality ──
+    # Scans R2 for already-uploaded NPY files, marks them done in Redis,
+    # reclaims stale tasks from dead workers, recovers lost tasks.
+    reconcile_with_r2(r2, tq)
+
+    # Check if job is already fully done after reconciliation
+    if tq.is_complete(REGION):
+        print("[INFO] Job already complete (all chunks uploaded to R2). Self-destructing.")
+        upload_logs_to_r2()
+        self_destruct()
+        return
+
     # ── Init GPU extractor ONCE (expensive — 30-60s) ──
     print("[INFO] Initializing GPU extractor...")
     extractor = GpuExtractor()
 
-    # ── Chunk queue loop ──
+    # ── Pipelined chunk queue loop ──
+    # Overlaps: upload of chunk N runs in background while chunk N+1 extracts.
+    # Prefetch: next chunk's CSV is downloaded during current extraction.
     chunks_done = 0
     chunks_failed = 0
     idle_cycles = 0
-    MAX_IDLE_CYCLES = 6  # 6 × 30s = 3 min of idle before checking job completion
+    MAX_IDLE_CYCLES = 6
+
+    # Pipeline state
+    pending_upload = None   # (thread, chunk_id, error_ref)
+    prefetched = None       # (chunk_id, local_csv, records, metadata_map)
 
     while True:
-        # Try to claim a task
-        try:
-            chunk_id = tq.claim_task(REGION, INSTANCE_ID)
-        except Exception as e:
-            print(f"[WARN] Redis claim_task failed: {e} — retrying in 10s")
-            time.sleep(10)
-            continue
-
-        if chunk_id is None:
-            # No todo tasks available
-            try:
-                if tq.is_complete(REGION):
-                    print(f"[INFO] Job complete! Processed {chunks_done} chunks. Self-destructing.")
-                    break
-            except Exception as e:
-                print(f"[WARN] Redis is_complete check failed: {e}")
-
-            idle_cycles += 1
-            if idle_cycles >= MAX_IDLE_CYCLES:
-                # Check one more time after waiting
+        # ── Drain previous background upload ──
+        if pending_upload is not None:
+            ul_thread, ul_chunk_id, ul_error = pending_upload
+            ul_thread.join()
+            if ul_error[0] is not None:
+                chunks_failed += 1
+                err = ul_error[0]
+                print(f"[ERROR] Background upload for {ul_chunk_id} failed: {err}")
                 try:
-                    if tq.is_complete(REGION):
-                        print(f"[INFO] Job complete after idle wait. Self-destructing.")
-                        break
+                    tq.fail_task(REGION, ul_chunk_id, INSTANCE_ID,
+                                 f"{type(err).__name__}: {str(err)[:200]}")
                 except Exception:
                     pass
-                # Still tasks in progress — keep waiting (stale monitor will reclaim them)
-                print(f"[INFO] No tasks available but {idle_cycles} idle cycles. "
-                      "Waiting for in-progress tasks to finish or be reclaimed...")
-                idle_cycles = 0
-            time.sleep(30)
-            continue
+            else:
+                tq.complete_task(REGION, ul_chunk_id, INSTANCE_ID)
+                chunks_done += 1
+                print(f"[INFO] Completed chunk {ul_chunk_id} ({chunks_done} total)")
+            pending_upload = None
+
+        # ── Get next chunk: from prefetch or fresh claim ──
+        if prefetched is not None:
+            chunk_id, pf_csv, pf_records, pf_meta = prefetched
+            preloaded_data = (pf_csv, pf_records, pf_meta)
+            prefetched = None
+        else:
+            try:
+                chunk_id = tq.claim_task(REGION, INSTANCE_ID)
+            except Exception as e:
+                print(f"[WARN] Redis claim_task failed: {e} — retrying in 10s")
+                time.sleep(10)
+                continue
+
+            if chunk_id is None:
+                try:
+                    if tq.is_complete(REGION):
+                        print(f"[INFO] Job complete! Processed {chunks_done} chunks. Self-destructing.")
+                        break
+                except Exception as e:
+                    print(f"[WARN] Redis is_complete check failed: {e}")
+
+                idle_cycles += 1
+                if idle_cycles >= MAX_IDLE_CYCLES:
+                    try:
+                        if tq.is_complete(REGION):
+                            print(f"[INFO] Job complete after idle wait. Self-destructing.")
+                            break
+                    except Exception:
+                        pass
+                    print(f"[INFO] No tasks available but {idle_cycles} idle cycles. "
+                          "Waiting for in-progress tasks to finish or be reclaimed...")
+                    idle_cycles = 0
+                time.sleep(5)  # Reduced from 30s for faster queue response
+                continue
+
+            preloaded_data = None
 
         idle_cycles = 0
         print(f"\n{'='*60}")
-        print(f"[INFO] Claimed chunk: {chunk_id} (completed so far: {chunks_done})")
+        print(f"[INFO] {'Pre-fetched' if preloaded_data else 'Claimed'} chunk: {chunk_id} "
+              f"(completed so far: {chunks_done})")
         print(f"{'='*60}")
 
+        # ── Prefetch next chunk's CSV in background during extraction ──
+        pf_result = [None]
+        pf_thread = threading.Thread(
+            target=_do_prefetch, args=(pf_result, r2, tq, work_dir), daemon=True
+        )
+        pf_thread.start()
+
+        # ── Process current chunk ──
         try:
-            process_chunk(r2, tq, extractor, chunk_id, work_dir)
-            tq.complete_task(REGION, chunk_id, INSTANCE_ID)
-            chunks_done += 1
-            print(f"[INFO] Completed chunk {chunk_id} ({chunks_done} total)")
+            result = process_chunk(r2, tq, extractor, chunk_id, work_dir,
+                                   preloaded=preloaded_data)
+
+            # Wait for prefetch to finish before starting upload
+            pf_thread.join()
+            prefetched = pf_result[0]
+
+            if result is None:
+                # Empty chunk — mark complete immediately
+                tq.complete_task(REGION, chunk_id, INSTANCE_ID)
+                chunks_done += 1
+                print(f"[INFO] Completed empty chunk {chunk_id} ({chunks_done} total)")
+            else:
+                features_file, metadata_file, local_csv = result
+
+                # Launch background upload (parallel NPY + metadata)
+                err_ref = [None]
+                ul_thread = threading.Thread(
+                    target=_do_background_upload,
+                    args=(err_ref, r2, chunk_id, features_file, metadata_file,
+                          local_csv, work_dir),
+                    daemon=True,
+                )
+                ul_thread.start()
+                pending_upload = (ul_thread, chunk_id, err_ref)
+                # Loop immediately → start next chunk while upload runs
+
         except Exception as e:
             chunks_failed += 1
             error_msg = f"{type(e).__name__}: {str(e)[:200]}"
@@ -1167,9 +1370,31 @@ def main():
                 print(f"[WARN] Failed to return chunk to queue: {re}")
             _cleanup_chunk_files(work_dir, chunk_id)
 
+            # Still collect prefetch result
+            pf_thread.join()
+            prefetched = pf_result[0]
+
         # Force GC between chunks
         gc.collect()
         torch.cuda.empty_cache()
+
+    # ── Wait for final background upload before exit ──
+    if pending_upload is not None:
+        print("[INFO] Waiting for final background upload to complete...")
+        ul_thread, ul_chunk_id, ul_error = pending_upload
+        ul_thread.join()
+        if ul_error[0] is not None:
+            chunks_failed += 1
+            print(f"[ERROR] Final upload failed for {ul_chunk_id}: {ul_error[0]}")
+            try:
+                tq.fail_task(REGION, ul_chunk_id, INSTANCE_ID,
+                             str(ul_error[0])[:200])
+            except Exception:
+                pass
+        else:
+            tq.complete_task(REGION, ul_chunk_id, INSTANCE_ID)
+            chunks_done += 1
+            print(f"[INFO] Final chunk {ul_chunk_id} completed ({chunks_done} total)")
 
     # ── Done — self-destruct ──
     print(f"\n[INFO] Final stats: {chunks_done} chunks completed, {chunks_failed} failed")
