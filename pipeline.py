@@ -877,13 +877,15 @@ def upload_with_retry(r2, local_path, bucket_key, label="FILE", max_attempts=5):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, work_dir: Path,
-                  preloaded=None, chunks_done_so_far: int = 0):
+                  preloaded=None, chunks_done_so_far: int = 0, redis_chunk_id: str = None):
     """
     Extract features for a chunk. Returns (features_file, metadata_file, local_csv)
     for async upload, or None if chunk was empty.
 
     preloaded: optional (local_csv, records, metadata_map) to skip CSV download.
+    redis_chunk_id: global chunk ID for Redis ops (batch mode). Defaults to chunk_id.
     """
+    _rcid = redis_chunk_id or chunk_id
     city = CITY_NAME
 
     if preloaded:
@@ -896,7 +898,7 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
         local_csv = str(work_dir / csv_filename)
         print(f"[CHUNK {chunk_id}] Downloading {csv_key}...")
         try:
-            tq.report_status(REGION, INSTANCE_ID, "DOWNLOADING", chunk_id=chunk_id)
+            tq.report_status(REGION, INSTANCE_ID, "DOWNLOADING", chunk_id=_rcid)
         except Exception:
             pass
         if not r2.download_file(csv_key, local_csv, max_retries=3):
@@ -957,7 +959,7 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
 
     print(f"[CHUNK {chunk_id}] Starting extraction (batch_size={extractor.batch_size})", flush=True)
     try:
-        tq.report_status(REGION, INSTANCE_ID, "EXTRACTING", chunk_id=chunk_id,
+        tq.report_status(REGION, INSTANCE_ID, "EXTRACTING", chunk_id=_rcid,
                          total=total_views_est)
     except Exception:
         pass
@@ -974,14 +976,14 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
             # ── Redis heartbeat + status report ──
             if now - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                 try:
-                    tq.heartbeat(REGION, INSTANCE_ID, chunk_id)
+                    tq.heartbeat(REGION, INSTANCE_ID, _rcid)
                     elapsed = now - loop_start
                     _spd = stats['ext_ok'] / elapsed if elapsed > 0 else 0
                     _rem = total_views_est - stats['ext_ok']
                     _eta = _rem / _spd if _spd > 0 else 0
                     tq.report_status(
                         REGION, INSTANCE_ID, "EXTRACTING",
-                        chunk_id=chunk_id, chunks_done=chunks_done_so_far,
+                        chunk_id=_rcid, chunks_done=chunks_done_so_far,
                         processed=stats['ext_ok'], total=total_views_est,
                         speed=_spd, eta=_eta,
                     )
@@ -1182,9 +1184,24 @@ def _do_prefetch(result_ref, r2, tq, work_dir):
         if next_id is None:
             return
 
-        city = CITY_NAME
-        csv_fn = f"{city}_{next_id}.csv"
-        csv_key = f"{CSV_BUCKET_PREFIX}/{csv_fn}"
+        # Batch mode: look up per-chunk metadata
+        _bmeta = None
+        try:
+            _bmeta = tq.get_chunk_meta(REGION, next_id)
+        except Exception:
+            pass
+
+        if _bmeta:
+            city = _bmeta['city_name']
+            csv_prefix = _bmeta['csv_prefix']
+            file_cid = f"chunk_{_bmeta['chunk_num']:04d}"
+        else:
+            city = CITY_NAME
+            csv_prefix = CSV_BUCKET_PREFIX
+            file_cid = next_id
+
+        csv_fn = f"{city}_{file_cid}.csv"
+        csv_key = f"{csv_prefix}/{csv_fn}"
         local_csv = str(work_dir / csv_fn)
 
         print(f"[PREFETCH] Downloading CSV for next chunk {next_id}...")
@@ -1197,7 +1214,7 @@ def _do_prefetch(result_ref, r2, tq, work_dir):
             return
 
         records, metadata_map = load_csv(local_csv)
-        result_ref[0] = (next_id, local_csv, records, metadata_map)
+        result_ref[0] = (next_id, local_csv, records, metadata_map, _bmeta)
         print(f"[PREFETCH] Ready: chunk {next_id} ({len(records)} panos)")
     except Exception as e:
         print(f"[PREFETCH] Error: {e}")
@@ -1213,6 +1230,23 @@ def reconcile_with_r2(r2, tq: TaskQueue):
     in Redis. Also reclaim stale active tasks and recover lost tasks.
     This makes the pipeline fully resumable after worker crashes.
     """
+    # Batch mode: skip R2 scan (chunks have mixed paths), just do stale recovery
+    try:
+        if (tq.redis.hlen(f"job:{REGION}:cmap") or 0) > 0:
+            print("[RESUME] Batch mode — skipping R2 reconciliation, using stale recovery only")
+            stale = tq.reclaim_stale(REGION)
+            if stale:
+                print(f"[RESUME] Reclaimed {len(stale)} stale tasks: {stale}")
+            lost = tq.recover_lost_tasks(REGION)
+            if lost:
+                print(f"[RESUME] Recovered {len(lost)} lost tasks: {lost}")
+            progress = tq.get_progress(REGION)
+            print(f"[RESUME] After recovery — todo: {progress['todo']}, "
+                  f"active: {progress['active']}, done: {progress['done']}/{progress['total_chunks']}")
+            return
+    except Exception:
+        pass
+
     city = CITY_NAME
     prefix = f"{FEATURES_BUCKET_PREFIX}/{city}_"
 
@@ -1363,8 +1397,8 @@ def main():
     MAX_IDLE_SECONDS = 600  # 10 min hard idle timeout → self-destruct
 
     # Pipeline state
-    pending_upload = None   # (thread, chunk_id, error_ref)
-    prefetched = None       # (chunk_id, local_csv, records, metadata_map)
+    pending_upload = None   # (thread, redis_chunk_id, error_ref)
+    prefetched = None       # (chunk_id, local_csv, records, metadata_map[, batch_meta])
 
     while True:
         # ── Drain previous background upload ──
@@ -1393,8 +1427,11 @@ def main():
             pending_upload = None
 
         # ── Get next chunk: from prefetch or fresh claim ──
+        _bmeta = None  # batch metadata for current chunk
         if prefetched is not None:
-            chunk_id, pf_csv, pf_records, pf_meta = prefetched
+            chunk_id = prefetched[0]
+            pf_csv, pf_records, pf_meta = prefetched[1], prefetched[2], prefetched[3]
+            _bmeta = prefetched[4] if len(prefetched) > 4 else None
             preloaded_data = (pf_csv, pf_records, pf_meta)
             prefetched = None
         else:
@@ -1447,8 +1484,25 @@ def main():
 
             preloaded_data = None
 
+            # Look up batch metadata for freshly claimed chunk
+            try:
+                _bmeta = tq.get_chunk_meta(REGION, chunk_id)
+            except Exception:
+                pass
+
         idle_cycles = 0
         idle_start_time = None
+
+        # ── Batch mode: override globals with per-chunk paths ──
+        _redis_cid = chunk_id  # preserve original for Redis ops
+        if _bmeta:
+            CITY_NAME = _bmeta['city_name']
+            CSV_BUCKET_PREFIX = _bmeta['csv_prefix']
+            FEATURES_BUCKET_PREFIX = _bmeta['features_prefix']
+            TOTAL_CHUNKS = _bmeta['city_total']
+            chunk_id = f"chunk_{_bmeta['chunk_num']:04d}"  # local file chunk ID
+            print(f"[BATCH] {_redis_cid} → {CITY_NAME} {chunk_id} "
+                  f"(csv={CSV_BUCKET_PREFIX}, feat={FEATURES_BUCKET_PREFIX})")
 
         # ── Skip if output already exists on R2 (avoids re-extracting) ──
         out_base = _output_base(CITY_NAME, chunk_id)
@@ -1457,7 +1511,7 @@ def main():
             if r2.file_exists(npy_key):
                 print(f"[SKIP] Chunk {chunk_id} output already on R2 — marking done")
                 try:
-                    tq.complete_task(REGION, chunk_id, INSTANCE_ID)
+                    tq.complete_task(REGION, _redis_cid, INSTANCE_ID)
                 except Exception:
                     pass
                 chunks_done += 1
@@ -1482,7 +1536,8 @@ def main():
         try:
             result = process_chunk(r2, tq, extractor, chunk_id, work_dir,
                                    preloaded=preloaded_data,
-                                   chunks_done_so_far=chunks_done)
+                                   chunks_done_so_far=chunks_done,
+                                   redis_chunk_id=_redis_cid)
 
             # Wait for prefetch to finish before starting upload
             pf_thread.join()
@@ -1490,13 +1545,14 @@ def main():
 
             if result is None:
                 # Empty chunk — mark complete immediately
-                tq.complete_task(REGION, chunk_id, INSTANCE_ID)
+                tq.complete_task(REGION, _redis_cid, INSTANCE_ID)
                 chunks_done += 1
                 print(f"[INFO] Completed empty chunk {chunk_id} ({chunks_done} total)")
             else:
                 features_file, metadata_file, local_csv = result
 
                 # Launch background upload (parallel NPY + metadata)
+                # chunk_id = local file ID for naming; _redis_cid tracked in pending_upload
                 err_ref = [None]
                 ul_thread = threading.Thread(
                     target=_do_background_upload,
@@ -1505,10 +1561,10 @@ def main():
                     daemon=True,
                 )
                 ul_thread.start()
-                pending_upload = (ul_thread, chunk_id, err_ref)
+                pending_upload = (ul_thread, _redis_cid, err_ref)
                 try:
                     tq.report_status(REGION, INSTANCE_ID, "UPLOADING",
-                                     chunk_id=chunk_id, chunks_done=chunks_done)
+                                     chunk_id=_redis_cid, chunks_done=chunks_done)
                 except Exception:
                     pass
                 # Loop immediately → start next chunk while upload runs
@@ -1520,7 +1576,7 @@ def main():
             import traceback
             traceback.print_exc()
             try:
-                tq.fail_task(REGION, chunk_id, INSTANCE_ID, error_msg)
+                tq.fail_task(REGION, _redis_cid, INSTANCE_ID, error_msg)
             except Exception as re:
                 print(f"[WARN] Failed to return chunk to queue: {re}")
             _cleanup_chunk_files(work_dir, chunk_id)
