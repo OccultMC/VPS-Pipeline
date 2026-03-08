@@ -250,7 +250,8 @@ class TaskQueue:
         done_key = self._done_key(region)
 
         # Skip chunks already marked done in Redis
-        already_done = self.redis.smembers(done_key) or set()
+        # Note: Upstash smembers() returns a list, not a set
+        already_done = set(self.redis.smembers(done_key) or [])
         need_reconcile = done_chunk_ids - already_done
 
         if not need_reconcile:
@@ -322,6 +323,37 @@ class TaskQueue:
                 break
         return result
 
+    # ── Batch chunk metadata ─────────────────────────────────────────────
+
+    def _cmap_key(self, region: str) -> str:
+        return f"job:{region}:cmap"
+
+    def set_batch_meta(self, region: str, chunk_metas: dict):
+        """Store per-chunk metadata for batch jobs.
+
+        chunk_metas: {global_chunk_id: "csv_prefix|features_prefix|city_name|city_total|chunk_num"}
+        """
+        key = self._cmap_key(region)
+        if chunk_metas:
+            self.redis.hset(key, values=chunk_metas)
+        logger.info(f"Stored batch metadata for {len(chunk_metas)} chunks in {region}")
+
+    def get_chunk_meta(self, region: str, chunk_id: str) -> Optional[dict]:
+        """Get batch metadata for a specific chunk. Returns dict or None."""
+        val = self.redis.hget(self._cmap_key(region), chunk_id)
+        if not val:
+            return None
+        parts = val.split('|')
+        if len(parts) < 5:
+            return None
+        return {
+            'csv_prefix': parts[0],
+            'features_prefix': parts[1],
+            'city_name': parts[2],
+            'city_total': int(parts[3]),
+            'chunk_num': int(parts[4]),
+        }
+
     # ── Cleanup ───────────────────────────────────────────────────────────
 
     def cleanup(self, region: str):
@@ -341,5 +373,6 @@ class TaskQueue:
             self._active_key(region),
             self._done_key(region),
             self._meta_key(region),
+            self._cmap_key(region),
         )
         logger.info(f"Cleaned up job keys for {region}")

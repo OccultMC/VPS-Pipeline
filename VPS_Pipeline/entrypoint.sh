@@ -76,10 +76,21 @@ else
     fi
 fi
 
-# Run the pipeline
+# Suppress Vast.ai SSH port-forwarding noise from polluting pipeline logs
+# These spam "Warning: Permanently added" + "remote port forwarding failed" every 2s
+export VAST_CONTAINERLABEL=${VAST_CONTAINERLABEL:-}
+(
+    # Kill the noisy ssh port-forward retry loop if it exists
+    # Redirect any remaining sshd/ssh stderr to /dev/null
+    for pid in $(pgrep -f "ssh.*vast.ai" 2>/dev/null); do
+        kill "$pid" 2>/dev/null || true
+    done
+) &>/dev/null || true
+
+# Run the pipeline — filter out SSH noise from stdout/stderr
 echo "[INFO] Starting pipeline.py at $(date -u)..."
-python pipeline.py
-EXIT_CODE=$?
+python pipeline.py 2>&1 | grep -v -E "^(Warning: Permanently added|Error: remote port forwarding|kex_exchange_identification|Connection closed by|Connection from|banner exchange|ssh: Could not resolve)" || true
+EXIT_CODE=${PIPESTATUS[0]}
 
 if [ $EXIT_CODE -ne 0 ]; then
     echo "[ERROR] Pipeline exited with code $EXIT_CODE at $(date -u)"
