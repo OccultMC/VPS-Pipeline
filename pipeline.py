@@ -1326,6 +1326,8 @@ def _detect_instance_id():
 
 
 def main():
+    global CITY_NAME, CSV_BUCKET_PREFIX, FEATURES_BUCKET_PREFIX, TOTAL_CHUNKS
+
     work_dir = Path('/app/work')
     work_dir.mkdir(parents=True, exist_ok=True)
 
