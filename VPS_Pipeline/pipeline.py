@@ -154,8 +154,8 @@ class SharedState:
         self.memmap = features_memmap
         self.write_idx = start_idx
         self.lock = threading.Lock()
-        self.metadata_handle = open(metadata_file_path, 'a', encoding='utf-8')
-        self.failed_handle = open(failed_file_path, 'a', encoding='utf-8')
+        self.metadata_handle = open(metadata_file_path, 'w', encoding='utf-8')
+        self.failed_handle = open(failed_file_path, 'w', encoding='utf-8')
         self._batch_count = 0
 
     def write_batch(self, features_batch: np.ndarray, metadata_batch: List[dict]):
@@ -271,38 +271,66 @@ class GpuExtractor:
             self._watchdog.cancel()
 
     @staticmethod
-    def _load_baked_model():
-        """Load MegaLoc model from weights baked into the Docker image."""
-        from safetensors.torch import load_file
+    def _load_model():
+        """Load MegaLoc model using the same get_trained_model path as inference.
 
+        Primary: torch.hub → get_trained_model (HuggingFace weights, strict=True)
+        Fallback: baked model.safetensors if hub download fails (strict=True)
+        """
+        errors = []
+
+        # ── Primary: torch.hub get_trained_model (same as Flask server) ──
+        for attempt in range(1, 4):
+            try:
+                print(f"[INIT]   torch.hub get_trained_model attempt {attempt}/3...", flush=True)
+                model = torch.hub.load(
+                    "gmberton/MegaLoc", "get_trained_model", trust_repo=True
+                )
+                print("[INIT]   Model loaded via torch.hub (matches inference server)", flush=True)
+                return model
+            except Exception as e:
+                print(f"[INIT]   torch.hub attempt {attempt} failed: {type(e).__name__}: {e}", flush=True)
+                errors.append(f"torch.hub#{attempt}: {e}")
+                if attempt < 3:
+                    time.sleep(2 ** attempt)
+
+        # ── Fallback: baked model (strict=True to catch key mismatches) ──
+        print("[WARN] torch.hub failed, trying baked model fallback...", flush=True)
         model_path = Path('/app/models/megaloc/model.safetensors')
-        if not model_path.exists():
-            raise FileNotFoundError(
-                f"MegaLoc model weights not found at {model_path}. "
-                "Rebuild the Docker image to embed the model."
-            )
+        if model_path.exists():
+            try:
+                from safetensors.torch import load_file
 
-        size_mb = model_path.stat().st_size / 1e6
-        print(f"[INIT]   Loading baked model weights ({size_mb:.1f}MB) from {model_path}", flush=True)
-        state_dict = load_file(str(model_path))
+                size_mb = model_path.stat().st_size / 1e6
+                print(f"[INIT]   Loading baked weights ({size_mb:.1f}MB) from {model_path}", flush=True)
+                state_dict = load_file(str(model_path))
 
-        hub_dir = Path(torch.hub.get_dir()) / 'gmberton_MegaLoc_main'
-        if not hub_dir.exists():
-            raise FileNotFoundError(
-                f"MegaLoc architecture not found at {hub_dir}. "
-                "Rebuild the Docker image to bake it in."
-            )
+                hub_dir = Path(torch.hub.get_dir()) / 'gmberton_MegaLoc_main'
+                if not hub_dir.exists():
+                    raise FileNotFoundError(f"MegaLoc architecture not found at {hub_dir}")
 
-        sys.path.insert(0, str(hub_dir))
-        try:
-            import importlib
-            megaloc_module = importlib.import_module('megaloc_model')
-            model = megaloc_module.MegaLoc()
-            model.load_state_dict(state_dict, strict=False)
-            print("[INIT]   Model architecture created + baked weights loaded (no download)", flush=True)
-            return model
-        finally:
-            sys.path.pop(0)
+                sys.path.insert(0, str(hub_dir))
+                try:
+                    import importlib
+                    megaloc_module = importlib.import_module('megaloc_model')
+                    model = megaloc_module.MegaLoc()
+                    model.load_state_dict(state_dict, strict=True)
+                    print("[INIT]   Model loaded from baked weights (strict=True, all keys matched)", flush=True)
+                    return model
+                finally:
+                    sys.path.pop(0)
+            except Exception as e:
+                errors.append(f"baked model: {e}")
+                print(f"[WARN] Baked model fallback failed: {e}", flush=True)
+        else:
+            errors.append("baked model.safetensors not found")
+
+        raise RuntimeError(
+            f"All model sources failed:\n"
+            + "\n".join(f"  - {err}" for err in errors)
+            + "\n\nEnsure the worker has network access to github.com + huggingface.co, "
+            + "or bake a compatible model.safetensors into the Docker image."
+        )
 
     def _init_gpu(self, t0: float):
         # ── Step 1: CUDA check ──
@@ -322,20 +350,20 @@ class GpuExtractor:
         torch.set_float32_matmul_precision('high')
         self.device = torch.device('cuda')
 
-        # ── Step 2: Load baked model ──
-        print(f"[INIT] Step 2/5: Loading baked MegaLoc model...", flush=True)
-        self._watchdog.start("load_baked_model")
+        # ── Step 2: Load MegaLoc model ──
+        print(f"[INIT] Step 2/5: Loading MegaLoc model...", flush=True)
+        self._watchdog.start("load_model")
         dl_start = time.time()
         try:
             model = _run_with_timeout(
-                self._load_baked_model,
+                self._load_model,
                 timeout_sec=GPU_INIT_TIMEOUT,
-                stage="load_baked_model"
+                stage="load_model"
             )
         except TimeoutError:
             raise RuntimeError(
                 f"Model loading timed out after {GPU_INIT_TIMEOUT}s. "
-                "safetensors load or model construction is hung."
+                "Network download or model construction is hung."
             )
         print(f"[INIT]   Model ready in {time.time() - dl_start:.1f}s", flush=True)
 
@@ -1177,8 +1205,9 @@ def _do_background_upload(error_ref, r2, chunk_id, features_file, metadata_file,
 # Prefetch Next Chunk (background CSV download during extraction)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _do_prefetch(result_ref, r2, tq, work_dir):
-    """Thread target: claim next chunk + download/parse CSV. Stores result in result_ref[0]."""
+def _do_prefetch(result_ref, r2, tq, work_dir, skip_prefixes=None):
+    """Thread target: claim next chunk + download/parse CSV. Stores result in result_ref[0].
+    skip_prefixes: shared set of city CSV prefixes to skip (missing on R2)."""
     try:
         next_id = tq.claim_task(REGION, INSTANCE_ID)
         if next_id is None:
@@ -1200,6 +1229,16 @@ def _do_prefetch(result_ref, r2, tq, work_dir):
             csv_prefix = CSV_BUCKET_PREFIX
             file_cid = next_id
 
+        # Skip if this city's CSVs are known missing
+        if skip_prefixes and csv_prefix in skip_prefixes:
+            print(f"[PREFETCH] Skipping {next_id} — city '{city}' CSVs missing on R2")
+            try:
+                tq.fail_task(REGION, next_id, INSTANCE_ID,
+                             f"city_csv_missing:{csv_prefix}")
+            except Exception:
+                pass
+            return
+
         csv_fn = f"{city}_{file_cid}.csv"
         csv_key = f"{csv_prefix}/{csv_fn}"
         local_csv = str(work_dir / csv_fn)
@@ -1207,8 +1246,14 @@ def _do_prefetch(result_ref, r2, tq, work_dir):
         print(f"[PREFETCH] Downloading CSV for next chunk {next_id}...")
         if not r2.download_file(csv_key, local_csv, max_retries=3):
             print(f"[PREFETCH] CSV download failed for {next_id}, returning to queue")
+            # Blacklist this city prefix
+            if skip_prefixes is not None:
+                skip_prefixes.add(csv_prefix)
+                print(f"[PREFETCH] Blacklisting city prefix '{csv_prefix}' — "
+                      f"all future chunks from {city} will be skipped")
             try:
-                tq.fail_task(REGION, next_id, INSTANCE_ID, "prefetch_csv_download_failed")
+                tq.fail_task(REGION, next_id, INSTANCE_ID,
+                             f"city_csv_missing:{csv_prefix}")
             except Exception:
                 pass
             return
@@ -1326,6 +1371,8 @@ def _detect_instance_id():
 
 
 def main():
+    global CITY_NAME, CSV_BUCKET_PREFIX, FEATURES_BUCKET_PREFIX, TOTAL_CHUNKS
+
     work_dir = Path('/app/work')
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1395,6 +1442,7 @@ def main():
     idle_start_time = None
     MAX_IDLE_CYCLES = 6
     MAX_IDLE_SECONDS = 600  # 10 min hard idle timeout → self-destruct
+    skip_city_prefixes = set()  # CSV prefixes with missing R2 files — skip entire city
 
     # Pipeline state
     pending_upload = None   # (thread, redis_chunk_id, error_ref)
@@ -1504,6 +1552,17 @@ def main():
             print(f"[BATCH] {_redis_cid} → {CITY_NAME} {chunk_id} "
                   f"(csv={CSV_BUCKET_PREFIX}, feat={FEATURES_BUCKET_PREFIX})")
 
+            # Skip entire city if its CSV prefix previously 404'd
+            if CSV_BUCKET_PREFIX in skip_city_prefixes:
+                print(f"[SKIP-CITY] {CITY_NAME} — CSVs missing on R2, skipping {_redis_cid}")
+                try:
+                    tq.fail_task(REGION, _redis_cid, INSTANCE_ID,
+                                 f"city_csv_missing:{CSV_BUCKET_PREFIX}")
+                except Exception:
+                    pass
+                prefetched = None
+                continue
+
         # ── Skip if output already exists on R2 (avoids re-extracting) ──
         out_base = _output_base(CITY_NAME, chunk_id)
         npy_key = f"{FEATURES_BUCKET_PREFIX}/{out_base}.npy"
@@ -1528,7 +1587,7 @@ def main():
         # ── Prefetch next chunk's CSV in background during extraction ──
         pf_result = [None]
         pf_thread = threading.Thread(
-            target=_do_prefetch, args=(pf_result, r2, tq, work_dir), daemon=True
+            target=_do_prefetch, args=(pf_result, r2, tq, work_dir, skip_city_prefixes), daemon=True
         )
         pf_thread.start()
 
@@ -1581,6 +1640,12 @@ def main():
                 print(f"[WARN] Failed to return chunk to queue: {re}")
             _cleanup_chunk_files(work_dir, chunk_id)
 
+            # If CSV download failed (404), skip all future chunks from this city
+            if "Failed to download" in str(e) and CSV_BUCKET_PREFIX:
+                skip_city_prefixes.add(CSV_BUCKET_PREFIX)
+                print(f"[SKIP-CITY] Blacklisting city prefix '{CSV_BUCKET_PREFIX}' "
+                      f"— all future chunks from {CITY_NAME} will be skipped")
+
             # Still collect prefetch result
             pf_thread.join()
             prefetched = pf_result[0]
@@ -1613,7 +1678,12 @@ def main():
                 chunks_done += 1
 
     # ── Done — self-destruct ──
-    print(f"\n[INFO] Final stats: {chunks_done} chunks completed, {chunks_failed} failed")
+    try:
+        final_progress = tq.get_progress(REGION)
+        perm_failed = final_progress.get('failed', 0)
+    except Exception:
+        perm_failed = 0
+    print(f"\n[INFO] Final stats: {chunks_done} chunks completed, {chunks_failed} failed this session, {perm_failed} permanently failed")
     try:
         tq.report_status(REGION, INSTANCE_ID, "DONE", chunks_done=chunks_done)
     except Exception:
