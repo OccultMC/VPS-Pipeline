@@ -1,11 +1,10 @@
 """
-Cloudflare R2 Storage Client (Builder Worker)
+Cloudflare R2 Storage Client (Pipeline Worker)
 
-Optimized for downloading many feature files and uploading the final index.
+Optimized for large feature file uploads with multipart and verification.
 """
 import os
 import time
-import json
 import logging
 from typing import Optional, List, Dict
 import collections
@@ -40,54 +39,42 @@ class R2Client:
         if not all([self.account_id, self.access_key_id, self.secret_access_key, self.bucket_name]):
             raise ValueError("Missing R2 credentials")
 
-        endpoint_url = f"https://{self.account_id}.r2.cloudflarestorage.com"
+        self._endpoint_url = f"https://{self.account_id}.r2.cloudflarestorage.com"
+        self.s3 = self._make_client()
 
-        self.s3 = boto3.client(
+    def _make_client(self):
+        """Create a fresh boto3 S3 client (avoids stale connection pool issues)."""
+        return boto3.client(
             "s3",
-            endpoint_url=endpoint_url,
+            endpoint_url=self._endpoint_url,
             aws_access_key_id=self.access_key_id,
             aws_secret_access_key=self.secret_access_key,
             config=Config(
                 retries={"max_attempts": 3, "mode": "adaptive"},
                 s3={"addressing_style": "path"},
+                read_timeout=120,     # 2 min per chunk — 8MB at 0.1 MB/s = 80s
+                connect_timeout=30,
             ),
             region_name="auto",
         )
 
-    def list_files(self, prefix: str = "") -> List[Dict]:
-        """List all files under a prefix. Returns list of {key, size, last_modified}."""
-        results = []
-        continuation_token = None
-
-        while True:
-            kwargs = {
-                "Bucket": self.bucket_name,
-                "Prefix": prefix,
-                "MaxKeys": 1000,
-            }
-            if continuation_token:
-                kwargs["ContinuationToken"] = continuation_token
-
-            resp = self.s3.list_objects_v2(**kwargs)
-
-            for obj in resp.get("Contents", []):
-                results.append({
-                    "key": obj["Key"],
-                    "size": obj["Size"],
-                    "last_modified": obj["LastModified"],
-                })
-
-            if resp.get("IsTruncated"):
-                continuation_token = resp["NextContinuationToken"]
-            else:
-                break
-
-        return results
+    def reset_client(self):
+        """Reset the S3 client to clear stale connections."""
+        self.s3 = self._make_client()
 
     def upload_file(self, local_path: str, bucket_key: str, max_retries: int = 3,
                     progress_callback=None) -> bool:
         local_path = str(local_path)
         file_size = os.path.getsize(local_path)
+
+        # Use smaller chunks and single-threaded upload for files >1GB
+        # to avoid overwhelming flaky connections on rented machines.
+        if file_size > 1 * 1024 * 1024 * 1024:  # >1GB
+            chunk_size = 8 * 1024 * 1024       # 8MB parts
+            concurrency = 1                     # sequential uploads
+        else:
+            chunk_size = 25 * 1024 * 1024       # 25MB parts
+            concurrency = 4
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -100,9 +87,9 @@ class R2Client:
                     callback = _cb
 
                 config = boto3.s3.transfer.TransferConfig(
-                    multipart_threshold=100 * 1024 * 1024,
-                    multipart_chunksize=100 * 1024 * 1024,
-                    max_concurrency=4,
+                    multipart_threshold=chunk_size,
+                    multipart_chunksize=chunk_size,
+                    max_concurrency=concurrency,
                 )
                 self.s3.upload_file(local_path, self.bucket_name, bucket_key,
                                     Callback=callback, Config=config)
@@ -117,13 +104,16 @@ class R2Client:
             except Exception as e:
                 print(f"[R2] Upload attempt {attempt}/{max_retries}: {e}")
                 if attempt < max_retries:
+                    # Reset client to clear stale connections before retry
+                    self.reset_client()
                     time.sleep(2 ** attempt)
 
         return False
 
     def upload_json(self, bucket_key: str, data: dict, max_retries: int = 3) -> bool:
-        """Upload a dict as JSON to R2."""
-        body = json.dumps(data).encode('utf-8')
+        """Upload a dict as JSON to R2 without needing a temp file."""
+        import json as _json
+        body = _json.dumps(data).encode('utf-8')
         for attempt in range(1, max_retries + 1):
             try:
                 self.s3.put_object(
@@ -139,12 +129,42 @@ class R2Client:
                     time.sleep(2 ** attempt)
         return False
 
+    def list_objects(self, prefix: str, suffix: str = None) -> List[str]:
+        """List object keys under a prefix, optionally filtered by suffix."""
+        keys = []
+        paginator = self.s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                if suffix is None or key.endswith(suffix):
+                    keys.append(key)
+        return keys
+
+    def file_exists(self, bucket_key: str) -> bool:
+        """Check if an object exists in the bucket."""
+        try:
+            self.s3.head_object(Bucket=self.bucket_name, Key=bucket_key)
+            return True
+        except Exception:
+            return False
+
+    def delete_object(self, bucket_key: str) -> bool:
+        """Delete an object from R2."""
+        try:
+            self.s3.delete_object(Bucket=self.bucket_name, Key=bucket_key)
+            print(f"[R2] Deleted {bucket_key}")
+            return True
+        except Exception as e:
+            print(f"[R2] Failed to delete {bucket_key}: {e}")
+            return False
+
     def download_json(self, bucket_key: str) -> dict:
-        """Download and parse a JSON file from R2."""
+        """Download and parse a JSON file from R2. Returns empty dict on failure."""
+        import json as _json
         try:
             resp = self.s3.get_object(Bucket=self.bucket_name, Key=bucket_key)
             body = resp['Body'].read()
-            return json.loads(body)
+            return _json.loads(body)
         except Exception:
             return {}
 
@@ -176,13 +196,3 @@ class R2Client:
                     time.sleep(2 ** attempt)
 
         return False
-
-    def delete_object(self, bucket_key: str) -> bool:
-        """Delete an object from R2."""
-        try:
-            self.s3.delete_object(Bucket=self.bucket_name, Key=bucket_key)
-            print(f"[R2] Deleted {bucket_key}")
-            return True
-        except Exception as e:
-            print(f"[R2] Failed to delete {bucket_key}: {e}")
-            return False
