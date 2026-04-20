@@ -708,27 +708,63 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
 
 async def _run_downloader(records, config, item_queue, metadata, stats, shared_state):
     from aiohttp import ClientTimeout
+    print(f"[DL] _run_downloader entered (records={len(records)}, "
+          f"max_threads={config.get('max_threads')}, workers={config.get('workers')})",
+          flush=True)
     sem = asyncio.Semaphore(config['max_threads'])
-    connector = aiohttp.TCPConnector(limit=600, limit_per_host=200, ttl_dns_cache=300)
     timeout = ClientTimeout(total=15, connect=8)
 
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        with ThreadPoolExecutor(max_workers=config['workers']) as executor:
-            CHUNK = 5000
-            for i in range(0, len(records), CHUNK):
-                chunk = records[i:i + CHUNK]
-                tasks = [
-                    _download_single_pano(session, rec, sem, executor, config,
-                                          item_queue, metadata, stats, shared_state)
-                    for rec in chunk
-                ]
-                await asyncio.gather(*tasks, return_exceptions=True)
+    # TCPConnector is created INSIDE the running event loop to avoid
+    # "Timeout context manager should be used inside a task" / loop-binding issues
+    # when aiohttp binds resources to a different loop than ClientSession.
+    connector = aiohttp.TCPConnector(limit=600, limit_per_host=200, ttl_dns_cache=300)
 
-    item_queue.put(_SENTINEL)
-    stats['dl_done'] = True
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            with ThreadPoolExecutor(max_workers=config['workers']) as executor:
+                CHUNK = 5000
+                for i in range(0, len(records), CHUNK):
+                    chunk = records[i:i + CHUNK]
+                    print(f"[DL] Dispatching {len(chunk)} pano tasks "
+                          f"(offset={i}/{len(records)})", flush=True)
+                    tasks = [
+                        _download_single_pano(session, rec, sem, executor, config,
+                                              item_queue, metadata, stats, shared_state)
+                        for rec in chunk
+                    ]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    # Surface any per-task exceptions that would otherwise be silent
+                    exc_counts = {}
+                    for r in results:
+                        if isinstance(r, BaseException):
+                            k = type(r).__name__
+                            exc_counts[k] = exc_counts.get(k, 0) + 1
+                    if exc_counts:
+                        print(f"[DL] Silent per-task exceptions: {exc_counts} "
+                              f"(dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']})",
+                              flush=True)
+    finally:
+        item_queue.put(_SENTINEL)
+        stats['dl_done'] = True
+        print(f"[DL] _run_downloader exiting "
+              f"(dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']}, "
+              f"views_produced={stats['views_produced']})", flush=True)
+
 
 def downloader_thread(records, config, item_queue, metadata, stats, shared_state):
-    asyncio.run(_run_downloader(records, config, item_queue, metadata, stats, shared_state))
+    try:
+        asyncio.run(_run_downloader(records, config, item_queue, metadata, stats, shared_state))
+    except BaseException as e:
+        import traceback
+        print(f"[DL][FATAL] downloader_thread crashed: {type(e).__name__}: {e}",
+              flush=True)
+        traceback.print_exc()
+        # Ensure main loop unblocks even after a crash
+        try:
+            item_queue.put(_SENTINEL, timeout=5.0)
+        except Exception:
+            pass
+        stats['dl_done'] = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
