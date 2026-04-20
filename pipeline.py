@@ -662,6 +662,11 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
                         await asyncio.sleep(2 ** attempt)
                         continue
                     stats['dl_fail'] += 1
+                    stats.setdefault('fail_no_tiles', 0)
+                    stats['fail_no_tiles'] += 1
+                    if stats['fail_no_tiles'] <= 3:
+                        print(f"[DL][SAMPLE] no_tiles panoid={panoid_str} "
+                              f"tiles_tried={len(tasks)} zoom={zoom_level}", flush=True)
                     shared_state.log_failure(panoid_str, "no_tiles")
                     return
 
@@ -681,6 +686,13 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
                         await asyncio.sleep(2 ** attempt)
                         continue
                     stats['dl_fail'] += 1
+                    stats.setdefault('fail_stitch', 0)
+                    stats['fail_stitch'] += 1
+                    if stats['fail_stitch'] <= 3:
+                        print(f"[DL][SAMPLE] stitch_failed panoid={panoid_str} "
+                              f"success={result.get('success')} "
+                              f"views={len(result.get('views', []))} "
+                              f"error={result.get('error', '')[:200]}", flush=True)
                     shared_state.log_failure(panoid_str, "stitch_failed")
                     return
 
@@ -704,6 +716,11 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
                 await asyncio.sleep(2 ** attempt)
             else:
                 stats['dl_fail'] += 1
+                stats.setdefault('fail_exc', 0)
+                stats['fail_exc'] += 1
+                if stats['fail_exc'] <= 3:
+                    print(f"[DL][SAMPLE] exception panoid={panoid_str} "
+                          f"{type(e).__name__}: {str(e)[:200]}", flush=True)
                 shared_state.log_failure(panoid_str, f"exception: {e}")
 
 async def _run_downloader(records, config, item_queue, metadata, stats, shared_state):
@@ -721,6 +738,22 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
 
     try:
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            # ── Connectivity probe: fetch 1 tile from the first real pano ──
+            if records:
+                probe_pid = records[0].get('panoid', '')
+                probe_url = f"https://cbk0.google.com/cbk?output=tile&panoid={probe_pid}&zoom=2&x=0&y=0"
+                try:
+                    async with session.get(probe_url) as r:
+                        body = await r.read()
+                        print(f"[DL][PROBE] GET {probe_url} → "
+                              f"status={r.status} len={len(body)} "
+                              f"ct={r.headers.get('Content-Type','')} "
+                              f"cl={r.headers.get('Content-Length','')}",
+                              flush=True)
+                except Exception as e:
+                    print(f"[DL][PROBE] GET {probe_url} FAILED: "
+                          f"{type(e).__name__}: {e}", flush=True)
+
             with ThreadPoolExecutor(max_workers=config['workers']) as executor:
                 CHUNK = 5000
                 for i in range(0, len(records), CHUNK):
@@ -748,7 +781,10 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
         stats['dl_done'] = True
         print(f"[DL] _run_downloader exiting "
               f"(dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']}, "
-              f"views_produced={stats['views_produced']})", flush=True)
+              f"views_produced={stats['views_produced']}, "
+              f"fail_no_tiles={stats.get('fail_no_tiles', 0)}, "
+              f"fail_stitch={stats.get('fail_stitch', 0)}, "
+              f"fail_exc={stats.get('fail_exc', 0)})", flush=True)
 
 
 def downloader_thread(records, config, item_queue, metadata, stats, shared_state):
