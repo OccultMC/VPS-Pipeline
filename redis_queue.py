@@ -115,6 +115,26 @@ class TaskQueue:
         self.redis.sadd(done_key, chunk_id)
         logger.info(f"Completed chunk {chunk_id} (worker {worker_id})")
 
+    def unclaim_task(self, region: str, chunk_id: str, worker_id: str, reason: str = ""):
+        """
+        Return a task to todo WITHOUT incrementing the fail counter.
+
+        Use when the failure is self-inflicted (e.g. this worker's IP got
+        403-blocked by Google) so a fresh worker on a different IP isn't
+        punished for the previous worker's misfortune. The chunk is pushed
+        to the FRONT of the todo list so it's retried promptly.
+        """
+        active_key = self._active_key(region)
+        todo_key = self._todo_key(region)
+
+        self.redis.hdel(active_key, chunk_id)
+        # lpush so the chunk is picked up quickly by the next worker
+        self.redis.lpush(todo_key, chunk_id)
+        logger.warning(
+            f"Unclaimed chunk {chunk_id} (worker {worker_id}) — {reason} — "
+            "returned to todo without fail-count bump"
+        )
+
     def fail_task(
         self, region: str, chunk_id: str, worker_id: str, error: str,
         max_retries: int = 3,
@@ -376,6 +396,60 @@ class TaskQueue:
             'city_total': int(parts[3]),
             'chunk_num': int(parts[4]),
         }
+
+    # ── Redo city ─────────────────────────────────────────────────────────
+
+    def redo_city(self, region: str, city_name: Optional[str] = None) -> List[str]:
+        """
+        Reset done/failed chunks for a city back to todo so they can be reprocessed.
+
+        For single-city jobs (no city_name given or no cmap): resets ALL done/failed chunks.
+        For batch jobs: only resets chunks belonging to the specified city_name (matched via cmap).
+
+        Returns list of chunk IDs moved back to todo.
+        """
+        done_key = self._done_key(region)
+        failed_key = self._failed_key(region)
+        todo_key = self._todo_key(region)
+        fcnt_key = self._fcnt_key(region)
+
+        done_set = set(self.redis.smembers(done_key) or [])
+        failed_set = set(self.redis.smembers(failed_key) or [])
+        candidates = done_set | failed_set
+
+        if not candidates:
+            logger.info(f"redo_city: nothing to redo for {region}")
+            return []
+
+        # Filter by city_name if this is a batch job
+        if city_name:
+            cmap = self.redis.hgetall(self._cmap_key(region)) or {}
+            if cmap:
+                # cmap values: "csv_prefix|features_prefix|city_name|city_total|chunk_num"
+                city_chunks = set()
+                for chunk_id, val in cmap.items():
+                    parts = val.split('|')
+                    if len(parts) >= 3 and parts[2] == city_name:
+                        city_chunks.add(chunk_id)
+                candidates = candidates & city_chunks
+                if not candidates:
+                    logger.info(f"redo_city: no done/failed chunks found for city '{city_name}' in {region}")
+                    return []
+
+        # Move from done/failed → todo, clear fail counts
+        reset = sorted(candidates)
+        for chunk_id in reset:
+            self.redis.srem(done_key, chunk_id)
+            self.redis.srem(failed_key, chunk_id)
+            self.redis.hdel(fcnt_key, chunk_id)
+
+        self.redis.rpush(todo_key, *reset)
+
+        logger.info(
+            f"redo_city: reset {len(reset)} chunks back to todo for "
+            f"{region}{f' (city={city_name})' if city_name else ''}"
+        )
+        return reset
 
     # ── Cleanup ───────────────────────────────────────────────────────────
 

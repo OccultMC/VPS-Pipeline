@@ -140,6 +140,13 @@ from redis_queue import TaskQueue
 
 _SENTINEL = None
 
+
+class IPBlockedError(RuntimeError):
+    """Raised when the probe detects Google has 403-blocked this instance's
+    source IP. The chunk should be unclaimed (not fail_task'd) and the worker
+    should self-destruct so a new instance can try from a fresh IP."""
+
+
 class ViewItem:
     __slots__ = ('panoid', 'view_data', 'lat', 'lng')
     def __init__(self, panoid: str, view_data, lat: float, lng: float):
@@ -750,9 +757,26 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
                               f"ct={r.headers.get('Content-Type','')} "
                               f"cl={r.headers.get('Content-Length','')}",
                               flush=True)
+                        stats['probe_status'] = r.status
+                        if r.status == 403:
+                            # Google sorry.google.com page = IP is blocked.
+                            # Flag so the outer loop can unclaim + self-destruct
+                            # instead of burning API calls and poisoning the queue.
+                            stats['ip_blocked_403'] = True
+                            print(f"[DL][PROBE] IP appears 403-blocked by Google. "
+                                  f"Will unclaim chunk + self-destruct.", flush=True)
                 except Exception as e:
                     print(f"[DL][PROBE] GET {probe_url} FAILED: "
                           f"{type(e).__name__}: {e}", flush=True)
+                    stats['probe_status'] = -1
+
+            # Short-circuit the whole gather if probe says IP is 403-blocked —
+            # no point firing 1000 requests that are all going to return the
+            # sorry.google.com page.
+            if stats.get('ip_blocked_403'):
+                print("[DL] Skipping pano dispatch — probe detected 403 block.",
+                      flush=True)
+                return
 
             with ThreadPoolExecutor(max_workers=config['workers']) as executor:
                 CHUNK = 5000
@@ -1190,6 +1214,11 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
     if final_count == 0 and total_records > 0:
         print(f"[ERROR] Chunk {chunk_id}: 0 features from {total_records} panos!")
         _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+        if stats.get('ip_blocked_403'):
+            raise IPBlockedError(
+                f"Chunk {chunk_id}: IP 403-blocked by Google (probe returned "
+                "sorry.google.com). Unclaim + self-destruct."
+            )
         raise RuntimeError(f"Zero features extracted from chunk {chunk_id}")
 
     if final_count > 0 and final_count < total_views_est:
@@ -1699,6 +1728,49 @@ def main():
                 except Exception:
                     pass
                 # Loop immediately → start next chunk while upload runs
+
+        except IPBlockedError as e:
+            # Google has 403-blocked this instance's IP. Do NOT fail_task
+            # (that would poison the fcnt for a chunk that's still perfectly
+            # good). Unclaim the chunk + also any prefetched chunk, then
+            # self-destruct so the fleet orchestrator can relaunch on a new IP.
+            print(f"[IP-BLOCK] {e}", flush=True)
+            try:
+                tq.unclaim_task(REGION, _redis_cid, INSTANCE_ID,
+                                reason="ip_blocked_403")
+            except Exception as re:
+                print(f"[WARN] Failed to unclaim {_redis_cid}: {re}")
+            _cleanup_chunk_files(work_dir, chunk_id)
+
+            # Also unclaim the prefetched chunk if one is pending — same IP,
+            # same problem.
+            pf_thread.join()
+            pf_result_val = pf_result[0]
+            if pf_result_val is not None:
+                try:
+                    pf_next_id = pf_result_val[0]
+                    tq.unclaim_task(REGION, pf_next_id, INSTANCE_ID,
+                                    reason="ip_blocked_403_prefetch")
+                    # Delete the prefetched CSV since we're bailing
+                    try:
+                        os.remove(pf_result_val[1])
+                    except OSError:
+                        pass
+                except Exception as re:
+                    print(f"[WARN] Failed to unclaim prefetched chunk: {re}")
+
+            # Drain any pending background upload before dying so we don't
+            # lose a legitimately-completed earlier chunk.
+            if pending_upload is not None:
+                try:
+                    pending_upload[0].join(timeout=300)
+                except Exception:
+                    pass
+
+            print("[IP-BLOCK] Self-destructing to release this IP.", flush=True)
+            upload_logs_to_r2()
+            self_destruct()
+            return
 
         except Exception as e:
             chunks_failed += 1
