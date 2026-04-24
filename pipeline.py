@@ -41,7 +41,11 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 HARDCODED_CONFIG = {
     'zoom_level': 2,
-    'max_threads': 150,
+    # Lowered from 150 → 30 to stay under Google's per-IP 403 threshold.
+    # Local scraper sustains 60 panos/sec @ max_threads=20 without ever
+    # triggering the block; 30 is a modest bump with GPU pipelining.
+    # Tunable via MAX_THREADS env var.
+    'max_threads': int(os.environ.get('MAX_THREADS', '30')),
     'workers': 8,
     'create_directional_views': True,
     'keep_panorama': False,
@@ -55,6 +59,32 @@ HARDCODED_CONFIG = {
     'output_dir': None,
     'batch_size': 32,
     'queue_size': 512,
+    # Small random jitter (seconds) applied before each pano dispatch —
+    # de-synchronises the 30 concurrent workers so we don't send exact
+    # bursts every time the semaphore refills.
+    'pano_jitter_max': float(os.environ.get('PANO_JITTER_MAX', '0.3')),
+}
+
+
+# Realistic Chrome headers — sent on every cbk*.google.com request. Google's
+# abuse gate is primarily IP-based but a distinctive UA (aiohttp default) is
+# one of the signals that feeds the "unusual traffic" heuristic. Matching a
+# real browser costs nothing and marginally extends per-IP runway.
+_BROWSER_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Referer': 'https://www.google.com/maps/',
+    'Sec-Fetch-Dest': 'image',
+    'Sec-Fetch-Mode': 'no-cors',
+    'Sec-Fetch-Site': 'same-site',
+    'Sec-Ch-Ua': '"Chromium";v="131", "Not_A Brand";v="24"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -650,8 +680,18 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
     heading_deg = record.get('heading_deg')
     zoom_level = config['zoom_level']
 
+    # Jitter each pano's start so the sem doesn't release in uniform bursts.
+    jitter_max = config.get('pano_jitter_max', 0.0)
+    if jitter_max > 0:
+        import random
+        await asyncio.sleep(random.uniform(0, jitter_max))
+
     retries = 3
     for attempt in range(1, retries + 1):
+        # Short-circuit if the probe already flagged this IP as blocked —
+        # no point wasting requests while the downloader is winding down.
+        if stats.get('ip_blocked_403'):
+            return
         try:
             async with sem:
                 tiles_x, tiles_y = TILES_AXIS_COUNT[zoom_level]
@@ -744,7 +784,34 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
     connector = aiohttp.TCPConnector(limit=600, limit_per_host=200, ttl_dns_cache=300)
 
     try:
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # Browser-like headers + shared cookie jar for the whole session.
+        # The cookie jar picks up NID/CONSENT from the warmup visit below so
+        # every tile request carries the same cookie set a real browser would.
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=_BROWSER_HEADERS,
+            cookie_jar=aiohttp.CookieJar(),
+        ) as session:
+
+            # ── Warmup: grab NID/CONSENT from maps.google.com before tiling ──
+            # Real browsers always have these cookies by the time they touch
+            # cbk*. Going straight to cbk* with zero cookies is a small bot
+            # tell. Cost: 1 extra GET per chunk.
+            try:
+                async with session.get(
+                    'https://www.google.com/maps/',
+                    allow_redirects=True,
+                ) as wr:
+                    _ = await wr.read()
+                    cookie_names = sorted({c.key for c in session.cookie_jar})
+                    print(f"[DL][WARMUP] google.com/maps → status={wr.status} "
+                          f"cookies={cookie_names}", flush=True)
+            except Exception as e:
+                print(f"[DL][WARMUP] maps.google.com FAILED: "
+                      f"{type(e).__name__}: {e} — continuing without cookies",
+                      flush=True)
+
             # ── Connectivity probe: fetch 1 tile from the first real pano ──
             if records:
                 probe_pid = records[0].get('panoid', '')
@@ -778,9 +845,40 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
                       flush=True)
                 return
 
+            # ── Background periodic re-probe to detect mid-chunk blocks ──
+            # A chunk can start fine (probe=200) but hit the block partway
+            # through. Re-probe every 15s in the background so we catch the
+            # transition quickly and abandon the chunk cleanly instead of
+            # writing half a feature file.
+            async def _reprobe_loop():
+                while not stats.get('ip_blocked_403') and not stats.get('dl_done'):
+                    await asyncio.sleep(15)
+                    if stats.get('dl_done'):
+                        return
+                    try:
+                        async with session.get(probe_url) as rr:
+                            await rr.read()
+                            if rr.status == 403:
+                                stats['ip_blocked_403'] = True
+                                print(f"[DL][REPROBE] Mid-chunk 403 detected "
+                                      f"(dl_ok={stats['dl_ok']}, "
+                                      f"dl_fail={stats['dl_fail']}) — "
+                                      f"abandoning chunk.", flush=True)
+                                return
+                    except Exception as e:
+                        # Transient — don't flip the flag on a single failure
+                        print(f"[DL][REPROBE] transient error: "
+                              f"{type(e).__name__}: {e}", flush=True)
+
+            reprobe_task = asyncio.create_task(_reprobe_loop())
+
             with ThreadPoolExecutor(max_workers=config['workers']) as executor:
                 CHUNK = 5000
                 for i in range(0, len(records), CHUNK):
+                    if stats.get('ip_blocked_403'):
+                        print("[DL] Mid-chunk 403 — skipping remaining panos.",
+                              flush=True)
+                        break
                     chunk = records[i:i + CHUNK]
                     print(f"[DL] Dispatching {len(chunk)} pano tasks "
                           f"(offset={i}/{len(records)})", flush=True)
@@ -800,6 +898,12 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
                         print(f"[DL] Silent per-task exceptions: {exc_counts} "
                               f"(dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']})",
                               flush=True)
+
+            reprobe_task.cancel()
+            try:
+                await reprobe_task
+            except (asyncio.CancelledError, Exception):
+                pass
     finally:
         item_queue.put(_SENTINEL)
         stats['dl_done'] = True
@@ -1223,14 +1327,26 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
     del features_memmap
     gc.collect()
 
+    # ── If IP got 403-blocked at any point, this chunk is unfinished. ──
+    # DISCARD any partial features — uploading a truncated NPY with
+    # dl_fail > dl_ok would mark the chunk done in Redis and leave those
+    # panos unprocessed forever. Raise IPBlockedError so the main loop
+    # unclaims the chunk (no fcnt bump) and self-destructs.
+    if stats.get('ip_blocked_403'):
+        print(f"[ERROR] Chunk {chunk_id}: IP 403-blocked mid-chunk "
+              f"(dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']}, "
+              f"partial_features={final_count}). Discarding partial output.",
+              flush=True)
+        _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+        raise IPBlockedError(
+            f"Chunk {chunk_id}: IP 403-blocked by Google (probe returned "
+            "sorry.google.com). Partial output discarded — unclaim + "
+            "self-destruct."
+        )
+
     if final_count == 0 and total_records > 0:
         print(f"[ERROR] Chunk {chunk_id}: 0 features from {total_records} panos!")
         _cleanup_chunk_files(work_dir, chunk_id, local_csv)
-        if stats.get('ip_blocked_403'):
-            raise IPBlockedError(
-                f"Chunk {chunk_id}: IP 403-blocked by Google (probe returned "
-                "sorry.google.com). Unclaim + self-destruct."
-            )
         raise RuntimeError(f"Zero features extracted from chunk {chunk_id}")
 
     if final_count > 0 and final_count < total_views_est:
