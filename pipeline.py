@@ -309,30 +309,23 @@ class GpuExtractor:
 
     @staticmethod
     def _load_model():
-        """Load MegaLoc model using the same get_trained_model path as inference.
+        """Load MegaLoc model.
 
-        Primary: torch.hub → get_trained_model (HuggingFace weights, strict=True)
-        Fallback: baked model.safetensors if hub download fails (strict=True)
+        Primary: baked safetensors at /app/models/megaloc/model.safetensors.
+          Baked weights are deterministic, fast, and never depend on network.
+        Fallback: torch.hub get_trained_model (HuggingFace) only when the
+          baked file is missing — CI/dev environments that don't bake it in.
+
+        Rationale for baked-first: torch.hub.load() stalls indefinitely on
+        network blips, exhausting GPU_INIT_TIMEOUT (300s) before the fallback
+        path runs. That kills the whole init and leaves CUDA in a bad state,
+        producing SIGSEGV-139 exits at container teardown. The baked model
+        works in <2s with zero network dependency, so we use it first when
+        available.
         """
         errors = []
 
-        # ── Primary: torch.hub get_trained_model (same as Flask server) ──
-        for attempt in range(1, 4):
-            try:
-                print(f"[INIT]   torch.hub get_trained_model attempt {attempt}/3...", flush=True)
-                model = torch.hub.load(
-                    "gmberton/MegaLoc", "get_trained_model", trust_repo=True
-                )
-                print("[INIT]   Model loaded via torch.hub (matches inference server)", flush=True)
-                return model
-            except Exception as e:
-                print(f"[INIT]   torch.hub attempt {attempt} failed: {type(e).__name__}: {e}", flush=True)
-                errors.append(f"torch.hub#{attempt}: {e}")
-                if attempt < 3:
-                    time.sleep(2 ** attempt)
-
-        # ── Fallback: baked model (strict=True to catch key mismatches) ──
-        print("[WARN] torch.hub failed, trying baked model fallback...", flush=True)
+        # ── Primary: baked model ──
         model_path = Path('/app/models/megaloc/model.safetensors')
         if model_path.exists():
             try:
@@ -358,15 +351,31 @@ class GpuExtractor:
                     sys.path.pop(0)
             except Exception as e:
                 errors.append(f"baked model: {e}")
-                print(f"[WARN] Baked model fallback failed: {e}", flush=True)
+                print(f"[WARN] Baked model load failed: {e} — will try torch.hub", flush=True)
         else:
             errors.append("baked model.safetensors not found")
+            print("[WARN] No baked model — falling through to torch.hub", flush=True)
+
+        # ── Fallback: torch.hub get_trained_model (needs network) ──
+        for attempt in range(1, 4):
+            try:
+                print(f"[INIT]   torch.hub get_trained_model attempt {attempt}/3...", flush=True)
+                model = torch.hub.load(
+                    "gmberton/MegaLoc", "get_trained_model", trust_repo=True
+                )
+                print("[INIT]   Model loaded via torch.hub", flush=True)
+                return model
+            except Exception as e:
+                print(f"[INIT]   torch.hub attempt {attempt} failed: {type(e).__name__}: {e}", flush=True)
+                errors.append(f"torch.hub#{attempt}: {e}")
+                if attempt < 3:
+                    time.sleep(2 ** attempt)
 
         raise RuntimeError(
             f"All model sources failed:\n"
             + "\n".join(f"  - {err}" for err in errors)
-            + "\n\nEnsure the worker has network access to github.com + huggingface.co, "
-            + "or bake a compatible model.safetensors into the Docker image."
+            + "\n\nEnsure the Docker image bakes model.safetensors, or the "
+            + "worker has network access to github.com + huggingface.co."
         )
 
     def _init_gpu(self, t0: float):
