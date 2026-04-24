@@ -930,20 +930,32 @@ def self_destruct():
         while True:
             time.sleep(3600)
 
-    cmd = ["vastai", "--api-key", VAST_API_KEY, "destroy", "instance", str(instance_id)]
+    # Use the plural form `destroy instances <id>` — singular prompts for
+    # interactive [y/N] confirmation, reports exit=0 on empty stdin but leaves
+    # the instance alive. Plural form takes a list and does not prompt.
+    # Also pipe an empty stdin defensively and auto-confirm via `yes`-style
+    # input in case the plural form ever starts prompting too.
+    cmd = ["vastai", "--api-key", VAST_API_KEY, "destroy", "instances", str(instance_id)]
     attempt = 0
     while True:
         attempt += 1
         try:
             print(f"[INFO] Self-destruct attempt {attempt} for instance {instance_id}...")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+                input="y\n",
+            )
             stdout = result.stdout.strip()
             stderr = result.stderr.strip()
             print(f"[INFO] Self-destruct response: exit={result.returncode} stdout='{stdout}' stderr='{stderr}'")
-            if result.returncode == 0:
+
+            # Only treat as successful if stdout matches the expected
+            # "destroying instance N." pattern — exit=0 can be lying when the
+            # CLI aborts a prompt.
+            if result.returncode == 0 and f"destroying instance {instance_id}" in stdout.lower():
                 print(f"[INFO] Instance {instance_id} destroyed successfully.")
                 return
-            print(f"[WARN] Self-destruct attempt {attempt} failed (exit {result.returncode}) — retrying in 30s")
+            print(f"[WARN] Self-destruct attempt {attempt} did not confirm destruction — retrying in 30s")
         except Exception as e:
             print(f"[WARN] Self-destruct attempt {attempt} exception: {e} — retrying in 30s")
         time.sleep(30)
