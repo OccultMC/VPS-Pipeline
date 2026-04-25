@@ -40,6 +40,46 @@ SEAM_LABELS = ["back->left", "left->front", "front->right"]
 RESIZE_W = 256  # downscale faces to this width for matching (keeps it fast)
 
 
+def angular_overlap_from_metadata(pano, left_idx: int, right_idx: int) -> float:
+    """
+    Return the angular overlap (radians) between two adjacent faces, using
+    the camera_metadata yaw + lens_projection.fov_s. The overlap is
+    (left_yaw + fov_left/2) - (right_yaw - fov_right/2), modulo 2π.
+    """
+    import math
+    cm_l = pano.camera_metadata[left_idx]
+    cm_r = pano.camera_metadata[right_idx]
+    yaw_l = cm_l.position.yaw
+    yaw_r = cm_r.position.yaw
+    fov_l = cm_l.lens_projection.fov_s
+    fov_r = cm_r.lens_projection.fov_s
+    left_edge = yaw_l + fov_l / 2.0       # right edge of LEFT face (in yaw)
+    right_edge = yaw_r - fov_r / 2.0      # left edge of RIGHT face (in yaw)
+    delta = left_edge - right_edge
+    # normalize to [-π, π]
+    while delta > math.pi:
+        delta -= 2 * math.pi
+    while delta < -math.pi:
+        delta += 2 * math.pi
+    return delta
+
+
+def overlap_px_from_geometry(pano, left_idx: int, right_idx: int,
+                             left_img: Image.Image) -> Tuple[int, float]:
+    """
+    Compute the seam overlap in *pixels of the LEFT face*, using the lens
+    metadata. Returns (px, pct_of_left_width).
+    """
+    cm_l = pano.camera_metadata[left_idx]
+    fov_l = cm_l.lens_projection.fov_s
+    overlap_rad = angular_overlap_from_metadata(pano, left_idx, right_idx)
+    if overlap_rad <= 0:
+        return (0, 0.0)
+    px = round(overlap_rad / fov_l * left_img.width)
+    pct = overlap_rad / fov_l * 100.0
+    return (px, pct)
+
+
 def find_optimal_overlap(left_img: Image.Image, right_img: Image.Image,
                          max_pct: float = 30.0) -> Tuple[int, int, float, float]:
     """
@@ -143,50 +183,67 @@ def main():
 
         imgs = [Image.open(p) for p in face_paths]
         widths = [im.width for im in imgs]
-        seams = []
+
+        # GEOMETRIC overlap (truth, from lens metadata)
+        face_indices = [0, 1, 2, 3]  # back, left, front, right
+        geom = []
+        for i in range(3):
+            px, pct = overlap_px_from_geometry(
+                pano, face_indices[i], face_indices[i + 1], imgs[i]
+            )
+            geom.append((px, pct))
+
+        # MATCHED overlap (pixel MSE — kept for reference)
+        match = []
         for i in range(3):
             d_px, d_resized, pct, err = find_optimal_overlap(
                 imgs[i], imgs[i + 1], max_pct=args.max_pct
             )
-            seams.append((d_px, pct, err))
+            match.append((d_px, pct, err))
 
-        rows.append((z, widths, seams))
-        s_str = "  ".join(
-            f"{lbl}={d}px({pct:.2f}%)"
-            for lbl, (d, pct, _) in zip(["b->l", "l->f", "f->r"], seams)
+        rows.append((z, widths, geom, match))
+        g_str = "  ".join(
+            f"{lbl}={px}px({pct:.2f}%)"
+            for lbl, (px, pct) in zip(["b->l", "l->f", "f->r"], geom)
         )
-        print(f"zoom {z}: w={widths}  {s_str}")
+        m_str = "  ".join(
+            f"{lbl}={px}px({pct:.2f}%)"
+            for lbl, (px, pct, _) in zip(["b->l", "l->f", "f->r"], match)
+        )
+        print(f"zoom {z}: w={widths}")
+        print(f"   geom : {g_str}")
+        print(f"   match: {m_str}")
 
-        # Write a stitched.jpg using the matched per-seam overlaps
-        seam_px = [s[0] for s in seams]
+        # Stitch using GEOMETRIC overlaps
+        seam_px = [g[0] for g in geom]
         stitched_path = os.path.join(z_dir, "stitched.jpg")
         try:
             stitch_with_per_seam_overlaps(imgs, seam_px, stitched_path)
             sw, sh = Image.open(stitched_path).size
-            print(f"         stitched -> {stitched_path}  ({sw}x{sh})")
+            print(f"   stitched -> {stitched_path}  ({sw}x{sh})")
         except Exception as e:
-            print(f"         stitch failed: {e}")
+            print(f"   stitch failed: {e}")
 
     print()
-    print("=" * 90)
-    print(f"{'zoom':<5} {'face widths (b/l/f/r)':<24} "
-          f"{'b->l %':<8} {'l->f %':<8} {'f->r %':<8} {'avg %':<8} "
-          f"{'avg px (vs back)':<18}")
-    print("-" * 90)
-    pcts_per_zoom = []
-    for z, ws, sr in rows:
-        avg_pct = sum(s[1] for s in sr) / 3
-        avg_px = round(ws[0] * avg_pct / 100)
-        pcts_per_zoom.append(avg_pct)
+    print("=" * 100)
+    print("GEOMETRIC overlaps (from pano.camera_metadata yaw + fov_s)")
+    print(f"{'zoom':<5} {'widths (b/l/f/r)':<24} "
+          f"{'b->l':<14} {'l->f':<14} {'f->r':<14}")
+    print("-" * 100)
+    for z, ws, geom, _ in rows:
         wstr = "/".join(map(str, ws))
-        print(f"{z:<5} {wstr:<24} "
-              f"{sr[0][1]:<8.2f} {sr[1][1]:<8.2f} {sr[2][1]:<8.2f} "
-              f"{avg_pct:<8.2f} {avg_px:<18}")
-    print("-" * 90)
-    if pcts_per_zoom:
-        overall = sum(pcts_per_zoom) / len(pcts_per_zoom)
-        print(f"\nMean optimal overlap across all zoom levels: {overall:.2f}%")
-        print(f"(this is what the stitcher should default to)")
+        cells = [f"{px}px ({pct:.2f}%)" for (px, pct) in geom]
+        print(f"{z:<5} {wstr:<24} {cells[0]:<14} {cells[1]:<14} {cells[2]:<14}")
+    print("-" * 100)
+    print()
+    print("MATCHED overlaps (pixel MSE — naive, kept for comparison)")
+    print(f"{'zoom':<5} {'widths (b/l/f/r)':<24} "
+          f"{'b->l':<14} {'l->f':<14} {'f->r':<14}")
+    print("-" * 100)
+    for z, ws, _, match in rows:
+        wstr = "/".join(map(str, ws))
+        cells = [f"{px}px ({pct:.2f}%)" for (px, pct, _) in match]
+        print(f"{z:<5} {wstr:<24} {cells[0]:<14} {cells[1]:<14} {cells[2]:<14}")
 
 
 if __name__ == "__main__":
