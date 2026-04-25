@@ -63,3 +63,24 @@ def test_pick_pano_falls_back_to_first_when_none_inside():
 
 def test_pick_pano_returns_none_for_empty_list():
     assert _pick_pano([], [[-122, 37], [-121, 37], [-121, 38]]) is None
+
+
+import os
+from PIL import Image
+from apple_scraper import _decode_heic_to_jpg
+
+FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "sample_face.heic")
+
+
+def test_decode_heic_to_jpg_writes_valid_image(tmp_path):
+    with open(FIXTURE, "rb") as f:
+        heic = f.read()
+    out = tmp_path / "front.jpg"
+    _decode_heic_to_jpg(heic, str(out))
+    assert out.exists()
+    assert out.stat().st_size > 1000
+    img = Image.open(out)
+    img.verify()
+    img2 = Image.open(out)
+    assert img2.format == "JPEG"
+    assert img2.width > 100 and img2.height > 100

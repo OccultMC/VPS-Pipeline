@@ -25,7 +25,20 @@ def _polygon_to_tiles(polygon: List[List[float]]) -> List[Tuple[int, int]]:
     return tiles
 
 
+import io
+
+import pillow_heif
+from PIL import Image
 from shapely.geometry import Point, Polygon as ShapelyPolygon
+
+pillow_heif.register_heif_opener()
+
+
+def _decode_heic_to_jpg(heic_bytes: bytes, out_path: str, quality: int = 92) -> None:
+    """Decode HEIC bytes to a JPEG file at `out_path`. Overwrites if exists."""
+    img = Image.open(io.BytesIO(heic_bytes))
+    img = img.convert("RGB")
+    img.save(out_path, format="JPEG", quality=quality)
 
 
 def _pick_pano(panos, polygon: List[List[float]]):
