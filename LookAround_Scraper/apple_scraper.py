@@ -96,7 +96,7 @@ def _write_meta_csv(pano, face_paths: List[str], csv_path: str) -> None:
             })
 
 
-def stitch_faces(pano_dir: str, overlap_px: int = 10, out_name: str = "stitched.jpg") -> str:
+def stitch_faces(pano_dir: str, overlap_px: int = 30, out_name: str = "stitched.jpg") -> str:
     """
     Stitch back/left/front/right JPGs in `pano_dir` left-to-right with
     `overlap_px` of horizontal overlap between adjacent faces. Writes

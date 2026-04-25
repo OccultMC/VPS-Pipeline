@@ -167,7 +167,7 @@ def on_scrape_polygon(data):
 def on_stitch_pano(data):
     sid = data.get("session_id") or request.sid
     pano_id = data.get("pano_id") or ""
-    overlap_px = int(data.get("overlap_px", 10))
+    overlap_px = int(data.get("overlap_px", 30))
 
     if not pano_id:
         emit("stitch_error", {"message": "missing pano_id"}, room=sid)
