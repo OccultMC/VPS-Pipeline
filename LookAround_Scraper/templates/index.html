@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LookAround Debug Scraper</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#111; --panel:#1c1c1c; --fg:#eee; --muted:#888; --accent:#4ea1ff; --err:#ff5c5c; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family:system-ui,sans-serif; font-size:13px; }
+  #app { display:grid; grid-template-columns: 320px 1fr; height:100vh; }
+  #sidebar { padding:16px; overflow:auto; border-right:1px solid #222; background:var(--panel); }
+  #map { height:100%; }
+  h1 { font-size:14px; margin:0 0 12px; letter-spacing:0.04em; text-transform:uppercase; color:var(--muted); }
+  label { display:block; font-size:11px; color:var(--muted); margin:12px 0 4px; text-transform:uppercase; letter-spacing:0.05em; }
+  input[type=file], input[type=number], select { width:100%; background:#000; color:var(--fg); border:1px solid #333; padding:6px 8px; font-size:12px; }
+  .progress { margin-top:16px; padding:8px; background:#000; border:1px solid #333; min-height:32px; font-family:ui-monospace,monospace; font-size:11px; white-space:pre-wrap; }
+  .gallery { margin-top:12px; display:grid; grid-template-columns: repeat(2, 1fr); gap:6px; }
+  .gallery .face { background:#000; border:1px solid #333; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:10px; overflow:hidden; }
+  .gallery .face img { width:100%; height:100%; object-fit:cover; }
+  .meta { margin-top:12px; font-family:ui-monospace,monospace; font-size:11px; color:var(--muted); }
+  .meta b { color:var(--fg); }
+  a.csv-link { color:var(--accent); display:inline-block; margin-top:8px; }
+  .err { color:var(--err); }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <h1>LookAround Debug</h1>
+    <label>Shape file</label>
+    <input type="file" id="shape-file" accept=".geojson,.json,.shp,.dbf,.shx,.prj,.zip,.kml,.gpkg" multiple>
+    <label>Zoom (0=full, 7=lowest)</label>
+    <input type="number" id="zoom" value="0" min="0" max="7">
+    <div class="progress" id="progress">click a polygon to scrape one panorama</div>
+    <div class="meta" id="meta"></div>
+    <div class="gallery" id="gallery">
+      <div class="face" data-name="back">back</div>
+      <div class="face" data-name="left">left</div>
+      <div class="face" data-name="front">front</div>
+      <div class="face" data-name="right">right</div>
+      <div class="face" data-name="top">top</div>
+      <div class="face" data-name="bottom">bottom</div>
+    </div>
+    <a class="csv-link" id="csv-link" href="#" style="display:none">download meta.csv</a>
+  </aside>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+  const sessionId = crypto.randomUUID();
+  const socket = io({ query: { session_id: sessionId } });
+  const map = L.map('map').setView([37.7749, -122.4194], 13);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
+    attribution: '&copy; OSM &copy; CARTO', maxZoom: 19
+  }).addTo(map);
+
+  const progressEl = document.getElementById('progress');
+  const metaEl = document.getElementById('meta');
+  const csvLink = document.getElementById('csv-link');
+  const galleryFaces = {};
+  document.querySelectorAll('#gallery .face').forEach(el => galleryFaces[el.dataset.name] = el);
+
+  let shapesLayer = null;
+
+  function setProgress(text, cls = '') {
+    progressEl.textContent = text;
+    progressEl.className = 'progress ' + cls;
+  }
+
+  function clearGallery() {
+    Object.entries(galleryFaces).forEach(([name, el]) => {
+      el.innerHTML = name;
+    });
+    metaEl.innerHTML = '';
+    csvLink.style.display = 'none';
+  }
+
+  function attachClickHandler(layer) {
+    layer.on('click', (e) => {
+      L.DomEvent.stopPropagation(e);
+      const geom = layer.feature && layer.feature.geometry;
+      if (!geom) return;
+      let ring;
+      if (geom.type === 'Polygon') {
+        ring = geom.coordinates[0];
+      } else if (geom.type === 'MultiPolygon') {
+        ring = geom.coordinates[0][0];
+      } else {
+        setProgress('unsupported geometry: ' + geom.type, 'err');
+        return;
+      }
+      clearGallery();
+      setProgress('submitting polygon (' + ring.length + ' vertices)...');
+      socket.emit('scrape_polygon', {
+        session_id: sessionId,
+        coords: ring,
+        zoom: parseInt(document.getElementById('zoom').value, 10) || 0,
+      });
+    });
+  }
+
+  document.getElementById('shape-file').addEventListener('change', async (e) => {
+    const files = e.target.files;
+    if (!files.length) return;
+    const fd = new FormData();
+    for (const f of files) fd.append('file', f);
+    fd.append('session_id', sessionId);
+    setProgress('uploading shape...');
+    const res = await fetch('/api/load-shapes', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (data.error) { setProgress('shape load error: ' + data.error, 'err'); return; }
+    if (shapesLayer) map.removeLayer(shapesLayer);
+    shapesLayer = L.geoJSON(data.geojson, {
+      style: { color: '#4ea1ff', weight: 1, fillOpacity: 0.15 },
+      onEachFeature: (feature, layer) => attachClickHandler(layer),
+    }).addTo(map);
+    map.fitBounds(shapesLayer.getBounds());
+    setProgress('loaded ' + data.filename + ' — click a polygon');
+  });
+
+  socket.on('progress', (p) => {
+    if (p.step === 'finding-tile') setProgress('finding coverage tile...');
+    else if (p.step === 'pano-selected') setProgress('pano ' + p.pano_id + ' @ ' + p.lat.toFixed(5) + ',' + p.lon.toFixed(5));
+    else if (p.step === 'face') setProgress('face ' + p.i + '/' + p.total + ' (' + p.name + ')...');
+  });
+
+  socket.on('scrape_done', (r) => {
+    setProgress('done — pano ' + r.pano_id);
+    metaEl.innerHTML = '<b>pano:</b> ' + r.pano_id + '<br><b>lat,lon:</b> ' + r.lat.toFixed(6) + ', ' + r.lon.toFixed(6) +
+      '<br><b>captured:</b> ' + r.capture_date + '<br><b>heading:</b> ' + r.heading.toFixed(3);
+    const names = ['back','left','front','right','top','bottom'];
+    r.face_urls.forEach((url, i) => {
+      const el = galleryFaces[names[i]];
+      el.innerHTML = '';
+      const img = document.createElement('img');
+      img.src = url; img.alt = names[i];
+      el.appendChild(img);
+    });
+    csvLink.href = r.csv_url;
+    csvLink.style.display = 'inline-block';
+  });
+
+  socket.on('scrape_error', (e) => setProgress('error: ' + e.message, 'err'));
+</script>
+</body>
+</html>
