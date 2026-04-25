@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from flask import (
-    Flask, jsonify, render_template, request, send_from_directory, url_for,
+    Flask, jsonify, render_template, request, send_from_directory,
 )
 from flask_socketio import SocketIO, emit, join_room
 
@@ -142,12 +142,11 @@ def on_scrape_polygon(data):
                 coords, zoom=zoom, out_root=str(DOWNLOADS_DIR),
                 progress_cb=progress_cb,
             )
-            with app.app_context():
-                face_urls = [
-                    url_for("serve_download", pano_id=result.pano_id, filename=os.path.basename(p))
-                    for p in result.face_paths
-                ]
-                csv_url = url_for("serve_download", pano_id=result.pano_id, filename="meta.csv")
+            face_urls = [
+                f"/downloads/{result.pano_id}/{os.path.basename(p)}"
+                for p in result.face_paths
+            ]
+            csv_url = f"/downloads/{result.pano_id}/meta.csv"
             socketio.emit("scrape_done", {
                 "pano_id": result.pano_id,
                 "lat": result.lat,

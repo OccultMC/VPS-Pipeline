@@ -1,0 +1,19 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "SF Downtown (dense Look Around coverage)"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-122.4200, 37.7745],
+          [-122.4188, 37.7745],
+          [-122.4188, 37.7755],
+          [-122.4200, 37.7755],
+          [-122.4200, 37.7745]
+        ]]
+      }
+    }
+  ]
+}
