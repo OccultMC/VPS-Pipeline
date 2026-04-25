@@ -84,3 +84,45 @@ def test_decode_heic_to_jpg_writes_valid_image(tmp_path):
     img2 = Image.open(out)
     assert img2.format == "JPEG"
     assert img2.width > 100 and img2.height > 100
+
+
+import csv
+from datetime import datetime, timezone
+from apple_scraper import _write_meta_csv, FACE_NAMES
+
+
+def _full_pano():
+    return SimpleNamespace(
+        id=12345,
+        build_id=678,
+        lat=37.7749,
+        lon=-122.4194,
+        date=datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
+        heading=1.5,
+        pitch=0.05,
+        roll=0.0,
+        coverage_type=SimpleNamespace(name="CAR"),
+    )
+
+
+def test_write_meta_csv_emits_six_rows_with_schema(tmp_path):
+    pano = _full_pano()
+    face_paths = [str(tmp_path / f"{name}.jpg") for name in FACE_NAMES]
+    csv_path = tmp_path / "meta.csv"
+    _write_meta_csv(pano, face_paths, str(csv_path))
+
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 6
+    expected_cols = {
+        "pano_id", "build_id", "lat", "lon", "capture_date",
+        "heading", "pitch", "roll", "coverage_type",
+        "face_index", "face_name", "image_path",
+    }
+    assert set(rows[0].keys()) == expected_cols
+    assert rows[0]["pano_id"] == "12345"
+    assert rows[0]["coverage_type"] == "CAR"
+    assert rows[0]["face_index"] == "0"
+    assert rows[0]["face_name"] == "back"
+    assert rows[5]["face_name"] == "bottom"
+    assert rows[2]["image_path"].endswith("front.jpg")

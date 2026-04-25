@@ -50,3 +50,38 @@ def _pick_pano(panos, polygon: List[List[float]]):
         if poly.contains(Point(pano.lon, pano.lat)):
             return pano
     return panos[0]
+
+
+import csv
+
+# Index → human name. Order matches streetlevel.lookaround.Face enum.
+FACE_NAMES = ["back", "left", "front", "right", "top", "bottom"]
+
+
+def _write_meta_csv(pano, face_paths: List[str], csv_path: str) -> None:
+    """Write one row per face. `face_paths` is 6 entries in FACE_NAMES order."""
+    cols = [
+        "pano_id", "build_id", "lat", "lon", "capture_date",
+        "heading", "pitch", "roll", "coverage_type",
+        "face_index", "face_name", "image_path",
+    ]
+    capture_date = pano.date.isoformat() if pano.date else ""
+    coverage_type = pano.coverage_type.name if pano.coverage_type else ""
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for i, path in enumerate(face_paths):
+            w.writerow({
+                "pano_id": pano.id,
+                "build_id": pano.build_id,
+                "lat": pano.lat,
+                "lon": pano.lon,
+                "capture_date": capture_date,
+                "heading": getattr(pano, "heading", ""),
+                "pitch": getattr(pano, "pitch", ""),
+                "roll": getattr(pano, "roll", ""),
+                "coverage_type": coverage_type,
+                "face_index": i,
+                "face_name": FACE_NAMES[i],
+                "image_path": path,
+            })
