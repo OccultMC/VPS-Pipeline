@@ -24,7 +24,7 @@ from flask import (
 )
 from flask_socketio import SocketIO, emit, join_room
 
-from apple_scraper import scrape_polygon
+from apple_scraper import scrape_polygon, stitch_faces
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -159,6 +159,36 @@ def on_scrape_polygon(data):
         except Exception as e:
             logger.exception("scrape failed")
             socketio.emit("scrape_error", {"message": str(e)}, room=sid)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@socketio.on("stitch_pano")
+def on_stitch_pano(data):
+    sid = data.get("session_id") or request.sid
+    pano_id = data.get("pano_id") or ""
+    overlap_px = int(data.get("overlap_px", 10))
+
+    if not pano_id:
+        emit("stitch_error", {"message": "missing pano_id"}, room=sid)
+        return
+
+    pano_dir = DOWNLOADS_DIR / pano_id
+    if not pano_dir.is_dir():
+        emit("stitch_error", {"message": f"pano dir not found: {pano_id}"}, room=sid)
+        return
+
+    def _run():
+        try:
+            out_path = stitch_faces(str(pano_dir), overlap_px=overlap_px)
+            stitched_url = f"/downloads/{pano_id}/{os.path.basename(out_path)}"
+            socketio.emit("stitch_done", {
+                "pano_id": pano_id,
+                "stitched_url": stitched_url,
+            }, room=sid)
+        except Exception as e:
+            logger.exception("stitch failed")
+            socketio.emit("stitch_error", {"message": str(e)}, room=sid)
 
     threading.Thread(target=_run, daemon=True).start()
 

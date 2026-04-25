@@ -39,8 +39,11 @@
       <div class="face" data-name="left">left</div>
       <div class="face" data-name="front">front</div>
       <div class="face" data-name="right">right</div>
-      <div class="face" data-name="top">top</div>
-      <div class="face" data-name="bottom">bottom</div>
+    </div>
+    <button id="stitch-btn" style="margin-top:12px; width:100%; padding:8px; background:#4ea1ff; color:#000; border:0; font-weight:600; cursor:pointer; display:none;">Stitch panorama</button>
+    <div id="stitched-wrap" style="margin-top:12px; display:none;">
+      <label style="margin-top:0">Stitched (back→left→front→right, 10px overlap)</label>
+      <a id="stitched-link" href="#" target="_blank"><img id="stitched-img" style="width:100%; border:1px solid #333;"></a>
     </div>
     <a class="csv-link" id="csv-link" href="#" style="display:none">download meta.csv</a>
   </aside>
@@ -76,7 +79,16 @@
     });
     metaEl.innerHTML = '';
     csvLink.style.display = 'none';
+    document.getElementById('stitch-btn').style.display = 'none';
+    document.getElementById('stitched-wrap').style.display = 'none';
   }
+
+  let currentPanoId = null;
+  document.getElementById('stitch-btn').addEventListener('click', () => {
+    if (!currentPanoId) return;
+    setProgress('stitching...');
+    socket.emit('stitch_pano', { session_id: sessionId, pano_id: currentPanoId, overlap_px: 10 });
+  });
 
   function attachClickHandler(layer) {
     layer.on('click', (e) => {
@@ -131,9 +143,10 @@
     setProgress('done — pano ' + r.pano_id);
     metaEl.innerHTML = '<b>pano:</b> ' + r.pano_id + '<br><b>lat,lon:</b> ' + r.lat.toFixed(6) + ', ' + r.lon.toFixed(6) +
       '<br><b>captured:</b> ' + r.capture_date + '<br><b>heading:</b> ' + r.heading.toFixed(3);
-    const names = ['back','left','front','right','top','bottom'];
+    const names = ['back','left','front','right'];
     r.face_urls.forEach((url, i) => {
       const el = galleryFaces[names[i]];
+      if (!el) return;
       el.innerHTML = '';
       const img = document.createElement('img');
       img.src = url; img.alt = names[i];
@@ -141,9 +154,22 @@
     });
     csvLink.href = r.csv_url;
     csvLink.style.display = 'inline-block';
+    currentPanoId = r.pano_id;
+    document.getElementById('stitch-btn').style.display = 'block';
   });
 
   socket.on('scrape_error', (e) => setProgress('error: ' + e.message, 'err'));
+
+  socket.on('stitch_done', (r) => {
+    setProgress('stitched — pano ' + r.pano_id);
+    const img = document.getElementById('stitched-img');
+    const link = document.getElementById('stitched-link');
+    img.src = r.stitched_url;
+    link.href = r.stitched_url;
+    document.getElementById('stitched-wrap').style.display = 'block';
+  });
+
+  socket.on('stitch_error', (e) => setProgress('stitch error: ' + e.message, 'err'));
 </script>
 </body>
 </html>

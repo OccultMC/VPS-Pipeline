@@ -133,7 +133,7 @@ from apple_scraper import scrape_polygon, ScrapeResult
 
 
 @pytest.mark.network
-def test_scrape_polygon_downloads_six_faces_and_csv(tmp_path):
+def test_scrape_polygon_downloads_four_faces_and_csv(tmp_path):
     # Downtown SF — known dense Look Around coverage
     polygon = [
         [-122.4200, 37.7745],
@@ -144,9 +144,49 @@ def test_scrape_polygon_downloads_six_faces_and_csv(tmp_path):
     result = scrape_polygon(polygon, zoom=6, out_root=str(tmp_path))
     assert isinstance(result, ScrapeResult)
     assert result.pano_id
-    assert len(result.face_paths) == 6
+    assert len(result.face_paths) == 4
     for p in result.face_paths:
         assert p.endswith(".jpg")
         assert os.path.getsize(p) > 1000
+    # top/bottom must NOT exist
+    pano_dir = os.path.dirname(result.face_paths[0])
+    assert not os.path.exists(os.path.join(pano_dir, "top.jpg"))
+    assert not os.path.exists(os.path.join(pano_dir, "bottom.jpg"))
     assert result.csv_path.endswith("meta.csv")
     assert os.path.exists(result.csv_path)
+
+
+from apple_scraper import stitch_faces
+
+
+def test_stitch_faces_overlaps_correctly(tmp_path):
+    # Mimic Apple's varying widths: back/front wider than left/right
+    widths = {"back": 100, "left": 60, "front": 100, "right": 60}
+    for name, w in widths.items():
+        img = Image.new("RGB", (w, 80), color=(0, 0, 0))
+        img.save(tmp_path / f"{name}.jpg", "JPEG")
+    out = stitch_faces(str(tmp_path), overlap_px=10)
+    assert os.path.exists(out)
+    out_img = Image.open(out)
+    # sum(widths) - 3*overlap = (100+60+100+60) - 30 = 290
+    assert out_img.width == 290
+    assert out_img.height == 80
+
+
+def test_stitch_faces_rejects_mismatched_heights(tmp_path):
+    Image.new("RGB", (100, 80)).save(tmp_path / "back.jpg", "JPEG")
+    Image.new("RGB", (60, 80)).save(tmp_path / "left.jpg", "JPEG")
+    Image.new("RGB", (100, 90)).save(tmp_path / "front.jpg", "JPEG")  # wrong height
+    Image.new("RGB", (60, 80)).save(tmp_path / "right.jpg", "JPEG")
+    import pytest as _pt
+    with _pt.raises(ValueError, match="heights differ"):
+        stitch_faces(str(tmp_path))
+
+
+def test_stitch_faces_raises_when_faces_missing(tmp_path):
+    img = Image.new("RGB", (50, 50), color=(0, 0, 0))
+    img.save(tmp_path / "back.jpg", "JPEG")
+    # left/front/right missing
+    import pytest as _pt
+    with _pt.raises(FileNotFoundError):
+        stitch_faces(str(tmp_path))

@@ -96,6 +96,37 @@ def _write_meta_csv(pano, face_paths: List[str], csv_path: str) -> None:
             })
 
 
+def stitch_faces(pano_dir: str, overlap_px: int = 10, out_name: str = "stitched.jpg") -> str:
+    """
+    Stitch back/left/front/right JPGs in `pano_dir` left-to-right with
+    `overlap_px` of horizontal overlap between adjacent faces. Writes
+    `<pano_dir>/<out_name>` and returns its path.
+
+    Faces must already exist on disk (e.g. produced by `scrape_polygon`).
+    Naive paste — no blending in the overlap region; the right face wins.
+    """
+    names = ["back", "left", "front", "right"]
+    paths = [os.path.join(pano_dir, f"{n}.jpg") for n in names]
+    for p in paths:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"missing face for stitching: {p}")
+    imgs = [Image.open(p).convert("RGB") for p in paths]
+    h = imgs[0].height
+    if any(im.height != h for im in imgs):
+        raise ValueError("face heights differ — cannot stitch")
+    widths = [im.width for im in imgs]
+    n = len(imgs)
+    out_w = sum(widths) - (n - 1) * overlap_px
+    canvas = Image.new("RGB", (out_w, h))
+    x = 0
+    for i, im in enumerate(imgs):
+        canvas.paste(im, (x, 0))
+        x += im.width - overlap_px
+    out_path = os.path.join(pano_dir, out_name)
+    canvas.save(out_path, format="JPEG", quality=92)
+    return out_path
+
+
 @dataclass
 class ScrapeResult:
     pano_id: str
@@ -152,7 +183,8 @@ def scrape_polygon(
     os.makedirs(pano_dir, exist_ok=True)
     auth = Authenticator()
     face_paths: List[str] = []
-    for i, name in enumerate(FACE_NAMES):
+    # Skip top/bottom (faces 4 and 5) — only 4 side faces are downloaded.
+    for i, name in enumerate(FACE_NAMES[:4]):
         out_path = os.path.join(pano_dir, f"{name}.jpg")
         try:
             heic = get_panorama_face(chosen_pano, Face(i), zoom, auth)
@@ -166,7 +198,7 @@ def scrape_polygon(
                 f"HEIC decode failed on face {name} (bytes={len(heic)}): {e}"
             ) from e
         face_paths.append(out_path)
-        _emit("progress", {"step": "face", "i": i + 1, "total": 6, "name": name})
+        _emit("progress", {"step": "face", "i": i + 1, "total": 4, "name": name})
 
     csv_path = os.path.join(pano_dir, "meta.csv")
     _write_meta_csv(chosen_pano, face_paths, csv_path)
