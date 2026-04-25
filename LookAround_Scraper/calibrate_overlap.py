@@ -76,6 +76,26 @@ def find_optimal_overlap(left_img: Image.Image, right_img: Image.Image,
     return (d_orig_px, best_d, pct, best_err)
 
 
+def stitch_with_per_seam_overlaps(imgs: List[Image.Image],
+                                  seam_overlaps_px: List[int],
+                                  out_path: str) -> None:
+    """Stitch left-to-right using one pixel overlap per seam (n-1 values)."""
+    n = len(imgs)
+    if len(seam_overlaps_px) != n - 1:
+        raise ValueError("need n-1 seam overlaps")
+    h = min(im.height for im in imgs)
+    out_w = sum(im.width for im in imgs) - sum(seam_overlaps_px)
+    canvas = Image.new("RGB", (out_w, h))
+    x = 0
+    for i, im in enumerate(imgs):
+        canvas.paste(im.crop((0, 0, im.width, h)), (x, 0))
+        if i < n - 1:
+            x += im.width - seam_overlaps_px[i]
+        else:
+            x += im.width
+    canvas.save(out_path, format="JPEG", quality=92)
+
+
 def get_or_download_face(pano, face_idx: int, zoom: int, auth: Authenticator,
                          out_path: str) -> str:
     if os.path.exists(out_path) and os.path.getsize(out_path) > 100:
@@ -136,6 +156,16 @@ def main():
             for lbl, (d, pct, _) in zip(["b->l", "l->f", "f->r"], seams)
         )
         print(f"zoom {z}: w={widths}  {s_str}")
+
+        # Write a stitched.jpg using the matched per-seam overlaps
+        seam_px = [s[0] for s in seams]
+        stitched_path = os.path.join(z_dir, "stitched.jpg")
+        try:
+            stitch_with_per_seam_overlaps(imgs, seam_px, stitched_path)
+            sw, sh = Image.open(stitched_path).size
+            print(f"         stitched -> {stitched_path}  ({sw}x{sh})")
+        except Exception as e:
+            print(f"         stitch failed: {e}")
 
     print()
     print("=" * 90)
