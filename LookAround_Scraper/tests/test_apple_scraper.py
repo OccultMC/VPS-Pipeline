@@ -126,3 +126,27 @@ def test_write_meta_csv_emits_six_rows_with_schema(tmp_path):
     assert rows[0]["face_name"] == "back"
     assert rows[5]["face_name"] == "bottom"
     assert rows[2]["image_path"].endswith("front.jpg")
+
+
+import pytest
+from apple_scraper import scrape_polygon, ScrapeResult
+
+
+@pytest.mark.network
+def test_scrape_polygon_downloads_six_faces_and_csv(tmp_path):
+    # Downtown SF — known dense Look Around coverage
+    polygon = [
+        [-122.4200, 37.7745],
+        [-122.4188, 37.7745],
+        [-122.4188, 37.7755],
+        [-122.4200, 37.7755],
+    ]
+    result = scrape_polygon(polygon, zoom=6, out_root=str(tmp_path))
+    assert isinstance(result, ScrapeResult)
+    assert result.pano_id
+    assert len(result.face_paths) == 6
+    for p in result.face_paths:
+        assert p.endswith(".jpg")
+        assert os.path.getsize(p) > 1000
+    assert result.csv_path.endswith("meta.csv")
+    assert os.path.exists(result.csv_path)

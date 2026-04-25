@@ -1,8 +1,17 @@
 """Apple Look Around debug scraper — pure logic, no web framework."""
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass, field
 from typing import Callable, List, Tuple, Optional
+
 from streetlevel.geo import wgs84_to_tile_coord
+from streetlevel.lookaround import (
+    Face,
+    get_coverage_tile,
+    get_panorama_face,
+)
+from streetlevel.lookaround.auth import Authenticator
 
 
 def _polygon_to_tiles(polygon: List[List[float]]) -> List[Tuple[int, int]]:
@@ -85,3 +94,91 @@ def _write_meta_csv(pano, face_paths: List[str], csv_path: str) -> None:
                 "face_name": FACE_NAMES[i],
                 "image_path": path,
             })
+
+
+@dataclass
+class ScrapeResult:
+    pano_id: str
+    build_id: str
+    lat: float
+    lon: float
+    capture_date: str
+    heading: float
+    face_paths: List[str] = field(default_factory=list)
+    csv_path: str = ""
+
+
+def scrape_polygon(
+    polygon: List[List[float]],
+    zoom: int = 0,
+    out_root: str = "downloads",
+    progress_cb: Optional[Callable[[str, dict], None]] = None,
+) -> ScrapeResult:
+    """
+    Scrape a single panorama from inside `polygon`. Downloads 6 faces, decodes
+    HEIC -> JPG, writes meta.csv. Returns ScrapeResult.
+
+    Raises:
+        RuntimeError: if no Look Around coverage exists in any covering tile,
+                      or face fetch / decode fails.
+    """
+    def _emit(event: str, data: dict):
+        if progress_cb:
+            progress_cb(event, data)
+
+    _emit("progress", {"step": "finding-tile"})
+    tiles = _polygon_to_tiles(polygon)
+    if not tiles:
+        raise RuntimeError("polygon has no vertices")
+
+    chosen_pano = None
+    for tx, ty in tiles:
+        coverage = get_coverage_tile(tx, ty)
+        if coverage.panos:
+            chosen_pano = _pick_pano(coverage.panos, polygon)
+            if chosen_pano is not None:
+                break
+    if chosen_pano is None:
+        raise RuntimeError("no Look Around coverage in polygon")
+
+    _emit("progress", {
+        "step": "pano-selected",
+        "pano_id": str(chosen_pano.id),
+        "lat": chosen_pano.lat,
+        "lon": chosen_pano.lon,
+    })
+
+    pano_dir = os.path.join(out_root, str(chosen_pano.id))
+    os.makedirs(pano_dir, exist_ok=True)
+    auth = Authenticator()
+    face_paths: List[str] = []
+    for i, name in enumerate(FACE_NAMES):
+        out_path = os.path.join(pano_dir, f"{name}.jpg")
+        try:
+            heic = get_panorama_face(chosen_pano, Face(i), zoom, auth)
+        except Exception:
+            auth = Authenticator()
+            heic = get_panorama_face(chosen_pano, Face(i), zoom, auth)
+        try:
+            _decode_heic_to_jpg(heic, out_path)
+        except Exception as e:
+            raise RuntimeError(
+                f"HEIC decode failed on face {name} (bytes={len(heic)}): {e}"
+            ) from e
+        face_paths.append(out_path)
+        _emit("progress", {"step": "face", "i": i + 1, "total": 6, "name": name})
+
+    csv_path = os.path.join(pano_dir, "meta.csv")
+    _write_meta_csv(chosen_pano, face_paths, csv_path)
+
+    capture_date = chosen_pano.date.isoformat() if getattr(chosen_pano, "date", None) else ""
+    return ScrapeResult(
+        pano_id=str(chosen_pano.id),
+        build_id=str(chosen_pano.build_id),
+        lat=chosen_pano.lat,
+        lon=chosen_pano.lon,
+        capture_date=capture_date,
+        heading=float(getattr(chosen_pano, "heading", 0.0) or 0.0),
+        face_paths=face_paths,
+        csv_path=csv_path,
+    )
