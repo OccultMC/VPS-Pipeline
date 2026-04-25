@@ -96,13 +96,14 @@ def _write_meta_csv(pano, face_paths: List[str], csv_path: str) -> None:
             })
 
 
-def stitch_faces(pano_dir: str, overlap_px: int = 30, out_name: str = "stitched.jpg") -> str:
+def stitch_faces(pano_dir: str, overlap_pct: float = 3.0, out_name: str = "stitched.jpg") -> str:
     """
-    Stitch back/left/front/right JPGs in `pano_dir` left-to-right with
-    `overlap_px` of horizontal overlap between adjacent faces. Writes
+    Stitch back/left/front/right JPGs in `pano_dir` left-to-right with a
+    horizontal overlap between adjacent faces. The overlap on each seam is
+    `overlap_pct` percent of the *left* face's width on that seam, so the
+    overlap scales with zoom level (face resolution). Writes
     `<pano_dir>/<out_name>` and returns its path.
 
-    Faces must already exist on disk (e.g. produced by `scrape_polygon`).
     Naive paste — no blending in the overlap region; the right face wins.
     """
     names = ["back", "left", "front", "right"]
@@ -114,14 +115,19 @@ def stitch_faces(pano_dir: str, overlap_px: int = 30, out_name: str = "stitched.
     h = imgs[0].height
     if any(im.height != h for im in imgs):
         raise ValueError("face heights differ — cannot stitch")
-    widths = [im.width for im in imgs]
     n = len(imgs)
-    out_w = sum(widths) - (n - 1) * overlap_px
+    # Per-seam overlap: i in 0..n-2 contributes overlap on its right edge.
+    seam_overlaps = [round(imgs[i].width * overlap_pct / 100.0) for i in range(n - 1)]
+    out_w = sum(im.width for im in imgs) - sum(seam_overlaps)
     canvas = Image.new("RGB", (out_w, h))
     x = 0
     for i, im in enumerate(imgs):
         canvas.paste(im, (x, 0))
-        x += im.width - overlap_px
+        # Advance by this face's width minus its right-seam overlap (last face has none).
+        if i < n - 1:
+            x += im.width - seam_overlaps[i]
+        else:
+            x += im.width
     out_path = os.path.join(pano_dir, out_name)
     canvas.save(out_path, format="JPEG", quality=92)
     return out_path

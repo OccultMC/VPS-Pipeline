@@ -165,12 +165,21 @@ def test_stitch_faces_overlaps_correctly(tmp_path):
     for name, w in widths.items():
         img = Image.new("RGB", (w, 80), color=(0, 0, 0))
         img.save(tmp_path / f"{name}.jpg", "JPEG")
-    out = stitch_faces(str(tmp_path), overlap_px=10)
+    # 10% overlap. seams use left-face widths in order: back(100), left(60), front(100).
+    # seam overlaps = round(100*.1)=10, round(60*.1)=6, round(100*.1)=10 → total 26
+    # out_w = (100+60+100+60) - 26 = 294
+    out = stitch_faces(str(tmp_path), overlap_pct=10.0)
     assert os.path.exists(out)
     out_img = Image.open(out)
-    # sum(widths) - 3*overlap = (100+60+100+60) - 30 = 290
-    assert out_img.width == 290
+    assert out_img.width == 294
     assert out_img.height == 80
+
+
+def test_stitch_faces_zero_pct_yields_concatenation(tmp_path):
+    for name, w in {"back": 100, "left": 60, "front": 100, "right": 60}.items():
+        Image.new("RGB", (w, 80)).save(tmp_path / f"{name}.jpg", "JPEG")
+    out = stitch_faces(str(tmp_path), overlap_pct=0.0)
+    assert Image.open(out).width == 100 + 60 + 100 + 60
 
 
 def test_stitch_faces_rejects_mismatched_heights(tmp_path):

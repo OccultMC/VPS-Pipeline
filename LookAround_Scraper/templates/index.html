@@ -40,9 +40,11 @@
       <div class="face" data-name="front">front</div>
       <div class="face" data-name="right">right</div>
     </div>
+    <label>Stitch overlap (% of face width)</label>
+    <input type="number" id="overlap-pct" value="3" min="0" max="50" step="0.5">
     <button id="stitch-btn" style="margin-top:12px; width:100%; padding:8px; background:#4ea1ff; color:#000; border:0; font-weight:600; cursor:pointer; display:none;">Stitch panorama</button>
     <div id="stitched-wrap" style="margin-top:12px; display:none;">
-      <label style="margin-top:0">Stitched (back→left→front→right, 30px overlap)</label>
+      <label style="margin-top:0">Stitched (back→left→front→right)</label>
       <a id="stitched-link" href="#" target="_blank"><img id="stitched-img" style="width:100%; border:1px solid #333;"></a>
     </div>
     <a class="csv-link" id="csv-link" href="#" style="display:none">download meta.csv</a>
@@ -87,7 +89,8 @@
   document.getElementById('stitch-btn').addEventListener('click', () => {
     if (!currentPanoId) return;
     setProgress('stitching...');
-    socket.emit('stitch_pano', { session_id: sessionId, pano_id: currentPanoId, overlap_px: 30 });
+    const pct = parseFloat(document.getElementById('overlap-pct').value) || 3.0;
+    socket.emit('stitch_pano', { session_id: sessionId, pano_id: currentPanoId, overlap_pct: pct });
   });
 
   function attachClickHandler(layer) {
