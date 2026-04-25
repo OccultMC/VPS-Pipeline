@@ -23,3 +23,17 @@ def _polygon_to_tiles(polygon: List[List[float]]) -> List[Tuple[int, int]]:
         for tx in range(x_min, x_max + 1):
             tiles.append((tx, ty))
     return tiles
+
+
+from shapely.geometry import Point, Polygon as ShapelyPolygon
+
+
+def _pick_pano(panos, polygon: List[List[float]]):
+    """Return first pano inside `polygon`, else first pano in list, else None."""
+    if not panos:
+        return None
+    poly = ShapelyPolygon(polygon)
+    for pano in panos:
+        if poly.contains(Point(pano.lon, pano.lat)):
+            return pano
+    return panos[0]
