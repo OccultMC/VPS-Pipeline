@@ -170,33 +170,33 @@ VIEWER_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>360 Viewer - {pano_id}</title>
+<title>360 Viewer - __PANO_ID__</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.css">
 <style>
-  html, body {{ margin:0; height:100%; background:#000; color:#eee; font-family:system-ui,sans-serif; }}
-  #panorama {{ height:100vh; }}
-  #info {{ position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.6); padding:8px 12px; border-radius:4px; font-size:12px; z-index:10; }}
+  html, body { margin:0; height:100%; background:#000; color:#eee; font-family:system-ui,sans-serif; }
+  #panorama { height:100vh; }
+  #info { position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.6); padding:8px 12px; border-radius:4px; font-size:12px; z-index:10; }
 </style>
 </head>
 <body>
-<div id="info">pano {pano_id} — drag to pan, scroll to zoom</div>
+<div id="info">pano __PANO_ID__ — drag to pan, scroll to zoom</div>
 <div id="panorama"></div>
 <script src="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.js"></script>
 <script>
-pannellum.viewer('panorama', {{
+pannellum.viewer('panorama', {
     type: 'equirectangular',
-    panorama: '/downloads/{pano_id}/equirect.jpg',
+    panorama: '/downloads/__PANO_ID__/equirect.jpg',
     autoLoad: true,
     showControls: true,
     showZoomCtrl: true,
     showFullscreenCtrl: true,
-    minPitch: -55,
-    maxPitch: 55,
+    minPitch: -90,
+    maxPitch: 90,
     hfov: 100,
     minHfov: 30,
     maxHfov: 120,
-    backgroundColor: [0, 0, 0],
-}});
+    backgroundColor: [0, 0, 0]
+});
 </script>
 </body>
 </html>
@@ -208,7 +208,7 @@ def viewer(pano_id: str):
     pano_dir = DOWNLOADS_DIR / pano_id
     if not (pano_dir / "equirect.jpg").exists():
         return f"equirect.jpg not found for {pano_id}. Stitch + project first.", 404
-    return VIEWER_HTML.replace("{pano_id}", pano_id)
+    return VIEWER_HTML.replace("__PANO_ID__", pano_id)
 
 
 @socketio.on("make_equirect")

@@ -218,10 +218,9 @@ def scrape_polygon(
     os.makedirs(pano_dir, exist_ok=True)
     auth = Authenticator()
     face_paths: List[str] = []
-    # Only the 4 side faces — top/bottom are skipped until we figure out how
-    # they should fold into the panorama (they're separate lens projections,
-    # not just sky/ground caps).
-    for i, name in enumerate(FACE_NAMES[:4]):
+    # All 6 faces (back/left/front/right + top/bottom). The reprojector folds
+    # top/bottom into the equirect via their lens metadata.
+    for i, name in enumerate(FACE_NAMES):
         out_path = os.path.join(pano_dir, f"{name}.jpg")
         try:
             heic = get_panorama_face(chosen_pano, Face(i), zoom, auth)
@@ -235,7 +234,7 @@ def scrape_polygon(
                 f"HEIC decode failed on face {name} (bytes={len(heic)}): {e}"
             ) from e
         face_paths.append(out_path)
-        _emit("progress", {"step": "face", "i": i + 1, "total": 4, "name": name})
+        _emit("progress", {"step": "face", "i": i + 1, "total": 6, "name": name})
 
     csv_path = os.path.join(pano_dir, "meta.csv")
     _write_meta_csv(chosen_pano, face_paths, csv_path)

@@ -133,7 +133,7 @@ from apple_scraper import scrape_polygon, ScrapeResult
 
 
 @pytest.mark.network
-def test_scrape_polygon_downloads_four_faces_and_csv(tmp_path):
+def test_scrape_polygon_downloads_six_faces_and_csv(tmp_path):
     # Downtown SF — known dense Look Around coverage
     polygon = [
         [-122.4200, 37.7745],
@@ -144,15 +144,13 @@ def test_scrape_polygon_downloads_four_faces_and_csv(tmp_path):
     result = scrape_polygon(polygon, zoom=6, out_root=str(tmp_path))
     assert isinstance(result, ScrapeResult)
     assert result.pano_id
-    assert len(result.face_paths) == 4
+    assert len(result.face_paths) == 6
     for p in result.face_paths:
         assert p.endswith(".jpg")
         assert os.path.getsize(p) > 1000
     pano_dir = os.path.dirname(result.face_paths[0])
-    for name in ["back", "left", "front", "right"]:
+    for name in ["back", "left", "front", "right", "top", "bottom"]:
         assert os.path.exists(os.path.join(pano_dir, f"{name}.jpg"))
-    for name in ["top", "bottom"]:
-        assert not os.path.exists(os.path.join(pano_dir, f"{name}.jpg"))
     assert result.csv_path.endswith("meta.csv")
     assert os.path.exists(result.csv_path)
 
