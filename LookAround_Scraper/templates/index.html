@@ -30,7 +30,12 @@
     <h1>LookAround Debug</h1>
     <label>Shape file</label>
     <input type="file" id="shape-file" accept=".geojson,.json,.shp,.dbf,.shx,.prj,.zip,.kml,.gpkg" multiple>
-    <label>Zoom (0=full, 7=lowest)</label>
+    <label>Click mode</label>
+    <select id="click-mode" style="width:100%; background:#000; color:var(--fg); border:1px solid #333; padding:6px 8px; font-size:12px;">
+      <option value="single">Single pano (click → scrape one)</option>
+      <option value="all">All panos in shape → CSV</option>
+    </select>
+    <label>Zoom (0=full, 7=lowest) — single-pano only</label>
     <input type="number" id="zoom" value="0" min="0" max="7">
     <div class="progress" id="progress">click a polygon to scrape one panorama</div>
     <div class="meta" id="meta"></div>
@@ -56,6 +61,11 @@
       <a id="viewer-link" href="#" target="_blank" style="display:block; margin-top:6px; color:#7755ff;">Open in 360 viewer →</a>
     </div>
     <a class="csv-link" id="csv-link" href="#" style="display:none">download meta.csv</a>
+    <div id="bulk-wrap" style="margin-top:12px; display:none; padding:8px; background:#000; border:1px solid #333;">
+      <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.05em;">Bulk scrape</div>
+      <div id="bulk-summary" style="margin-top:4px; font-family:ui-monospace,monospace; font-size:12px;"></div>
+      <a id="bulk-csv-link" href="#" style="color:var(--accent); display:inline-block; margin-top:6px;" download>download CSV →</a>
+    </div>
   </aside>
   <div id="map"></div>
 </div>
@@ -77,6 +87,7 @@
   document.querySelectorAll('#gallery .face').forEach(el => galleryFaces[el.dataset.name] = el);
 
   let shapesLayer = null;
+  let pointsLayer = null;
 
   function setProgress(text, cls = '') {
     progressEl.textContent = text;
@@ -121,14 +132,44 @@
         setProgress('unsupported geometry: ' + geom.type, 'err');
         return;
       }
-      clearGallery();
-      setProgress('submitting polygon (' + ring.length + ' vertices)...');
-      socket.emit('scrape_polygon', {
-        session_id: sessionId,
-        coords: ring,
-        zoom: parseInt(document.getElementById('zoom').value, 10) || 0,
-      });
+      const mode = document.getElementById('click-mode').value;
+      const props = (layer.feature && layer.feature.properties) || {};
+      if (mode === 'all') {
+        clearPoints();
+        document.getElementById('bulk-wrap').style.display = 'none';
+        setProgress('enumerating panos in polygon...');
+        socket.emit('scrape_polygon_all', {
+          session_id: sessionId,
+          coords: ring,
+          country_code: props.country_code || '',
+          address_label: props.address_label || props.name || '',
+        });
+      } else {
+        clearGallery();
+        setProgress('submitting polygon (' + ring.length + ' vertices)...');
+        socket.emit('scrape_polygon', {
+          session_id: sessionId,
+          coords: ring,
+          zoom: parseInt(document.getElementById('zoom').value, 10) || 0,
+        });
+      }
     });
+  }
+
+  function clearPoints() {
+    if (pointsLayer) { map.removeLayer(pointsLayer); pointsLayer = null; }
+  }
+
+  function renderPoints(points) {
+    clearPoints();
+    if (!points.length) return;
+    pointsLayer = L.layerGroup();
+    for (const p of points) {
+      L.circleMarker([p.lat, p.lon], {
+        radius: 2, color: '#7755ff', weight: 1, fillColor: '#7755ff', fillOpacity: 0.7,
+      }).bindTooltip(p.id, {sticky: true}).addTo(pointsLayer);
+    }
+    pointsLayer.addTo(map);
   }
 
   document.getElementById('shape-file').addEventListener('change', async (e) => {
@@ -154,7 +195,21 @@
     if (p.step === 'finding-tile') setProgress('finding coverage tile...');
     else if (p.step === 'pano-selected') setProgress('pano ' + p.pano_id + ' @ ' + p.lat.toFixed(5) + ',' + p.lon.toFixed(5));
     else if (p.step === 'face') setProgress('face ' + p.i + '/' + p.total + ' (' + p.name + ')...');
+    else if (p.step === 'tile') setProgress('tile ' + p.i + '/' + p.total + ' — ' + p.panos_so_far + ' panos so far');
   });
+
+  socket.on('scrape_all_done', (r) => {
+    setProgress('bulk done — ' + r.count + ' panos');
+    renderPoints(r.points);
+    document.getElementById('bulk-summary').textContent =
+      r.count + ' panoramas inside polygon';
+    const link = document.getElementById('bulk-csv-link');
+    link.href = r.csv_url;
+    link.textContent = 'download ' + r.csv_name + ' →';
+    document.getElementById('bulk-wrap').style.display = 'block';
+  });
+
+  socket.on('scrape_all_error', (e) => setProgress('bulk error: ' + e.message, 'err'));
 
   socket.on('scrape_done', (r) => {
     setProgress('done — pano ' + r.pano_id);

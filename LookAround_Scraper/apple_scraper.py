@@ -133,6 +133,91 @@ def stitch_faces(pano_dir: str, overlap_pct: float = 3.0, out_name: str = "stitc
     return out_path
 
 
+def scrape_all_in_polygon(
+    polygon: List[List[float]],
+    progress_cb: Optional[Callable[[str, dict], None]] = None,
+) -> List[dict]:
+    """
+    Enumerate every Look Around panorama whose lat/lon falls inside `polygon`.
+
+    Iterates all z=17 tiles covering the polygon's bbox, fetches each
+    coverage tile, filters by point-in-polygon. Returns a list of dicts
+    suitable for CSV export to Stage_2_Apple_Image_Scraper.
+
+    progress_cb is called as
+        ('progress', {'step': 'tile', 'i': k, 'total': n, 'panos_so_far': m})
+    """
+    def _emit(event: str, data: dict):
+        if progress_cb:
+            progress_cb(event, data)
+
+    tiles = _polygon_to_tiles(polygon)
+    if not tiles:
+        return []
+
+    poly = ShapelyPolygon(polygon)
+    seen_ids = set()
+    out_records: List[dict] = []
+
+    for i, (tx, ty) in enumerate(tiles):
+        try:
+            coverage = get_coverage_tile(tx, ty)
+        except Exception:
+            coverage = None
+
+        if coverage and coverage.panos:
+            for pano in coverage.panos:
+                if pano.id in seen_ids:
+                    continue
+                if not poly.contains(Point(pano.lon, pano.lat)):
+                    continue
+                seen_ids.add(pano.id)
+                out_records.append({
+                    "panoid": str(pano.id),
+                    "build_id": str(pano.build_id),
+                    "lat": pano.lat,
+                    "lon": pano.lon,
+                    "heading_deg": float(getattr(pano, "heading", 0.0) or 0.0),
+                    "capture_date": pano.date.isoformat() if getattr(pano, "date", None) else "",
+                    "coverage_type": pano.coverage_type.name if pano.coverage_type else "",
+                })
+
+        _emit("progress", {
+            "step": "tile",
+            "i": i + 1,
+            "total": len(tiles),
+            "panos_so_far": len(out_records),
+        })
+
+    return out_records
+
+
+def write_bulk_csv(records: List[dict], csv_path: str,
+                   country_code: str = "", address_label: str = "") -> str:
+    """Write the bulk scrape result as a Stage_2-compatible CSV."""
+    cols = [
+        "panoid", "build_id", "lat", "lon",
+        "heading_deg", "capture_date", "coverage_type",
+        "country_code", "address_label",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in records:
+            w.writerow({
+                "panoid": r["panoid"],
+                "build_id": r["build_id"],
+                "lat": r["lat"],
+                "lon": r["lon"],
+                "heading_deg": r.get("heading_deg", ""),
+                "capture_date": r.get("capture_date", ""),
+                "coverage_type": r.get("coverage_type", ""),
+                "country_code": country_code,
+                "address_label": address_label,
+            })
+    return csv_path
+
+
 def _write_metadata_json(pano, pano_dir: str) -> str:
     """Persist per-face lens + position metadata for downstream reprojection."""
     import json

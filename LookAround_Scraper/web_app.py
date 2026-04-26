@@ -9,6 +9,7 @@ Usage:
 """
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -24,7 +25,7 @@ from flask import (
 )
 from flask_socketio import SocketIO, emit, join_room
 
-from apple_scraper import scrape_polygon, stitch_faces
+from apple_scraper import scrape_polygon, stitch_faces, scrape_all_in_polygon, write_bulk_csv
 from cylindrical_project import trim_wrap_overlap, pad_to_2to1
 from equirect_reproject import reproject_to_equirect
 from PIL import Image
@@ -35,6 +36,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 ROOT = Path(__file__).resolve().parent
 DOWNLOADS_DIR = ROOT / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
+BULK_DIR = DOWNLOADS_DIR / "_bulk"
+BULK_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET", "dev-secret-key")
@@ -116,6 +119,11 @@ def load_shapes():
 def serve_download(pano_id: str, filename: str):
     pano_dir = DOWNLOADS_DIR / pano_id
     return send_from_directory(str(pano_dir), filename)
+
+
+@app.route("/downloads/_bulk/<path:filename>")
+def serve_bulk(filename: str):
+    return send_from_directory(str(BULK_DIR), filename, as_attachment=True)
 
 
 # ───────────────────────────────────────── SocketIO ───────────────────────────
@@ -248,6 +256,54 @@ def on_make_equirect(data):
         except Exception as e:
             logger.exception("equirect failed")
             socketio.emit("equirect_error", {"message": str(e)}, room=sid)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@socketio.on("scrape_polygon_all")
+def on_scrape_polygon_all(data):
+    """
+    Enumerate every Look Around pano whose lat/lon is inside the polygon.
+    Streams progress events; on completion writes a Stage_2-compatible CSV
+    and emits a `scrape_all_done` event with the points + csv URL.
+    """
+    sid = data.get("session_id") or request.sid
+    coords = data.get("coords") or []
+    country_code = (data.get("country_code") or "").strip()
+    address_label = (data.get("address_label") or "").strip()
+
+    if not coords or len(coords) < 3:
+        emit("scrape_all_error", {"message": "polygon needs at least 3 vertices"}, room=sid)
+        return
+
+    def _run():
+        def progress_cb(event, payload):
+            socketio.emit(event, payload, room=sid)
+
+        try:
+            records = scrape_all_in_polygon(coords, progress_cb=progress_cb)
+
+            ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+            slug = address_label or country_code or "polygon"
+            slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in slug)[:40]
+            csv_name = f"lookaround_{slug}_{ts}.csv"
+            csv_path = BULK_DIR / csv_name
+            write_bulk_csv(records, str(csv_path),
+                           country_code=country_code, address_label=address_label)
+
+            socketio.emit("scrape_all_done", {
+                "count": len(records),
+                "csv_url": f"/downloads/_bulk/{csv_name}",
+                "csv_name": csv_name,
+                # Lightweight payload for map markers:
+                "points": [
+                    {"id": r["panoid"], "lat": r["lat"], "lon": r["lon"]}
+                    for r in records
+                ],
+            }, room=sid)
+        except Exception as e:
+            logger.exception("scrape_all failed")
+            socketio.emit("scrape_all_error", {"message": str(e)}, room=sid)
 
     threading.Thread(target=_run, daemon=True).start()
 
