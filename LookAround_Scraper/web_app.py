@@ -26,6 +26,7 @@ from flask_socketio import SocketIO, emit, join_room
 
 from apple_scraper import scrape_polygon, stitch_faces
 from cylindrical_project import trim_wrap_overlap, pad_to_2to1
+from equirect_reproject import reproject_to_equirect
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -226,17 +227,12 @@ def on_make_equirect(data):
 
     def _run():
         try:
-            stitched = pano_dir / "stitched.jpg"
-            right = pano_dir / "right.jpg"
-            if not stitched.exists() or not right.exists():
-                raise RuntimeError("need stitched.jpg + right.jpg first (stitch the pano)")
+            meta_json = pano_dir / "metadata.json"
+            if not meta_json.exists():
+                raise RuntimeError("metadata.json missing — re-scrape this pano")
 
-            strip = Image.open(stitched).convert("RGB")
-            right_w = Image.open(right).width
-            trimmed = trim_wrap_overlap(strip, right_w)
-            equi = pad_to_2to1(trimmed)
-            out_path = pano_dir / "equirect.jpg"
-            equi.save(str(out_path), format="JPEG", quality=92)
+            out_path = reproject_to_equirect(str(pano_dir), out_name="equirect.jpg")
+            equi = Image.open(out_path)
 
             socketio.emit("equirect_done", {
                 "pano_id": pano_id,

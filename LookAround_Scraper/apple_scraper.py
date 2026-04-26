@@ -133,6 +133,35 @@ def stitch_faces(pano_dir: str, overlap_pct: float = 3.0, out_name: str = "stitc
     return out_path
 
 
+def _write_metadata_json(pano, pano_dir: str) -> str:
+    """Persist per-face lens + position metadata for downstream reprojection."""
+    import json
+    data = {
+        "pano_id": str(pano.id),
+        "build_id": str(pano.build_id),
+        "lat": pano.lat,
+        "lon": pano.lon,
+        "heading": float(getattr(pano, "heading", 0.0) or 0.0),
+        "pitch": float(getattr(pano, "pitch", 0.0) or 0.0),
+        "roll": float(getattr(pano, "roll", 0.0) or 0.0),
+        "faces": [],
+    }
+    for cm in (pano.camera_metadata or []):
+        data["faces"].append({
+            "yaw": cm.position.yaw,
+            "pitch": cm.position.pitch,
+            "roll": cm.position.roll,
+            "fov_s": cm.lens_projection.fov_s,
+            "fov_h": cm.lens_projection.fov_h,
+            "cx": cm.lens_projection.cx,
+            "cy": cm.lens_projection.cy,
+        })
+    out_path = os.path.join(pano_dir, "metadata.json")
+    with open(out_path, "w") as f:
+        json.dump(data, f, indent=2)
+    return out_path
+
+
 @dataclass
 class ScrapeResult:
     pano_id: str
@@ -189,9 +218,10 @@ def scrape_polygon(
     os.makedirs(pano_dir, exist_ok=True)
     auth = Authenticator()
     face_paths: List[str] = []
-    # All 6 faces (back/left/front/right + top/bottom). Stitcher only uses the
-    # 4 sides; top/bottom are kept for inspection / future use.
-    for i, name in enumerate(FACE_NAMES):
+    # Only the 4 side faces — top/bottom are skipped until we figure out how
+    # they should fold into the panorama (they're separate lens projections,
+    # not just sky/ground caps).
+    for i, name in enumerate(FACE_NAMES[:4]):
         out_path = os.path.join(pano_dir, f"{name}.jpg")
         try:
             heic = get_panorama_face(chosen_pano, Face(i), zoom, auth)
@@ -205,10 +235,11 @@ def scrape_polygon(
                 f"HEIC decode failed on face {name} (bytes={len(heic)}): {e}"
             ) from e
         face_paths.append(out_path)
-        _emit("progress", {"step": "face", "i": i + 1, "total": 6, "name": name})
+        _emit("progress", {"step": "face", "i": i + 1, "total": 4, "name": name})
 
     csv_path = os.path.join(pano_dir, "meta.csv")
     _write_meta_csv(chosen_pano, face_paths, csv_path)
+    _write_metadata_json(chosen_pano, pano_dir)
 
     capture_date = chosen_pano.date.isoformat() if getattr(chosen_pano, "date", None) else ""
     return ScrapeResult(
