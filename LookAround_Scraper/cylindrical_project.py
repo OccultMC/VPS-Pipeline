@@ -62,6 +62,113 @@ def pad_to_2to1(img: Image.Image) -> Image.Image:
     return canvas
 
 
+def _sample(equi: np.ndarray, eq_x: np.ndarray, eq_y: np.ndarray) -> np.ndarray:
+    """Nearest-neighbor lookup with horizontal wrap."""
+    H, W, _ = equi.shape
+    xi = np.mod(eq_x.astype(np.int32), W)
+    yi = np.clip(eq_y.astype(np.int32), 0, H - 1)
+    return equi[yi, xi]
+
+
+def render_cylindrical(equi: np.ndarray, out_w: int, out_h: int,
+                       fov_h_deg: float = 360.0) -> np.ndarray:
+    """Cylindrical projection: full 360° wrap horizontally, perfect verticals."""
+    H, W, _ = equi.shape
+    fov_h = math.radians(fov_h_deg)
+    yaw = (np.arange(out_w, dtype=np.float64) / out_w - 0.5) * fov_h
+    focal = out_w / fov_h  # pixels per radian
+    # v=0 at TOP of output → +pitch (sky)
+    v_centered = out_h / 2.0 - np.arange(out_h, dtype=np.float64)
+    pitch = np.arctan(v_centered / focal)
+    uu, _ = np.meshgrid(yaw, np.zeros(out_h))
+    _, vv = np.meshgrid(np.zeros(out_w), pitch)
+    eq_x = (uu / (2 * math.pi) + 0.5) * W
+    eq_y = (0.5 - vv / math.pi) * H
+    return _sample(equi, eq_x, eq_y)
+
+
+def render_mercator(equi: np.ndarray, out_w: int, out_h: int,
+                    fov_h_deg: float = 360.0) -> np.ndarray:
+    """
+    Mercator: full 360° wrap, vertical stretches near poles. Same horizontal
+    geometry as cylindrical, different vertical mapping.
+    """
+    H, W, _ = equi.shape
+    fov_h = math.radians(fov_h_deg)
+    yaw = (np.arange(out_w, dtype=np.float64) / out_w - 0.5) * fov_h
+    scale = out_w / (2 * math.pi)
+    # v=0 at TOP → +pitch (sky)
+    v_centered = (out_h / 2.0 - np.arange(out_h, dtype=np.float64)) / scale
+    pitch = 2 * np.arctan(np.exp(v_centered)) - math.pi / 2
+    uu, _ = np.meshgrid(yaw, np.zeros(out_h))
+    _, vv = np.meshgrid(np.zeros(out_w), pitch)
+    eq_x = (uu / (2 * math.pi) + 0.5) * W
+    eq_y = (0.5 - vv / math.pi) * H
+    return _sample(equi, eq_x, eq_y)
+
+
+def render_stereographic(equi: np.ndarray, out_size: int, pole: str = "down",
+                         zoom: float = 0.33) -> np.ndarray:
+    """
+    Stereographic projection. pole='down' is a "little planet"; pole='up'
+    is a "tunnel". `zoom` controls how much of the sphere fits inside the
+    disk (smaller zoom = more sphere included).
+    """
+    H, W, _ = equi.shape
+    cx = cy = out_size / 2.0
+    u_c = np.arange(out_size, dtype=np.float64) - cx
+    v_c = np.arange(out_size, dtype=np.float64) - cy
+    uu, vv = np.meshgrid(u_c, v_c)
+    r = np.sqrt(uu * uu + vv * vv)
+    f = cx * zoom
+    theta_pole = 2 * np.arctan(r / (2 * f))
+    az = np.arctan2(vv, uu)
+    if pole == "down":
+        pitch = -math.pi / 2 + theta_pole
+        yaw = az
+    else:  # up
+        pitch = math.pi / 2 - theta_pole
+        yaw = az + math.pi
+    pitch = np.clip(pitch, -math.pi / 2, math.pi / 2)
+    eq_x = (yaw / (2 * math.pi) + 0.5) * W
+    eq_y = (0.5 - pitch / math.pi) * H
+    return _sample(equi, eq_x, eq_y)
+
+
+def render_fisheye(equi: np.ndarray, out_size: int,
+                   fov_deg: float = 180.0, pole: str = "front") -> np.ndarray:
+    """
+    Equidistant fisheye (circular). Renders content inside a disk; outside
+    the disk is black. `pole='front'` looks straight ahead at yaw=0,pitch=0.
+    """
+    H, W, _ = equi.shape
+    cx = cy = out_size / 2.0
+    u_c = np.arange(out_size, dtype=np.float64) - cx
+    v_c = np.arange(out_size, dtype=np.float64) - cy
+    uu, vv = np.meshgrid(u_c, v_c)
+    r = np.sqrt(uu * uu + vv * vv)
+    fov = math.radians(fov_deg)
+    theta = r / cx * (fov / 2)        # angle from optical axis
+    az = np.arctan2(vv, uu)
+    # Optical axis = +Z (forward). Theta is angle from +Z.
+    rx = np.sin(theta) * np.cos(az)
+    ry = np.sin(theta) * np.sin(az)
+    rz = np.cos(theta)
+    if pole == "down":
+        ry, rz = -rz, ry
+    elif pole == "up":
+        ry, rz = rz, -ry
+    yaw = np.arctan2(rx, rz)
+    pitch = np.arcsin(np.clip(-ry, -1, 1))
+    eq_x = (yaw / (2 * math.pi) + 0.5) * W
+    eq_y = (0.5 - pitch / math.pi) * H
+    out = _sample(equi, eq_x, eq_y)
+    # Mask outside the disk
+    mask = (r > cx).astype(np.uint8)
+    out = out * (1 - mask[:, :, None])
+    return out
+
+
 def render_perspective(equi: np.ndarray, yaw_deg: float, pitch_deg: float,
                        fov_deg: float, out_w: int, out_h: int) -> np.ndarray:
     """
@@ -144,9 +251,11 @@ def main():
     equi_img.save(equi_path, format="JPEG", quality=92)
     print(f"equirect: {equi_img.width}x{equi_img.height}  -> {equi_path}")
 
-    # 3. Render 6 perspective views
     equi_arr = np.asarray(equi_img)
-    views = [
+    eq_w, eq_h = equi_img.size
+
+    # 3a. 6 perspective (rectilinear) cube views
+    cube_views = [
         ("front",  0,    0),
         ("right",  90,   0),
         ("back",   180,  0),
@@ -154,7 +263,7 @@ def main():
         ("up",     0,    90),
         ("down",   0,   -90),
     ]
-    for name, yaw, pitch in views:
+    for name, yaw, pitch in cube_views:
         out = render_perspective(
             equi_arr, yaw_deg=yaw, pitch_deg=pitch,
             fov_deg=args.view_fov,
@@ -162,7 +271,36 @@ def main():
         )
         out_path = os.path.join(args.pano_dir, f"view_{name}.jpg")
         Image.fromarray(out).save(out_path, format="JPEG", quality=92)
-        print(f"  view {name:<6} (yaw={yaw}, pitch={pitch}) -> {out_path}")
+        print(f"  perspective {name:<6} (yaw={yaw}, pitch={pitch}) -> {out_path}")
+
+    # 3b. Whole-pano renders in different projections
+    proj_w, proj_h = eq_w, eq_h  # match equirect dims for fair comparison
+
+    out = render_cylindrical(equi_arr, proj_w, proj_h)
+    Image.fromarray(out).save(os.path.join(args.pano_dir, "proj_cylindrical.jpg"),
+                              format="JPEG", quality=92)
+    print(f"  proj cylindrical    -> proj_cylindrical.jpg ({proj_w}x{proj_h})")
+
+    out = render_mercator(equi_arr, proj_w, proj_h)
+    Image.fromarray(out).save(os.path.join(args.pano_dir, "proj_mercator.jpg"),
+                              format="JPEG", quality=92)
+    print(f"  proj mercator       -> proj_mercator.jpg   ({proj_w}x{proj_h})")
+
+    sphere_size = min(proj_w, proj_h * 2)
+    out = render_stereographic(equi_arr, sphere_size, pole="down", zoom=0.33)
+    Image.fromarray(out).save(os.path.join(args.pano_dir, "proj_littleplanet.jpg"),
+                              format="JPEG", quality=92)
+    print(f"  proj little planet  -> proj_littleplanet.jpg ({sphere_size}x{sphere_size})")
+
+    out = render_stereographic(equi_arr, sphere_size, pole="up", zoom=0.33)
+    Image.fromarray(out).save(os.path.join(args.pano_dir, "proj_tunnel.jpg"),
+                              format="JPEG", quality=92)
+    print(f"  proj tunnel         -> proj_tunnel.jpg     ({sphere_size}x{sphere_size})")
+
+    out = render_fisheye(equi_arr, sphere_size, fov_deg=180, pole="front")
+    Image.fromarray(out).save(os.path.join(args.pano_dir, "proj_fisheye.jpg"),
+                              format="JPEG", quality=92)
+    print(f"  proj fisheye 180    -> proj_fisheye.jpg    ({sphere_size}x{sphere_size})")
 
 
 if __name__ == "__main__":
