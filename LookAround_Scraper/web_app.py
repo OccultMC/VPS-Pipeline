@@ -271,6 +271,7 @@ def on_scrape_polygon_all(data):
     coords = data.get("coords") or []
     country_code = (data.get("country_code") or "").strip()
     address_label = (data.get("address_label") or "").strip()
+    stride = max(1, int(data.get("stride") or 1))
 
     if not coords or len(coords) < 3:
         emit("scrape_all_error", {"message": "polygon needs at least 3 vertices"}, room=sid)
@@ -281,7 +282,7 @@ def on_scrape_polygon_all(data):
             socketio.emit(event, payload, room=sid)
 
         try:
-            records = scrape_all_in_polygon(coords, progress_cb=progress_cb)
+            records = scrape_all_in_polygon(coords, progress_cb=progress_cb, stride=stride)
 
             ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
             slug = address_label or country_code or "polygon"
@@ -293,6 +294,7 @@ def on_scrape_polygon_all(data):
 
             socketio.emit("scrape_all_done", {
                 "count": len(records),
+                "stride": stride,
                 "csv_url": f"/downloads/_bulk/{csv_name}",
                 "csv_name": csv_name,
                 # Lightweight payload for map markers:

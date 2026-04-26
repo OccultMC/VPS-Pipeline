@@ -136,6 +136,7 @@ def stitch_faces(pano_dir: str, overlap_pct: float = 3.0, out_name: str = "stitc
 def scrape_all_in_polygon(
     polygon: List[List[float]],
     progress_cb: Optional[Callable[[str, dict], None]] = None,
+    stride: int = 1,
 ) -> List[dict]:
     """
     Enumerate every Look Around panorama whose lat/lon falls inside `polygon`.
@@ -143,6 +144,12 @@ def scrape_all_in_polygon(
     Iterates all z=17 tiles covering the polygon's bbox, fetches each
     coverage tile, filters by point-in-polygon. Returns a list of dicts
     suitable for CSV export to Stage_2_Apple_Image_Scraper.
+
+    `stride`: keep 1 of every N panoramas to thin out density. Within each
+    `build_id` group (one drive = one camera run, IDs are sequential by
+    capture time → uniform spacing along the road), panos are sorted by
+    pano_id and every Nth is kept. stride=1 keeps everything; stride=3
+    keeps ~33%.
 
     progress_cb is called as
         ('progress', {'step': 'tile', 'i': k, 'total': n, 'panos_so_far': m})
@@ -188,6 +195,19 @@ def scrape_all_in_polygon(
             "total": len(tiles),
             "panos_so_far": len(out_records),
         })
+
+    if stride > 1 and out_records:
+        # Group by build_id (one drive = one build_id). Within each drive,
+        # pano IDs increase monotonically with capture time, so sorting by
+        # ID and slicing [::stride] gives evenly spaced panos along the road.
+        by_build: dict = {}
+        for r in out_records:
+            by_build.setdefault(r["build_id"], []).append(r)
+        pruned: List[dict] = []
+        for bid, recs in by_build.items():
+            recs.sort(key=lambda r: int(r["panoid"]))
+            pruned.extend(recs[::stride])
+        out_records = pruned
 
     return out_records
 

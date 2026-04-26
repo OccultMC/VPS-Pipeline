@@ -35,6 +35,8 @@
       <option value="single">Single pano (click → scrape one)</option>
       <option value="all">All panos in shape → CSV</option>
     </select>
+    <label>Bulk stride (1=keep all, 3=keep every 3rd)</label>
+    <input type="number" id="stride" value="3" min="1" max="20">
     <label>Zoom (0=full, 7=lowest) — single-pano only</label>
     <input type="number" id="zoom" value="0" min="0" max="7">
     <div class="progress" id="progress">click a polygon to scrape one panorama</div>
@@ -137,12 +139,14 @@
       if (mode === 'all') {
         clearPoints();
         document.getElementById('bulk-wrap').style.display = 'none';
-        setProgress('enumerating panos in polygon...');
+        const stride = parseInt(document.getElementById('stride').value, 10) || 1;
+        setProgress('enumerating panos (stride ' + stride + ')...');
         socket.emit('scrape_polygon_all', {
           session_id: sessionId,
           coords: ring,
           country_code: props.country_code || '',
           address_label: props.address_label || props.name || '',
+          stride: stride,
         });
       } else {
         clearGallery();
@@ -199,10 +203,11 @@
   });
 
   socket.on('scrape_all_done', (r) => {
-    setProgress('bulk done — ' + r.count + ' panos');
+    setProgress('bulk done — ' + r.count + ' panos (stride ' + (r.stride || 1) + ')');
     renderPoints(r.points);
+    const strideTxt = (r.stride && r.stride > 1) ? ' (1 of every ' + r.stride + ' kept)' : '';
     document.getElementById('bulk-summary').textContent =
-      r.count + ' panoramas inside polygon';
+      r.count + ' panoramas after pruning' + strideTxt;
     const link = document.getElementById('bulk-csv-link');
     link.href = r.csv_url;
     link.textContent = 'download ' + r.csv_name + ' →';
