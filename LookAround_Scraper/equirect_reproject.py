@@ -53,15 +53,19 @@ def _render_top_or_bottom(face_idx, m, img, rx_w, ry_w, rz_w, out, out_h, out_w)
     cp, sp = math.cos(face_pitch), math.sin(face_pitch)
     cr, sr = math.cos(face_roll), math.sin(face_roll)
 
-    # Inverse of the geometry rotations: world_dir -> default_dir.
-    # Forward chain on the geometry (intrinsic): R_x(-pitch) · R_z(-roll).
-    # Inverse: R_z(+roll) · R_x(+pitch).
+    # Forward chain on the geometry (in lookmap.eu's adapter):
+    #     v_world = R_z(-roll) . R_x(-pitch) . S . v_default
+    # where S = diag(-1, 1, 1) comes from the .scale(-1, 1, 1) the JS calls
+    # on every face's SphereGeometry (so it can be viewed from inside).
+    # Inverse for our backward sampling:
+    #     v_default = S . R_x(+pitch) . R_z(+roll) . v_world
     rx1 = cr * rx_w - sr * ry_w
     ry1 = sr * rx_w + cr * ry_w
     rz1 = rz_w
     rx2 = rx1
     ry2 = cp * ry1 - sp * rz1
     rz2 = sp * ry1 + cp * rz1
+    rx2 = -rx2  # S = diag(-1, 1, 1)
 
     # Three.js SphereGeometry parameterization:
     #   x = -cos(phi) sin(theta), y = cos(theta), z = sin(phi) sin(theta)
@@ -91,7 +95,8 @@ def reproject_to_equirect(pano_dir: str,
                           out_w: int | None = None,
                           out_h: int | None = None,
                           out_name: str = "equirect_reproj.jpg",
-                          include_top_bottom: bool = True) -> str:
+                          include_top_bottom: bool = True,
+                          max_out_w: int = 4096) -> str:
     """
     Reproject the side (and optionally top/bottom) faces in `pano_dir` to a
     single equirectangular image written to `pano_dir/out_name`. Requires
@@ -117,11 +122,14 @@ def reproject_to_equirect(pano_dir: str,
 
     if out_w is None:
         out_w = max(im.shape[1] for im in face_imgs_sides) * 4
+    out_w = min(out_w, max_out_w)
     if out_h is None:
         out_h = out_w // 2
 
-    yaws = (np.arange(out_w, dtype=np.float64) / out_w) * 2 * math.pi - math.pi
-    pitches = math.pi / 2 - (np.arange(out_h, dtype=np.float64) / out_h) * math.pi
+    # Use float32 — at 4096x2048 the per-pixel arrays are ~33 MB each (float32)
+    # vs 67 MB (float64); at 22528x11264 they're ~1 GB vs 2 GB. Cuts memory in half.
+    yaws = (np.arange(out_w, dtype=np.float32) / out_w) * 2 * np.float32(math.pi) - np.float32(math.pi)
+    pitches = np.float32(math.pi) / 2 - (np.arange(out_h, dtype=np.float32) / out_h) * np.float32(math.pi)
     yaw_2d, pitch_2d = np.meshgrid(yaws, pitches)
     cos_p = np.cos(pitch_2d)
     rx_w = np.sin(yaw_2d) * cos_p

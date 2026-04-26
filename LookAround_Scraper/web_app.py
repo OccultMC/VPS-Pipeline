@@ -225,13 +225,17 @@ def on_make_equirect(data):
         emit("equirect_error", {"message": f"pano dir not found: {pano_id}"}, room=sid)
         return
 
+    max_out_w = int(data.get("max_out_w", 4096))
+
     def _run():
         try:
             meta_json = pano_dir / "metadata.json"
             if not meta_json.exists():
                 raise RuntimeError("metadata.json missing — re-scrape this pano")
 
-            out_path = reproject_to_equirect(str(pano_dir), out_name="equirect.jpg")
+            out_path = reproject_to_equirect(
+                str(pano_dir), out_name="equirect.jpg", max_out_w=max_out_w
+            )
             equi = Image.open(out_path)
 
             socketio.emit("equirect_done", {
