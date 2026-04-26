@@ -25,6 +25,8 @@ from flask import (
 from flask_socketio import SocketIO, emit, join_room
 
 from apple_scraper import scrape_polygon, stitch_faces
+from cylindrical_project import trim_wrap_overlap, pad_to_2to1
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -159,6 +161,93 @@ def on_scrape_polygon(data):
         except Exception as e:
             logger.exception("scrape failed")
             socketio.emit("scrape_error", {"message": str(e)}, room=sid)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+VIEWER_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>360 Viewer - {pano_id}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.css">
+<style>
+  html, body {{ margin:0; height:100%; background:#000; color:#eee; font-family:system-ui,sans-serif; }}
+  #panorama {{ height:100vh; }}
+  #info {{ position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.6); padding:8px 12px; border-radius:4px; font-size:12px; z-index:10; }}
+</style>
+</head>
+<body>
+<div id="info">pano {pano_id} — drag to pan, scroll to zoom</div>
+<div id="panorama"></div>
+<script src="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.js"></script>
+<script>
+pannellum.viewer('panorama', {{
+    type: 'equirectangular',
+    panorama: '/downloads/{pano_id}/equirect.jpg',
+    autoLoad: true,
+    showControls: true,
+    showZoomCtrl: true,
+    showFullscreenCtrl: true,
+    minPitch: -55,
+    maxPitch: 55,
+    hfov: 100,
+    minHfov: 30,
+    maxHfov: 120,
+    backgroundColor: [0, 0, 0],
+}});
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/viewer/<pano_id>")
+def viewer(pano_id: str):
+    pano_dir = DOWNLOADS_DIR / pano_id
+    if not (pano_dir / "equirect.jpg").exists():
+        return f"equirect.jpg not found for {pano_id}. Stitch + project first.", 404
+    return VIEWER_HTML.replace("{pano_id}", pano_id)
+
+
+@socketio.on("make_equirect")
+def on_make_equirect(data):
+    """Build equirect.jpg from the existing stitched.jpg + face widths."""
+    sid = data.get("session_id") or request.sid
+    pano_id = data.get("pano_id") or ""
+    if not pano_id:
+        emit("equirect_error", {"message": "missing pano_id"}, room=sid)
+        return
+
+    pano_dir = DOWNLOADS_DIR / pano_id
+    if not pano_dir.is_dir():
+        emit("equirect_error", {"message": f"pano dir not found: {pano_id}"}, room=sid)
+        return
+
+    def _run():
+        try:
+            stitched = pano_dir / "stitched.jpg"
+            right = pano_dir / "right.jpg"
+            if not stitched.exists() or not right.exists():
+                raise RuntimeError("need stitched.jpg + right.jpg first (stitch the pano)")
+
+            strip = Image.open(stitched).convert("RGB")
+            right_w = Image.open(right).width
+            trimmed = trim_wrap_overlap(strip, right_w)
+            equi = pad_to_2to1(trimmed)
+            out_path = pano_dir / "equirect.jpg"
+            equi.save(str(out_path), format="JPEG", quality=92)
+
+            socketio.emit("equirect_done", {
+                "pano_id": pano_id,
+                "equirect_url": f"/downloads/{pano_id}/equirect.jpg",
+                "viewer_url": f"/viewer/{pano_id}",
+                "width": equi.width,
+                "height": equi.height,
+            }, room=sid)
+        except Exception as e:
+            logger.exception("equirect failed")
+            socketio.emit("equirect_error", {"message": str(e)}, room=sid)
 
     threading.Thread(target=_run, daemon=True).start()
 
