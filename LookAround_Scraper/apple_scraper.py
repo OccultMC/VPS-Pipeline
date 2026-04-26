@@ -224,6 +224,7 @@ def scrape_all_in_polygon(
     polygon: List[List[float]],
     progress_cb: Optional[Callable[[str, dict], None]] = None,
     stride: int = 1,
+    dedupe_radius_m: float = 13.33,
 ) -> List[dict]:
     """
     Enumerate every Look Around panorama whose lat/lon falls inside `polygon`.
@@ -299,7 +300,70 @@ def scrape_all_in_polygon(
             pruned.extend(recs[::stride])
         out_records = pruned
 
+    if dedupe_radius_m > 0 and out_records:
+        before = len(out_records)
+        out_records = _fuzzy_dedupe(out_records, radius_m=dedupe_radius_m)
+        _emit("progress", {
+            "step": "dedupe",
+            "before": before,
+            "after": len(out_records),
+            "radius_m": dedupe_radius_m,
+        })
+
     return out_records
+
+
+def _fuzzy_dedupe(records: List[dict], radius_m: float = 13.33) -> List[dict]:
+    """
+    Drop panos that fall within `radius_m` of an already-kept pano.
+
+    O(N) expected via grid-bucket spatial index (cell size = radius_m,
+    each insert checks the 9 surrounding cells). Lat/lon are projected
+    to a flat plane in metres centred on the median latitude — accurate
+    to <0.1% over a single bulk-scrape polygon.
+
+    Default radius = 13.33 m, i.e. 90% of the natural ~14.8 m spacing
+    between two consecutive Apple Look Around capture points. Within a
+    single drive after stride pruning, panos sit further apart than
+    this and are not affected; the dedupe primarily catches the
+    inter-drive overlap where two passes covered the same road.
+    """
+    import math as _math
+
+    if not records or radius_m <= 0:
+        return records
+
+    lats = [r["lat"] for r in records]
+    median_lat = sorted(lats)[len(lats) // 2]
+    lat_to_m = 111320.0
+    lon_to_m = 111320.0 * _math.cos(_math.radians(median_lat))
+    cell = radius_m
+    r2 = radius_m * radius_m
+
+    grid: Dict[Tuple[int, int], list] = {}
+    kept: List[dict] = []
+    for rec in records:
+        x = rec["lon"] * lon_to_m
+        y = rec["lat"] * lat_to_m
+        cx, cy = int(x // cell), int(y // cell)
+        too_close = False
+        for dx in (-1, 0, 1):
+            if too_close:
+                break
+            for dy in (-1, 0, 1):
+                bucket = grid.get((cx + dx, cy + dy))
+                if not bucket:
+                    continue
+                for jx, jy in bucket:
+                    if (x - jx) * (x - jx) + (y - jy) * (y - jy) < r2:
+                        too_close = True
+                        break
+                if too_close:
+                    break
+        if not too_close:
+            grid.setdefault((cx, cy), []).append((x, y))
+            kept.append(rec)
+    return kept
 
 
 def write_bulk_csv(records: List[dict], csv_path: str,

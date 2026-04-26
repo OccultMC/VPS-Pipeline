@@ -37,6 +37,8 @@
     </select>
     <label>Bulk stride (1=keep all, 3=keep every 3rd)</label>
     <input type="number" id="stride" value="3" min="1" max="20">
+    <label>Fuzzy dedupe radius (m, 0=off, 13.33=~90% of pano spacing)</label>
+    <input type="number" id="dedupe-radius" value="13.33" min="0" max="200" step="0.5">
     <label>Zoom (0=full, 7=lowest) — single-pano only</label>
     <input type="number" id="zoom" value="0" min="0" max="7">
     <div class="progress" id="progress">click a polygon to scrape one panorama</div>
@@ -140,13 +142,16 @@
         clearPoints();
         document.getElementById('bulk-wrap').style.display = 'none';
         const stride = parseInt(document.getElementById('stride').value, 10) || 1;
-        setProgress('enumerating panos (stride ' + stride + ')...');
+        const dedupe = parseFloat(document.getElementById('dedupe-radius').value) || 0;
+        setProgress('enumerating panos (stride ' + stride +
+                    ', dedupe ' + dedupe + 'm)...');
         socket.emit('scrape_polygon_all', {
           session_id: sessionId,
           coords: ring,
           country_code: props.country_code || '',
           address_label: props.address_label || props.name || '',
           stride: stride,
+          dedupe_radius_m: dedupe,
         });
       } else {
         clearGallery();
@@ -200,6 +205,7 @@
     else if (p.step === 'pano-selected') setProgress('pano ' + p.pano_id + ' @ ' + p.lat.toFixed(5) + ',' + p.lon.toFixed(5));
     else if (p.step === 'face') setProgress('face ' + p.i + '/' + p.total + ' (' + p.name + ')...');
     else if (p.step === 'tile') setProgress('tile ' + p.i + '/' + p.total + ' — ' + p.panos_so_far + ' panos so far');
+    else if (p.step === 'dedupe') setProgress('dedupe ' + p.before + ' → ' + p.after + ' (' + p.radius_m + 'm)');
   });
 
   socket.on('scrape_all_done', (r) => {
