@@ -176,6 +176,8 @@
     pointsLayer.addTo(map);
   }
 
+  let lastShapeGeoJSON = null;
+
   document.getElementById('shape-file').addEventListener('change', async (e) => {
     const files = e.target.files;
     if (!files.length) return;
@@ -186,14 +188,49 @@
     const res = await fetch('/api/load-shapes', { method: 'POST', body: fd });
     const data = await res.json();
     if (data.error) { setProgress('shape load error: ' + data.error, 'err'); return; }
+
     if (shapesLayer) map.removeLayer(shapesLayer);
+    lastShapeGeoJSON = data.geojson;
+    const totalFeatures = (data.geojson.features || []).length;
     shapesLayer = L.geoJSON(data.geojson, {
-      style: { color: '#4ea1ff', weight: 1, fillOpacity: 0.15 },
+      style: { color: '#888', weight: 1, fillOpacity: 0.05 },  // grey while pruning
       onEachFeature: (feature, layer) => attachClickHandler(layer),
     }).addTo(map);
     map.fitBounds(shapesLayer.getBounds());
-    setProgress('loaded ' + data.filename + ' — click a polygon');
+    setProgress('loaded ' + data.filename + ' — checking coverage on ' + totalFeatures + ' shapes...');
+
+    // Fire pruning probe
+    socket.emit('prune_shapes', { session_id: sessionId, geojson: data.geojson });
   });
+
+  socket.on('prune_progress', (p) => {
+    if (p.step === 'tiles') {
+      setProgress('coverage probe: tile ' + p.done + '/' + p.total +
+                  ' (' + p.features + ' shapes)');
+    }
+  });
+
+  socket.on('prune_done', (r) => {
+    setProgress('coverage: ' + r.kept_indices.length + '/' + r.total +
+                ' shapes have Apple Look Around (' +
+                r.dropped_indices.length + ' dropped)');
+    if (!shapesLayer || !lastShapeGeoJSON) return;
+
+    const dropSet = new Set(r.dropped_indices);
+    map.removeLayer(shapesLayer);
+
+    // Rebuild layer with only the kept features.
+    const keptFC = {
+      type: 'FeatureCollection',
+      features: (lastShapeGeoJSON.features || []).filter((_, i) => !dropSet.has(i)),
+    };
+    shapesLayer = L.geoJSON(keptFC, {
+      style: { color: '#4ea1ff', weight: 1, fillOpacity: 0.15 },
+      onEachFeature: (feature, layer) => attachClickHandler(layer),
+    }).addTo(map);
+  });
+
+  socket.on('prune_error', (e) => setProgress('prune error: ' + e.message, 'err'));
 
   socket.on('progress', (p) => {
     if (p.step === 'finding-tile') setProgress('finding coverage tile...');

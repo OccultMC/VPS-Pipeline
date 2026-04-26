@@ -25,7 +25,11 @@ from flask import (
 )
 from flask_socketio import SocketIO, emit, join_room
 
-from apple_scraper import scrape_polygon, stitch_faces, scrape_all_in_polygon, write_bulk_csv
+from apple_scraper import (
+    scrape_polygon, stitch_faces,
+    scrape_all_in_polygon, write_bulk_csv,
+    check_shapes_coverage,
+)
 from cylindrical_project import trim_wrap_overlap, pad_to_2to1
 from equirect_reproject import reproject_to_equirect
 from PIL import Image
@@ -256,6 +260,34 @@ def on_make_equirect(data):
         except Exception as e:
             logger.exception("equirect failed")
             socketio.emit("equirect_error", {"message": str(e)}, room=sid)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@socketio.on("prune_shapes")
+def on_prune_shapes(data):
+    """
+    For an uploaded GeoJSON FeatureCollection, return per-feature coverage
+    flags. The UI can then drop features with no Apple Look Around coverage
+    so the user only ever sees scrap-able shapes.
+    """
+    sid = data.get("session_id") or request.sid
+    geojson = data.get("geojson") or {}
+
+    def _run():
+        def progress_cb(event, payload):
+            socketio.emit(event, payload, room=sid)
+
+        try:
+            flags = check_shapes_coverage(geojson, progress_cb=progress_cb)
+            socketio.emit("prune_done", {
+                "kept_indices": [i for i, f in enumerate(flags) if f],
+                "dropped_indices": [i for i, f in enumerate(flags) if not f],
+                "total": len(flags),
+            }, room=sid)
+        except Exception as e:
+            logger.exception("prune_shapes failed")
+            socketio.emit("prune_error", {"message": str(e)}, room=sid)
 
     threading.Thread(target=_run, daemon=True).start()
 

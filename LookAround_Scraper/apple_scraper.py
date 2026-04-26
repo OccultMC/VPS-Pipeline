@@ -1,17 +1,104 @@
 """Apple Look Around debug scraper — pure logic, no web framework."""
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
-from typing import Callable, List, Tuple, Optional
+from typing import Callable, List, Tuple, Optional, Iterable, Dict
+
+import aiohttp
 
 from streetlevel.geo import wgs84_to_tile_coord
 from streetlevel.lookaround import (
     Face,
     get_coverage_tile,
+    get_coverage_tile_async,
     get_panorama_face,
 )
 from streetlevel.lookaround.auth import Authenticator
+
+
+# ─── Coverage-tile cache + async parallel fetcher ────────────────────────────
+# Apple's z=17 coverage tile API returns ALL panos on that tile in one call.
+# Multiple polygons routinely share tiles, and the same tile gets re-queried
+# across bulk scrapes. Cache results indefinitely (per process).
+#
+# Value: list of pano dicts (already projected to the format scrape_all needs)
+# OR None if the fetch failed.
+_TILE_CACHE: Dict[Tuple[int, int], Optional[list]] = {}
+
+
+def _pano_to_dict(pano) -> dict:
+    return {
+        "panoid": str(pano.id),
+        "build_id": str(pano.build_id),
+        "lat": pano.lat,
+        "lon": pano.lon,
+        "heading_deg": float(getattr(pano, "heading", 0.0) or 0.0),
+        "capture_date": pano.date.isoformat() if getattr(pano, "date", None) else "",
+        "coverage_type": pano.coverage_type.name if pano.coverage_type else "",
+    }
+
+
+async def _fetch_tiles_async(
+    tiles: Iterable[Tuple[int, int]],
+    concurrency: int = 200,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> Dict[Tuple[int, int], Optional[list]]:
+    """
+    Fetch every tile in `tiles` in parallel (skipping cached ones), populate
+    `_TILE_CACHE`, and return a dict {(tx,ty): list_of_pano_dicts | None}.
+
+    `progress_cb(done, total)` (called from event-loop thread) reports as
+    each tile lands.
+    """
+    todo = [t for t in dict.fromkeys(tiles) if t not in _TILE_CACHE]
+    if not todo:
+        return {t: _TILE_CACHE.get(t) for t in tiles}
+
+    sem = asyncio.Semaphore(concurrency)
+    done_count = 0
+    total = len(todo)
+
+    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+    connector = aiohttp.TCPConnector(
+        limit=max(concurrency, 100),
+        limit_per_host=max(concurrency, 100),
+        ttl_dns_cache=300,
+        keepalive_timeout=30,
+    )
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+
+        async def one(tx: int, ty: int):
+            nonlocal done_count
+            async with sem:
+                try:
+                    cov = await get_coverage_tile_async(tx, ty, session)
+                    panos = [_pano_to_dict(p) for p in cov.panos]
+                    _TILE_CACHE[(tx, ty)] = panos
+                except Exception:
+                    _TILE_CACHE[(tx, ty)] = None
+            done_count += 1
+            if progress_cb:
+                try:
+                    progress_cb(done_count, total)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*[one(tx, ty) for (tx, ty) in todo])
+
+    return {t: _TILE_CACHE.get(t) for t in tiles}
+
+
+def _run_async(coro):
+    """Run an async coroutine in a fresh event loop. Safe to call from any
+    thread — used by the Flask SocketIO daemon-thread workers."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def _polygon_to_tiles(polygon: List[List[float]]) -> List[Tuple[int, int]]:
@@ -166,35 +253,38 @@ def scrape_all_in_polygon(
     seen_ids = set()
     out_records: List[dict] = []
 
-    for i, (tx, ty) in enumerate(tiles):
-        try:
-            coverage = get_coverage_tile(tx, ty)
-        except Exception:
-            coverage = None
-
-        if coverage and coverage.panos:
-            for pano in coverage.panos:
-                if pano.id in seen_ids:
-                    continue
-                if not poly.contains(Point(pano.lon, pano.lat)):
-                    continue
-                seen_ids.add(pano.id)
-                out_records.append({
-                    "panoid": str(pano.id),
-                    "build_id": str(pano.build_id),
-                    "lat": pano.lat,
-                    "lon": pano.lon,
-                    "heading_deg": float(getattr(pano, "heading", 0.0) or 0.0),
-                    "capture_date": pano.date.isoformat() if getattr(pano, "date", None) else "",
-                    "coverage_type": pano.coverage_type.name if pano.coverage_type else "",
-                })
-
+    # Fetch all covering tiles in parallel (cached). Streams progress as
+    # each tile lands.
+    def _tile_progress(done: int, total: int):
         _emit("progress", {
             "step": "tile",
-            "i": i + 1,
-            "total": len(tiles),
-            "panos_so_far": len(out_records),
+            "i": done,
+            "total": total,
+            "panos_so_far": len(out_records),  # updated below; rough live count
         })
+
+    tile_results = _run_async(_fetch_tiles_async(tiles, concurrency=200,
+                                                 progress_cb=_tile_progress))
+
+    # Now filter every pano (sync, fast — point-in-polygon is the only work).
+    for (tx, ty), panos in tile_results.items():
+        if not panos:
+            continue
+        for pano in panos:
+            pid = pano["panoid"]
+            if pid in seen_ids:
+                continue
+            if not poly.contains(Point(pano["lon"], pano["lat"])):
+                continue
+            seen_ids.add(pid)
+            out_records.append(pano)
+
+    _emit("progress", {
+        "step": "tile",
+        "i": len(tiles),
+        "total": len(tiles),
+        "panos_so_far": len(out_records),
+    })
 
     if stride > 1 and out_records:
         # Group by build_id (one drive = one build_id). Within each drive,
@@ -210,6 +300,105 @@ def scrape_all_in_polygon(
         out_records = pruned
 
     return out_records
+
+
+def _polygon_rings_from_feature(feature: dict) -> List[List[List[float]]]:
+    """Return all outer rings of a GeoJSON feature as [[ [lon,lat], ... ], ...]."""
+    geom = feature.get("geometry") or {}
+    gtype = geom.get("type")
+    coords = geom.get("coordinates") or []
+    if gtype == "Polygon":
+        return [coords[0]] if coords else []
+    if gtype == "MultiPolygon":
+        return [poly[0] for poly in coords if poly]
+    return []
+
+
+def check_shapes_coverage(
+    geojson: dict,
+    progress_cb: Optional[Callable[[str, dict], None]] = None,
+    concurrency: int = 200,
+) -> List[bool]:
+    """
+    For a FeatureCollection, return a bool list (one per feature) indicating
+    whether the feature has at least one Apple Look Around panorama inside it.
+
+    Uses the shared coverage-tile cache, so subsequent bulk scrapes of any
+    feature in the same area pay zero network cost for the tiles it already
+    saw.
+
+    The check short-circuits per feature: as soon as one tile yields a pano
+    inside the polygon, the feature is marked True.
+    """
+    def _emit(event: str, data: dict):
+        if progress_cb:
+            progress_cb(event, data)
+
+    features = (geojson.get("features") or []) if isinstance(geojson, dict) else []
+    if not features:
+        return []
+
+    # 1) Compute the union of every feature's covering tiles.
+    feature_tiles: List[List[Tuple[int, int]]] = []
+    all_tiles: set = set()
+    for feat in features:
+        rings = _polygon_rings_from_feature(feat)
+        ts: List[Tuple[int, int]] = []
+        for ring in rings:
+            ts.extend(_polygon_to_tiles(ring))
+        # dedupe per feature
+        ts = list(dict.fromkeys(ts))
+        feature_tiles.append(ts)
+        all_tiles.update(ts)
+
+    if not all_tiles:
+        return [False] * len(features)
+
+    _emit("prune_progress", {
+        "step": "tiles",
+        "done": 0,
+        "total": len(all_tiles),
+        "features": len(features),
+    })
+
+    # 2) Fetch every unique tile once, in parallel.
+    def _tp(done: int, total: int):
+        _emit("prune_progress", {
+            "step": "tiles", "done": done, "total": total, "features": len(features),
+        })
+
+    _run_async(_fetch_tiles_async(all_tiles, concurrency=concurrency,
+                                   progress_cb=_tp))
+
+    # 3) Per feature: short-circuit point-in-polygon on its tiles' panos.
+    out: List[bool] = []
+    for fi, feat in enumerate(features):
+        rings = _polygon_rings_from_feature(feat)
+        has_coverage = False
+        for ring in rings:
+            poly = ShapelyPolygon(ring)
+            for tile in feature_tiles[fi]:
+                panos = _TILE_CACHE.get(tile)
+                if not panos:
+                    continue
+                for p in panos:
+                    if poly.contains(Point(p["lon"], p["lat"])):
+                        has_coverage = True
+                        break
+                if has_coverage:
+                    break
+            if has_coverage:
+                break
+        out.append(has_coverage)
+
+    _emit("prune_progress", {
+        "step": "done",
+        "done": len(all_tiles),
+        "total": len(all_tiles),
+        "features": len(features),
+        "kept": sum(out),
+    })
+    return out
 
 
 def write_bulk_csv(records: List[dict], csv_path: str,
