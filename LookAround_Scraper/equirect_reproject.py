@@ -53,18 +53,21 @@ def _render_top_or_bottom(face_idx, m, img, rx_w, ry_w, rz_w, out, out_h, out_w)
     cp, sp = math.cos(face_pitch), math.sin(face_pitch)
     cr, sr = math.cos(face_roll), math.sin(face_roll)
 
-    # Forward chain on the geometry: v_world = R_z(-roll) . R_x(-pitch) . default
-    # Inverse for backward sampling: v_default = R_x(+pitch) . R_z(+roll) . v_world
+    # Forward chain on the geometry: v_world = R_z(-roll) . R_x(-pitch) . S . default
+    # Inverse for backward sampling: v_default = S . R_x(+pitch) . R_z(+roll) . v_world
     #
-    # Note: lookmap.eu also calls SphereGeometry.scale(-1, 1, 1) on every
-    # face, but adding it here over-mirrored top/bottom — empirically the
-    # correct output for our equirect convention is to skip the scale.
+    # S accounts for the SphereGeometry.scale(-1,1,1) lookmap.eu applies to
+    # every face. Empirically, our equirect convention also needs the Y
+    # component negated (S = diag(-1,-1,1) = 180-degree rotation around Z),
+    # otherwise top/bottom show up mirrored across the X axis vs the sides.
     rx1 = cr * rx_w - sr * ry_w
     ry1 = sr * rx_w + cr * ry_w
     rz1 = rz_w
     rx2 = rx1
     ry2 = cp * ry1 - sp * rz1
     rz2 = sp * ry1 + cp * rz1
+    rx2 = -rx2  # S = diag(-1, -1, 1)
+    ry2 = -ry2
 
     # Three.js SphereGeometry parameterization:
     #   x = -cos(phi) sin(theta), y = cos(theta), z = sin(phi) sin(theta)
