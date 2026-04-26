@@ -39,8 +39,6 @@
       <div class="face" data-name="left">left</div>
       <div class="face" data-name="front">front</div>
       <div class="face" data-name="right">right</div>
-      <div class="face" data-name="top">top</div>
-      <div class="face" data-name="bottom">bottom</div>
     </div>
     <label>Stitch overlap (% of face width)</label>
     <input type="number" id="overlap-pct" value="3" min="0" max="50" step="0.5">
@@ -160,7 +158,7 @@
     setProgress('done — pano ' + r.pano_id);
     metaEl.innerHTML = '<b>pano:</b> ' + r.pano_id + '<br><b>lat,lon:</b> ' + r.lat.toFixed(6) + ', ' + r.lon.toFixed(6) +
       '<br><b>captured:</b> ' + r.capture_date + '<br><b>heading:</b> ' + r.heading.toFixed(3);
-    const names = ['back','left','front','right','top','bottom'];
+    const names = ['back','left','front','right'];
     r.face_urls.forEach((url, i) => {
       const el = galleryFaces[names[i]];
       if (!el) return;
