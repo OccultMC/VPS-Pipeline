@@ -10,6 +10,7 @@ Key optimizations:
 6. Parallel GCS uploads using ThreadPoolExecutor
 """
 import asyncio
+import random
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 from aiohttp import ClientTimeout  # used for session-level timeout
@@ -305,40 +306,151 @@ def _stitch_and_process_tiles(
     return result
 
 
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+BLACK_TILE_BYTE_SIZE = 1184
+
+# Sentinel: tile fetch returned google's 1184-byte placeholder ("black tile")
+# even after retries. Caller treats this as fatal for the pano rather than
+# silently stitching with a hole.
+BLACK_TILE = object()
+
+
 async def fetch_tile(
     session: aiohttp.ClientSession,
     panoid: str,
     x: int,
     y: int,
     zoom_level: int,
-    retries: int = 2,
-    backoff: float = 0.15
-) -> Union[None, Tuple]:
-    """Fetch a single panorama tile with retry support."""
-    # Round-robin across 4 CDN hosts for higher aggregate connection throughput
-    host = (x + y) % 4
-    url = f"https://cbk{host}.google.com/cbk?output=tile&panoid={panoid}&zoom={zoom_level}&x={x}&y={y}"
+    retries: int = 5,
+    backoff: float = 0.3
+) -> Union[None, Tuple, object]:
+    """Fetch a single panorama tile with retry support.
+
+    Retries on transient failures: network exceptions, 5xx/429, and
+    google's 1184-byte black-tile placeholder. Honors Retry-After when
+    present. 4xx (other than 429) is terminal. If the tile is still black
+    after retries, returns BLACK_TILE so the caller can abort the whole
+    pano instead of silently stitching with a hole.
+    """
+    url = (
+        f"https://streetviewpixels-pa.googleapis.com/v1/tile"
+        f"?cb_client=maps_sv.tactile&panoid={panoid}"
+        f"&x={x}&y={y}&zoom={zoom_level}&nbt=1&fover=2"
+    )
 
     for attempt in range(1, retries + 1):
         try:
             async with session.get(url) as response:
-                if response.status != 200:
+                status = response.status
+
+                if status == 200:
+                    cl_int = int(response.headers.get("Content-Length", 0))
+                    if cl_int == BLACK_TILE_BYTE_SIZE:
+                        if attempt >= retries:
+                            return BLACK_TILE
+                        delay = backoff * (2 ** (attempt - 1)) + random.uniform(0, backoff)
+                        await asyncio.sleep(delay)
+                        continue
+                    data = await response.read()
+                    return (x, y, data)
+
+                if status not in RETRYABLE_STATUS or attempt >= retries:
                     return None
 
-                BLACK_TILE_BYTE_SIZE = 1184
-                BLACK_TILE_SIZE = int(response.headers.get("Content-Length", 0))
-
-                if BLACK_TILE_SIZE == BLACK_TILE_BYTE_SIZE:
-                    return None
-
-                data = await response.read()
-                return (x, y, data)
+                ra = response.headers.get('Retry-After')
+                try:
+                    delay = float(ra) if ra else backoff * (2 ** (attempt - 1))
+                except ValueError:
+                    delay = backoff * (2 ** (attempt - 1))
+                delay += random.uniform(0, backoff)
+                await asyncio.sleep(delay)
+                continue
 
         except Exception:
             if attempt < retries:
-                await asyncio.sleep(backoff * (2 ** (attempt - 1)))
+                delay = backoff * (2 ** (attempt - 1)) + random.uniform(0, backoff)
+                await asyncio.sleep(delay)
 
     return None
+
+
+async def fetch_thumbnail(
+    session: aiohttp.ClientSession,
+    panoid: str,
+    yaw: float,
+    pitch: float,
+    fov: float,
+    w: int,
+    h: int,
+    retries: int = 5,
+    backoff: float = 0.3,
+) -> Optional[bytes]:
+    """Fetch a single rendered view from Google's thumbnail endpoint.
+
+    Server applies the projection/FOV — no tile fetching or stitching needed.
+    thumbfov must be an integer (TYPE_INT32). Same retry policy as fetch_tile.
+    """
+    url = (
+        f"https://streetviewpixels-pa.googleapis.com/v1/thumbnail"
+        f"?panoid={panoid}&cb_client=maps_sv.tactile.gps"
+        f"&w={w}&h={h}&yaw={yaw:.2f}&pitch={pitch:.2f}&thumbfov={int(round(fov))}"
+    )
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.get(url) as response:
+                status = response.status
+                if status == 200:
+                    return await response.read()
+                if status not in RETRYABLE_STATUS or attempt >= retries:
+                    return None
+                ra = response.headers.get('Retry-After')
+                try:
+                    delay = float(ra) if ra else backoff * (2 ** (attempt - 1))
+                except ValueError:
+                    delay = backoff * (2 ** (attempt - 1))
+                delay += random.uniform(0, backoff)
+                await asyncio.sleep(delay)
+        except Exception:
+            if attempt < retries:
+                await asyncio.sleep(backoff * (2 ** (attempt - 1)) + random.uniform(0, backoff))
+    return None
+
+
+async def fetch_thumbnail_views_rgb(
+    session: aiohttp.ClientSession,
+    panoid: str,
+    num_views: int,
+    fov: float,
+    view_offset: float,
+    resolution: int,
+    heading_deg: Optional[float] = None,
+    pitch: float = 0.0,
+) -> Optional[List[np.ndarray]]:
+    """Fetch N evenly-spaced thumbnail views and decode to RGB HWC uint8.
+
+    Returns the list in view-index order, or None if any view fails to
+    fetch or decode (caller should fall back to the tile/stitch path).
+    """
+    base = (heading_deg if heading_deg is not None else 0.0) + view_offset
+    step = 360.0 / num_views
+    yaws = [(base + step * i) % 360.0 for i in range(num_views)]
+
+    tasks = [
+        fetch_thumbnail(session, panoid, yaw, pitch, fov, resolution, resolution)
+        for yaw in yaws
+    ]
+    jpeg_list = await asyncio.gather(*tasks)
+    if any(j is None for j in jpeg_list):
+        return None
+
+    arrays: List[np.ndarray] = []
+    for jpeg in jpeg_list:
+        arr = np.frombuffer(jpeg, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            return None
+        arrays.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    return arrays
 
 
 async def determine_dimensions(
@@ -417,9 +529,18 @@ async def process_panoid(
                 for y in range(tiles_y + 1)
                 if required_y is None or y in required_y
             ]
-            tiles = [tile for tile in await asyncio.gather(*tasks) if tile is not None]
+            fetch_results = await asyncio.gather(*tasks)
             t1 = _time.perf_counter()
 
+            black_count = sum(1 for r in fetch_results if r is BLACK_TILE)
+            if black_count:
+                result["error"] = (
+                    f"Black tile(s) persisted after retries: {black_count} of "
+                    f"{len(fetch_results)} positions — skipping pano"
+                )
+                return result
+
+            tiles = [r for r in fetch_results if r is not None]
             if not tiles:
                 result["error"] = "No tiles fetched"
                 return result
