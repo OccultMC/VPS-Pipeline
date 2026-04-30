@@ -110,6 +110,7 @@ from gsvpd.core_optimized import (
     determine_dimensions,
     _stitch_and_process_tiles,
     compute_required_tile_rows,
+    BLACK_TILE,
 )
 from gsvpd.constants import TILES_AXIS_COUNT, TILE_COUNT_TO_SIZE, X_COUNT_TO_SIZE
 from concurrent.futures import ThreadPoolExecutor
@@ -655,7 +656,14 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
                     for y in range(tiles_y + 1)
                     if required_y is None or y in required_y
                 ]
-                tiles = [t for t in await asyncio.gather(*tasks) if t is not None]
+                fetch_results = await asyncio.gather(*tasks)
+
+                if any(r is BLACK_TILE for r in fetch_results):
+                    stats['dl_fail'] += 1
+                    shared_state.log_failure(panoid_str, "black_tile_persisted")
+                    return
+
+                tiles = [r for r in fetch_results if r is not None]
 
                 if not tiles:
                     if attempt < retries:
@@ -709,7 +717,7 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
 async def _run_downloader(records, config, item_queue, metadata, stats, shared_state):
     from aiohttp import ClientTimeout
     sem = asyncio.Semaphore(config['max_threads'])
-    connector = aiohttp.TCPConnector(limit=600, limit_per_host=200, ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(limit=600, limit_per_host=400, ttl_dns_cache=300)
     timeout = ClientTimeout(total=15, connect=8)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
