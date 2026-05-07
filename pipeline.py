@@ -344,8 +344,23 @@ class GpuExtractor:
                     import importlib
                     megaloc_module = importlib.import_module('megaloc_model')
                     model = megaloc_module.MegaLoc()
-                    model.load_state_dict(state_dict, strict=True)
-                    print("[INIT]   Model loaded from baked weights (strict=True, all keys matched)", flush=True)
+                    try:
+                        model.load_state_dict(state_dict, strict=True)
+                        print("[INIT]   Model loaded from baked weights (strict=True, all keys matched)", flush=True)
+                    except RuntimeError as load_err:
+                        # Older baked weights use backbone.model.* prefix from a wrapper
+                        # class that no longer exists in current gmberton/MegaLoc. Strip
+                        # the `.model.` namespace level and retry strict.
+                        if any(k.startswith('backbone.model.') for k in state_dict):
+                            remapped = {
+                                (k.replace('backbone.model.', 'backbone.', 1)
+                                 if k.startswith('backbone.model.') else k): v
+                                for k, v in state_dict.items()
+                            }
+                            model.load_state_dict(remapped, strict=True)
+                            print("[INIT]   Model loaded from baked weights (remapped backbone.model.* → backbone.*)", flush=True)
+                        else:
+                            raise
                     return model
                 finally:
                     sys.path.pop(0)
