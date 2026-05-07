@@ -2,7 +2,7 @@ name: Build and Push VPS Pipeline Image
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main" ]
     paths:
       - '**'
       - '.github/workflows/docker-build.yml'
