@@ -347,20 +347,40 @@ class GpuExtractor:
                     try:
                         model.load_state_dict(state_dict, strict=True)
                         print("[INIT]   Model loaded from baked weights (strict=True, all keys matched)", flush=True)
-                    except RuntimeError as load_err:
-                        # Older baked weights use backbone.model.* prefix from a wrapper
-                        # class that no longer exists in current gmberton/MegaLoc. Strip
-                        # the `.model.` namespace level and retry strict.
-                        if any(k.startswith('backbone.model.') for k in state_dict):
-                            remapped = {
-                                (k.replace('backbone.model.', 'backbone.', 1)
-                                 if k.startswith('backbone.model.') else k): v
-                                for k, v in state_dict.items()
-                            }
-                            model.load_state_dict(remapped, strict=True)
-                            print("[INIT]   Model loaded from baked weights (remapped backbone.model.* → backbone.*)", flush=True)
-                        else:
-                            raise
+                    except RuntimeError:
+                        # Reconcile baked weights against the current architecture.
+                        # The baked safetensors was exported from an older gmberton
+                        # /MegaLoc revision with two diffs vs current:
+                        #   1. backbone wrapped in a container so keys are
+                        #      `backbone.model.*` instead of `backbone.*`
+                        #   2. extra `backbone.mask_token` from DINOv2 pretraining,
+                        #      not used at inference and absent from current arch
+                        DROPPED = {'backbone.mask_token'}
+                        cleaned = {
+                            ('backbone.' + k[len('backbone.model.'):]
+                             if k.startswith('backbone.model.') else k): v
+                            for k, v in state_dict.items()
+                            if k not in DROPPED
+                        }
+                        # strict=False so unexpected keys are ignored, but check
+                        # missing_keys ourselves — any missing key means a layer
+                        # would run with random weights → silently wrong outputs.
+                        result = model.load_state_dict(cleaned, strict=False)
+                        if result.missing_keys:
+                            raise RuntimeError(
+                                f"Baked weights incompatible after cleanup — "
+                                f"{len(result.missing_keys)} missing key(s), "
+                                f"first few: {result.missing_keys[:5]}"
+                            )
+                        n_dropped = len(state_dict) - len(cleaned)
+                        n_unexpected = len(result.unexpected_keys)
+                        print(
+                            f"[INIT]   Model loaded from baked weights "
+                            f"(remapped backbone.model.*→backbone.*, "
+                            f"dropped {n_dropped} pretraining key(s), "
+                            f"{n_unexpected} unexpected key(s) ignored)",
+                            flush=True,
+                        )
                     return model
                 finally:
                     sys.path.pop(0)
