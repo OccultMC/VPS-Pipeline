@@ -56,7 +56,9 @@ HARDCODED_CONFIG = {
     'view_pitch': 0.0,         # horizontal-only views
 
     'output_dir': None,
-    'batch_size': 32,
+    # batch_size is set dynamically by GpuExtractor._probe_max_batch_size()
+    # based on the GPU's VRAM minus model baseline minus a safety pad. The
+    # OOM auto-shrink (in _run_inference) further halves it on demand.
     'queue_size': 512,
     # Small random jitter (seconds) applied before each pano dispatch —
     # de-synchronises the 30 concurrent workers so we don't send exact
@@ -578,36 +580,71 @@ class GpuExtractor:
               f"batch_size={self.batch_size}", flush=True)
 
     def _probe_max_batch_size(self) -> int:
-        """Run a single-image inference under autocast, measure peak VRAM delta,
-        then compute the largest power-of-2 batch that fits in 75% of free VRAM."""
+        """Compute the safe batch size for this GPU.
+
+        Method:
+          1. Run a small batch (PROBE_BATCH=8) through the model under fp16
+             autocast and measure peak VRAM delta vs baseline. Probing at 8
+             instead of 1 amortizes the fixed per-batch activation overhead,
+             producing a clean per-image marginal estimate.
+          2. Bump that per-image cost by 10% (conservative pad — accounts for
+             input variance and CUDA caching-allocator overhead between runs).
+          3. Reserve a 1 GB SAFETY_PAD on top of (model + buffered activations)
+             for kernel scratch space, IPC buffers, and fragmentation.
+          4. batch = floor((total_vram - baseline - safety_pad) / per_image_buffered)
+          5. Clamp to [MIN_BATCH, MAX_BATCH] and round down to power of 2.
+
+        Empirically (RTX 3070 8GB, 100k-image stress test at bs=16):
+          baseline ~0.86 GB, per-image marginal ~94 MB → formula picks bs=32
+          which would peak at ~3.9 GB (51% of 8 GB) — safe headroom for
+          fragmentation + decode pipelining.
+        """
+        PROBE_BATCH = 8
+        SAFETY_PAD_GB = 1.0
+        CONSERVATIVE_BUFFER = 1.10  # treat each image as 10% larger than measured
+        MIN_BATCH = 8
+        MAX_BATCH = 512
+
         try:
             torch.cuda.empty_cache()
             baseline = torch.cuda.memory_allocated(0)
             torch.cuda.reset_peak_memory_stats(0)
 
-            dummy = torch.randn(1, 3, 322, 322, device=self.device)
-            dummy = (dummy - self.mean) / self.std
+            probe = torch.randn(PROBE_BATCH, 3, 322, 322, device=self.device)
+            probe = (probe - self.mean) / self.std
             with torch.no_grad():
                 with torch.autocast('cuda', dtype=torch.float16):
-                    _ = self.model(dummy)
+                    _ = self.model(probe)
             torch.cuda.synchronize()
 
             peak = torch.cuda.max_memory_allocated(0)
-            del dummy
+            del probe
             torch.cuda.empty_cache()
 
-            per_image = max(peak - baseline, 1)
-            free = torch.cuda.mem_get_info(0)[0]
-            max_batch = max(8, int(free * 0.75 / per_image))
-            max_batch = min(max_batch, 512)
+            per_image_bytes = max((peak - baseline) // PROBE_BATCH, 1)
+            per_image_buffered = int(per_image_bytes * CONSERVATIVE_BUFFER)
+
+            total_vram = torch.cuda.get_device_properties(self.device).total_memory
+            safety_pad = int(SAFETY_PAD_GB * 1024**3)
+            free_for_act = max(total_vram - baseline - safety_pad, 0)
+
+            max_batch = max(MIN_BATCH, int(free_for_act / per_image_buffered))
+            max_batch = min(max_batch, MAX_BATCH)
             max_batch = 2 ** int(math.log2(max_batch))
 
-            print(f"[INIT]   Auto batch size: {max_batch} "
-                  f"(per-image={per_image / 1e6:.1f} MB, free={free / 1e6:.0f} MB)", flush=True)
+            print(f"[INIT]   Auto batch size: {max_batch}", flush=True)
+            print(f"[INIT]     vram total={total_vram/1024**3:.1f}GB  "
+                  f"model+warmup={baseline/1024**3:.2f}GB  "
+                  f"safety_pad={SAFETY_PAD_GB:.1f}GB  "
+                  f"free_for_act={free_for_act/1024**3:.2f}GB", flush=True)
+            print(f"[INIT]     per_image={per_image_bytes/1024**2:.0f}MB measured "
+                  f"+ {int((CONSERVATIVE_BUFFER-1)*100)}% buffer "
+                  f"= {per_image_buffered/1024**2:.0f}MB used for sizing "
+                  f"(probe_batch={PROBE_BATCH})", flush=True)
             return max_batch
         except Exception as e:
-            print(f"[WARN] Batch size probe failed ({e}), defaulting to 32", flush=True)
-            return 32
+            print(f"[WARN] Batch size probe failed ({e}), defaulting to 16", flush=True)
+            return 16
 
     @staticmethod
     def _decode_item(item: ViewItem):
