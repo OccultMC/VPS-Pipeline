@@ -1,0 +1,39 @@
+# Blackwell variant — built+pushed alongside the standard image as
+# `ghcr.io/occultmc/vps-pipeline:blackwell`. The scraper picks this tag
+# whenever it spawns on a Blackwell GPU (5060/5070/5080/5090 / RTX PRO
+# 4000-6000 Blackwell). Everything else still gets `:latest` (PT 2.6/CUDA 12.4)
+# because that base is compatible with older nvidia-container-toolkit
+# stacks that 12.8 trips with "unresolvable CDI devices".
+#
+# PyTorch's CUDA 12.8 wheels are the first ones that ship native sm_120
+# kernels, so this is the minimum base that actually runs on Blackwell.
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx libglib2.0-0 curl dos2unix build-essential python3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install vastai CLI for self-destruct
+RUN pip install --no-cache-dir vastai
+
+# Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Cache MegaLoc architecture (hubconf.py + model code) — no weights downloaded
+RUN python -c "import torch; torch.hub._get_cache_or_reload('gmberton/MegaLoc', force_reload=False, trust_repo=True, calling_fn='load')"
+
+# MegaLoc model weights — downloaded from R2 by CI workflow, COPYd into image
+COPY models/megaloc/model.safetensors /app/models/megaloc/model.safetensors
+
+# Application code
+COPY pipeline.py gsv_thumbnail.py r2_storage.py redis_queue.py entrypoint.sh ./
+
+RUN dos2unix entrypoint.sh && chmod +x entrypoint.sh
+
+ENTRYPOINT ["./entrypoint.sh"]

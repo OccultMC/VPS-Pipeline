@@ -19,6 +19,20 @@ jobs:
       contents: read
       packages: write
 
+    # Two variants from the same checkout:
+    #   - default: PyTorch 2.6 / CUDA 12.4 → broad host compat, NO sm_120
+    #   - blackwell: PyTorch 2.7.1 / CUDA 12.8 → sm_120 native (5060/70/80/90,
+    #     RTX PRO 4000-6000 Blackwell). Tagged `:blackwell`. Scraper dispatches
+    #     per-offer based on GPU name.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            tag: latest
+          - dockerfile: Dockerfile.blackwell
+            tag: blackwell
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v3
@@ -36,7 +50,7 @@ jobs:
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
-          type=raw,value=latest
+          type=raw,value=${{ matrix.tag }}
 
     - name: Download MegaLoc model from R2
       env:
@@ -53,13 +67,13 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
 
-    - name: Build and push Docker image
+    - name: Build and push ${{ matrix.tag }}
       uses: docker/build-push-action@v4
       with:
         context: .
-        file: ./Dockerfile
+        file: ./${{ matrix.dockerfile }}
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+        cache-from: type=gha,scope=${{ matrix.tag }}
+        cache-to: type=gha,mode=max,scope=${{ matrix.tag }}
