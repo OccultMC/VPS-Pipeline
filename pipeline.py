@@ -40,22 +40,21 @@ os.environ["MKL_NUM_THREADS"] = "1"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 HARDCODED_CONFIG = {
-    'zoom_level': 2,
     # Lowered from 150 → 30 to stay under Google's per-IP 403 threshold.
     # Local scraper sustains 60 panos/sec @ max_threads=20 without ever
     # triggering the block; 30 is a modest bump with GPU pipelining.
     # Tunable via MAX_THREADS env var.
     'max_threads': int(os.environ.get('MAX_THREADS', '30')),
-    'workers': 8,
-    'create_directional_views': True,
-    'keep_panorama': False,
-    'view_resolution': 322,
-    'view_fov': 60.0,
-    'num_views': 8,
-    'global_view': False,
-    'augment': False,
-    'no_antialias': True,
-    'interpolation': 'cubic',
+
+    # Server-rendered thumbnail mode: 8 perspective views per pano fetched
+    # directly from streetviewpixels-pa.googleapis.com — no tile fetch, no
+    # equirect stitch, no client-side projection.
+    'view_resolution': 322,    # MegaLoc input dim (fed straight to the GPU)
+    'view_fov': 70.0,          # degrees
+    'num_views': 8,            # 360° / 8 = 45° spacing
+    'view_offset': 0.0,        # base yaw added to heading_deg (or 0 if absent)
+    'view_pitch': 0.0,         # horizontal-only views
+
     'output_dir': None,
     'batch_size': 32,
     'queue_size': 512,
@@ -66,10 +65,11 @@ HARDCODED_CONFIG = {
 }
 
 
-# Realistic Chrome headers — sent on every cbk*.google.com request. Google's
-# abuse gate is primarily IP-based but a distinctive UA (aiohttp default) is
-# one of the signals that feeds the "unusual traffic" heuristic. Matching a
-# real browser costs nothing and marginally extends per-IP runway.
+# Realistic Chrome headers — sent on every streetviewpixels-pa.googleapis.com
+# request. Google's abuse gate is primarily IP-based but a distinctive UA
+# (aiohttp default) is one of the signals that feeds the "unusual traffic"
+# heuristic. Matching a real browser costs nothing and marginally extends
+# per-IP runway.
 _BROWSER_HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -135,13 +135,8 @@ def _redis_retry(fn, *args, retries=5, delay=3, label="redis"):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import aiohttp
-from gsvpd.core_optimized import (
-    fetch_tile,
-    determine_dimensions,
-    _stitch_and_process_tiles,
-    compute_required_tile_rows,
-)
-from gsvpd.constants import TILES_AXIS_COUNT, TILE_COUNT_TO_SIZE, X_COUNT_TO_SIZE
+import random
+from gsv_thumbnail import fetch_thumbnail_view
 from concurrent.futures import ThreadPoolExecutor
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -169,6 +164,35 @@ from redis_queue import TaskQueue
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SENTINEL = None
+
+
+class _ThrottledPrinter:
+    """Print a labelled message at most once per `interval` seconds.
+
+    Used to compress log spam from per-pano failures (403, black-views,
+    decode errors) so a long-running scrape doesn't generate gigabytes of
+    duplicate stderr lines while a transient issue is happening.
+    """
+    def __init__(self, interval: float = 10.0):
+        self.interval = interval
+        self._last: Dict[str, float] = {}
+        self._dropped: Dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def maybe(self, key: str, msg: str):
+        now = time.time()
+        with self._lock:
+            last = self._last.get(key, 0.0)
+            if now - last >= self.interval:
+                dropped = self._dropped.pop(key, 0)
+                self._last[key] = now
+                suffix = f" (+{dropped} suppressed in last {self.interval:.0f}s)" if dropped else ""
+                print(msg + suffix, flush=True)
+            else:
+                self._dropped[key] = self._dropped.get(key, 0) + 1
+
+
+_throttle = _ThrottledPrinter(interval=10.0)
 
 
 class IPBlockedError(RuntimeError):
@@ -199,6 +223,14 @@ class SharedState:
         n = len(features_batch)
         if n == 0:
             return
+        # HARD alignment check. If features and metadata ever desync, every
+        # subsequent NPY row maps to the wrong panoid — this is exactly the
+        # bug that produced the corrupt indexes. Fail loud, not silent.
+        if len(metadata_batch) != n:
+            raise AssertionError(
+                f"SharedState.write_batch: features ({n}) != metadata "
+                f"({len(metadata_batch)}) — refusing to write misaligned data"
+            )
         with self.lock:
             start = self.write_idx
             end = start + n
@@ -386,36 +418,32 @@ class GpuExtractor:
                     sys.path.pop(0)
             except Exception as e:
                 errors.append(f"baked model: {e}")
-                print(f"[WARN] Baked model load failed: {e} — will try torch.hub", flush=True)
-        else:
-            errors.append("baked model.safetensors not found")
-            print("[WARN] No baked model — falling through to torch.hub", flush=True)
-
-        # ── Fallback: torch.hub get_trained_model (needs network) ──
-        for attempt in range(1, 4):
-            try:
-                print(f"[INIT]   torch.hub get_trained_model attempt {attempt}/3...", flush=True)
-                model = torch.hub.load(
-                    "gmberton/MegaLoc", "get_trained_model", trust_repo=True
+                # Hard-fail instead of falling through to torch.hub. The hub
+                # fetches whatever HuggingFace serves at the time, which can
+                # silently drift between extraction and query time and produces
+                # features in a different embedding space — corrupting search
+                # recall for any chunks indexed against a different version.
+                # Pinning to baked safetensors keeps every worker (and the
+                # server) on the same model checkpoint forever.
+                raise RuntimeError(
+                    f"Baked MegaLoc weights at {model_path} failed to load and "
+                    f"torch.hub fallback is disabled to prevent encoder drift. "
+                    f"Underlying error: {e}"
                 )
-                print("[INIT]   Model loaded via torch.hub", flush=True)
-                return model
-            except Exception as e:
-                print(f"[INIT]   torch.hub attempt {attempt} failed: {type(e).__name__}: {e}", flush=True)
-                errors.append(f"torch.hub#{attempt}: {e}")
-                if attempt < 3:
-                    time.sleep(2 ** attempt)
 
+        # No baked model present — refuse to start (would otherwise silently
+        # use torch.hub and cause encoder mismatch with previously indexed cities).
         raise RuntimeError(
-            f"All model sources failed:\n"
-            + "\n".join(f"  - {err}" for err in errors)
-            + "\n\nEnsure the Docker image bakes model.safetensors, or the "
-            + "worker has network access to github.com + huggingface.co."
+            f"No baked MegaLoc weights at {model_path}. "
+            f"Workers must use a pinned safetensors file to keep all extracted "
+            f"features in a single embedding space; torch.hub fallback was removed "
+            f"because HuggingFace can serve different weights over time. "
+            f"Bake models/megaloc/model.safetensors into the Docker image."
         )
 
     def _init_gpu(self, t0: float):
         # ── Step 1: CUDA check ──
-        print(f"[INIT] Step 1/5: Checking CUDA availability...", flush=True)
+        print(f"[INIT] Step 1/6: Checking CUDA availability...", flush=True)
         cuda_available = torch.cuda.is_available()
         if not cuda_available:
             raise RuntimeError(
@@ -432,7 +460,7 @@ class GpuExtractor:
         self.device = torch.device('cuda')
 
         # ── Step 2: Load MegaLoc model ──
-        print(f"[INIT] Step 2/5: Loading MegaLoc model...", flush=True)
+        print(f"[INIT] Step 2/6: Loading MegaLoc model...", flush=True)
         self._watchdog.start("load_model")
         dl_start = time.time()
         try:
@@ -450,7 +478,7 @@ class GpuExtractor:
 
         # ── Step 3: Move to GPU ──
         self._watchdog.start("model_to_cuda")
-        print(f"[INIT] Step 3/5: Moving model to {self.device}...", flush=True)
+        print(f"[INIT] Step 3/6: Moving model to {self.device}...", flush=True)
         move_start = time.time()
         try:
             model = _run_with_timeout(
@@ -469,11 +497,11 @@ class GpuExtractor:
         self._watchdog.start("torch_compile")
         gpu_count = torch.cuda.device_count()
         if gpu_count > 1:
-            print(f"[INIT] Step 4/5: Wrapping with DataParallel ({gpu_count} GPUs)...", flush=True)
+            print(f"[INIT] Step 4/6: Wrapping with DataParallel ({gpu_count} GPUs)...", flush=True)
             model = torch.nn.DataParallel(model)
 
         if hasattr(torch, 'compile'):
-            print(f"[INIT] Step 4/5: torch.compile()...", flush=True)
+            print(f"[INIT] Step 4/6: torch.compile()...", flush=True)
             compile_start = time.time()
             try:
                 model = _run_with_timeout(
@@ -487,11 +515,11 @@ class GpuExtractor:
             except Exception as e:
                 print(f"[WARN] torch.compile() failed: {type(e).__name__}: {e} — running without compilation", flush=True)
         else:
-            print(f"[INIT] Step 4/5: torch.compile not available (PyTorch < 2.0), skipping", flush=True)
+            print(f"[INIT] Step 4/6: torch.compile not available (PyTorch < 2.0), skipping", flush=True)
 
         # ── Step 5: Warmup inference ──
         self._watchdog.start("warmup_inference")
-        print(f"[INIT] Step 5/5: Warmup inference...", flush=True)
+        print(f"[INIT] Step 5/6: Warmup inference...", flush=True)
         warmup_start = time.time()
         try:
             dummy = torch.randn(1, 3, 322, 322, device=self.device)
@@ -543,8 +571,10 @@ class GpuExtractor:
 
         vram_used = torch.cuda.memory_allocated(0) / (1024**3)
         vram_reserved = torch.cuda.memory_reserved(0) / (1024**3)
-        print(f"[INIT] GpuExtractor ready — total init: {time.time() - t0:.1f}s, "
-              f"VRAM: {vram_used:.2f}GB used / {vram_reserved:.2f}GB reserved, "
+        # Single greppable success line — used by orchestrator + log scrapers
+        # to confirm the worker came up correctly before any chunks are claimed.
+        print(f"[INIT] MODEL READY — init={time.time() - t0:.1f}s "
+              f"vram={vram_used:.2f}/{vram_reserved:.2f}GB "
               f"batch_size={self.batch_size}", flush=True)
 
     def _probe_max_batch_size(self) -> int:
@@ -719,77 +749,90 @@ def load_csv(csv_path: str) -> Tuple[List[dict], Dict[str, Dict]]:
 # Async Downloader
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _download_single_pano(session, record, sem, executor, config, item_queue, metadata, stats, shared_state):
+async def _download_single_pano(session, record, sem, config, item_queue, metadata, stats, shared_state):
+    """Fetch all `num_views` server-rendered perspective views for one pano.
+
+    Strict-alignment policy: if any single view fails (4xx, decode error,
+    black-placeholder) after retries, the entire pano is dropped — partial
+    panos would create row-count drift between NPY and JSONL across chunks.
+
+    The async-pano-level retry covers transient network exceptions; per-view
+    HTTP retries (5xx/429 + Retry-After) live inside fetch_thumbnail_view.
+    """
     panoid_str = record['panoid']
     heading_deg = record.get('heading_deg')
-    zoom_level = config['zoom_level']
+
+    num_views = config['num_views']
+    fov = config['view_fov']
+    resolution = config['view_resolution']
+    pitch = config.get('view_pitch', 0.0)
+    offset = config.get('view_offset', 0.0)
+
+    # Yaws: evenly spaced; aligned to street heading if CSV provided one,
+    # otherwise oriented to true north.
+    base_yaw = (heading_deg if heading_deg is not None else 0.0) + offset
+    step = 360.0 / num_views
+    yaws = [(base_yaw + step * i) % 360.0 for i in range(num_views)]
 
     # Jitter each pano's start so the sem doesn't release in uniform bursts.
     jitter_max = config.get('pano_jitter_max', 0.0)
     if jitter_max > 0:
-        import random
         await asyncio.sleep(random.uniform(0, jitter_max))
 
     retries = 3
     for attempt in range(1, retries + 1):
-        # Short-circuit if the probe already flagged this IP as blocked —
+        # Short-circuit if a previous request flagged this IP as blocked —
         # no point wasting requests while the downloader is winding down.
         if stats.get('ip_blocked_403'):
             return
         try:
             async with sem:
-                tiles_x, tiles_y = TILES_AXIS_COUNT[zoom_level]
-                required_y = config.get('_required_tile_rows')
+                # Fan out N parallel thumbnail fetches. Each call handles its
+                # own 5xx/429 retry; we get back numpy RGB arrays or None.
                 tasks = [
-                    fetch_tile(session, panoid_str, x, y, zoom_level)
-                    for x in range(tiles_x + 1)
-                    for y in range(tiles_y + 1)
-                    if required_y is None or y in required_y
+                    fetch_thumbnail_view(
+                        session, panoid_str, y, pitch, fov,
+                        resolution, resolution, stats=stats,
+                    )
+                    for y in yaws
                 ]
-                tiles = [t for t in await asyncio.gather(*tasks) if t is not None]
+                view_arrays = await asyncio.gather(*tasks)
 
-                if not tiles:
+                # Re-check 403 flag — fetch_thumbnail_view sets it on any 403.
+                if stats.get('ip_blocked_403'):
+                    _throttle.maybe(
+                        'ip_blocked',
+                        f"[DL] HTTP 403 from streetviewpixels-pa — IP blocked, "
+                        f"winding down (http_403={stats.get('http_403', 0)})"
+                    )
+                    return
+
+                missing = sum(1 for v in view_arrays if v is None)
+                if missing:
                     if attempt < retries:
                         await asyncio.sleep(2 ** attempt)
                         continue
                     stats['dl_fail'] += 1
-                    stats.setdefault('fail_no_tiles', 0)
-                    stats['fail_no_tiles'] += 1
-                    if stats['fail_no_tiles'] <= 3:
-                        print(f"[DL][SAMPLE] no_tiles panoid={panoid_str} "
-                              f"tiles_tried={len(tasks)} zoom={zoom_level}", flush=True)
-                    shared_state.log_failure(panoid_str, "no_tiles")
+                    stats.setdefault('fail_partial_views', 0)
+                    stats['fail_partial_views'] += 1
+                    _throttle.maybe(
+                        'partial_views',
+                        f"[DL] partial_views panoid={panoid_str} "
+                        f"missing={missing}/{num_views} "
+                        f"(total fail_partial_views={stats['fail_partial_views']}, "
+                        f"black={stats.get('black_views', 0)})"
+                    )
+                    shared_state.log_failure(
+                        panoid_str, f"partial_views:{missing}/{num_views}"
+                    )
                     return
 
-                x_tc = len({x for x, _, _ in tiles})
-                y_tc = len({y for _, y, _ in tiles})
-                w, h = await determine_dimensions(executor, tiles, zoom_level, x_tc, y_tc)
-
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    executor, _stitch_and_process_tiles,
-                    tiles, w, h, config, panoid_str, zoom_level, heading_deg
-                )
-                del tiles
-
-                if not result['success'] or not result['views']:
-                    if attempt < retries:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    stats['dl_fail'] += 1
-                    stats.setdefault('fail_stitch', 0)
-                    stats['fail_stitch'] += 1
-                    if stats['fail_stitch'] <= 3:
-                        print(f"[DL][SAMPLE] stitch_failed panoid={panoid_str} "
-                              f"success={result.get('success')} "
-                              f"views={len(result.get('views', []))} "
-                              f"error={result.get('error', '')[:200]}", flush=True)
-                    shared_state.log_failure(panoid_str, "stitch_failed")
-                    return
-
+                # All N views good — push as ViewItems sharing the same
+                # panoid + lat/lng. SharedState.write_batch keeps memmap
+                # rows and JSONL lines aligned under a lock.
                 meta = metadata.get(panoid_str, {'lat': 0.0, 'lng': 0.0})
-                for view_data, _ in zip(result['views'], result['view_filenames']):
-                    item = ViewItem(panoid_str, view_data, meta['lat'], meta['lng'])
+                for view_arr in view_arrays:
+                    item = ViewItem(panoid_str, view_arr, meta['lat'], meta['lng'])
                     while True:
                         try:
                             item_queue.put(item, timeout=1.0)
@@ -798,8 +841,8 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
                             continue
 
                 stats['dl_ok'] += 1
-                stats['views_produced'] += len(result['views'])
-                del result
+                stats['views_produced'] += num_views
+                del view_arrays
                 return
 
         except Exception as e:
@@ -809,15 +852,16 @@ async def _download_single_pano(session, record, sem, executor, config, item_que
                 stats['dl_fail'] += 1
                 stats.setdefault('fail_exc', 0)
                 stats['fail_exc'] += 1
-                if stats['fail_exc'] <= 3:
-                    print(f"[DL][SAMPLE] exception panoid={panoid_str} "
-                          f"{type(e).__name__}: {str(e)[:200]}", flush=True)
+                _throttle.maybe(
+                    'pano_exc',
+                    f"[DL] pano exception {type(e).__name__}: {str(e)[:200]} "
+                    f"(total fail_exc={stats['fail_exc']})"
+                )
                 shared_state.log_failure(panoid_str, f"exception: {e}")
 
 async def _run_downloader(records, config, item_queue, metadata, stats, shared_state):
     from aiohttp import ClientTimeout
-    print(f"[DL] _run_downloader entered (records={len(records)}, "
-          f"max_threads={config.get('max_threads')}, workers={config.get('workers')})",
+    print(f"[DL] entered records={len(records)} max_threads={config.get('max_threads')}",
           flush=True)
     sem = asyncio.Semaphore(config['max_threads'])
     timeout = ClientTimeout(total=15, connect=8)
@@ -825,7 +869,9 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
     # TCPConnector is created INSIDE the running event loop to avoid
     # "Timeout context manager should be used inside a task" / loop-binding issues
     # when aiohttp binds resources to a different loop than ClientSession.
-    connector = aiohttp.TCPConnector(limit=600, limit_per_host=200, ttl_dns_cache=300)
+    # Single host (streetviewpixels-pa.googleapis.com) so per-host budget
+    # gets the lion's share of the global connection cap.
+    connector = aiohttp.TCPConnector(limit=600, limit_per_host=400, ttl_dns_cache=300)
 
     try:
         # Browser-like headers + shared cookie jar for the whole session.
@@ -856,14 +902,21 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
                       f"{type(e).__name__}: {e} — continuing without cookies",
                       flush=True)
 
-            # ── Connectivity probe: fetch 1 tile from the first real pano ──
+            # ── Connectivity probe: fetch 1 thumbnail from the first real pano ──
             if records:
                 probe_pid = records[0].get('panoid', '')
-                probe_url = f"https://cbk0.google.com/cbk?output=tile&panoid={probe_pid}&zoom=2&x=0&y=0"
+                probe_resolution = config.get('view_resolution', 322)
+                probe_fov = int(round(config.get('view_fov', 70.0)))
+                probe_url = (
+                    f"https://streetviewpixels-pa.googleapis.com/v1/thumbnail"
+                    f"?panoid={probe_pid}&cb_client=maps_sv.tactile.gps"
+                    f"&w={probe_resolution}&h={probe_resolution}"
+                    f"&yaw=0.00&pitch=0.00&thumbfov={probe_fov}"
+                )
                 try:
                     async with session.get(probe_url) as r:
                         body = await r.read()
-                        print(f"[DL][PROBE] GET {probe_url} → "
+                        print(f"[DL][PROBE] GET thumbnail panoid={probe_pid} → "
                               f"status={r.status} len={len(body)} "
                               f"ct={r.headers.get('Content-Type','')} "
                               f"cl={r.headers.get('Content-Length','')}",
@@ -877,7 +930,7 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
                             print(f"[DL][PROBE] IP appears 403-blocked by Google. "
                                   f"Will unclaim chunk + self-destruct.", flush=True)
                 except Exception as e:
-                    print(f"[DL][PROBE] GET {probe_url} FAILED: "
+                    print(f"[DL][PROBE] GET thumbnail FAILED: "
                           f"{type(e).__name__}: {e}", flush=True)
                     stats['probe_status'] = -1
 
@@ -916,32 +969,31 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
 
             reprobe_task = asyncio.create_task(_reprobe_loop())
 
-            with ThreadPoolExecutor(max_workers=config['workers']) as executor:
-                CHUNK = 5000
-                for i in range(0, len(records), CHUNK):
-                    if stats.get('ip_blocked_403'):
-                        print("[DL] Mid-chunk 403 — skipping remaining panos.",
-                              flush=True)
-                        break
-                    chunk = records[i:i + CHUNK]
-                    print(f"[DL] Dispatching {len(chunk)} pano tasks "
-                          f"(offset={i}/{len(records)})", flush=True)
-                    tasks = [
-                        _download_single_pano(session, rec, sem, executor, config,
-                                              item_queue, metadata, stats, shared_state)
-                        for rec in chunk
-                    ]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    # Surface any per-task exceptions that would otherwise be silent
-                    exc_counts = {}
-                    for r in results:
-                        if isinstance(r, BaseException):
-                            k = type(r).__name__
-                            exc_counts[k] = exc_counts.get(k, 0) + 1
-                    if exc_counts:
-                        print(f"[DL] Silent per-task exceptions: {exc_counts} "
-                              f"(dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']})",
-                              flush=True)
+            CHUNK = 5000
+            for i in range(0, len(records), CHUNK):
+                if stats.get('ip_blocked_403'):
+                    print("[DL] Mid-chunk 403 — skipping remaining panos.",
+                          flush=True)
+                    break
+                chunk = records[i:i + CHUNK]
+                print(f"[DL] Dispatching {len(chunk)} pano tasks "
+                      f"(offset={i}/{len(records)})", flush=True)
+                tasks = [
+                    _download_single_pano(session, rec, sem, config,
+                                          item_queue, metadata, stats, shared_state)
+                    for rec in chunk
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # Surface any per-task exceptions that would otherwise be silent
+                exc_counts = {}
+                for r in results:
+                    if isinstance(r, BaseException):
+                        k = type(r).__name__
+                        exc_counts[k] = exc_counts.get(k, 0) + 1
+                if exc_counts:
+                    print(f"[DL] Silent per-task exceptions: {exc_counts} "
+                          f"(dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']})",
+                          flush=True)
 
             reprobe_task.cancel()
             try:
@@ -951,12 +1003,12 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
     finally:
         item_queue.put(_SENTINEL)
         stats['dl_done'] = True
-        print(f"[DL] _run_downloader exiting "
-              f"(dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']}, "
-              f"views_produced={stats['views_produced']}, "
-              f"fail_no_tiles={stats.get('fail_no_tiles', 0)}, "
-              f"fail_stitch={stats.get('fail_stitch', 0)}, "
-              f"fail_exc={stats.get('fail_exc', 0)})", flush=True)
+        print(f"[DL] exit dl_ok={stats['dl_ok']} dl_fail={stats['dl_fail']} "
+              f"views={stats['views_produced']} "
+              f"partial={stats.get('fail_partial_views', 0)} "
+              f"black={stats.get('black_views', 0)} "
+              f"http403={stats.get('http_403', 0)} "
+              f"exc={stats.get('fail_exc', 0)}", flush=True)
 
 
 def downloader_thread(records, config, item_queue, metadata, stats, shared_state):
@@ -983,10 +1035,27 @@ def get_free_gb(path: str = '/') -> float:
     usage = shutil.disk_usage(path)
     return usage.free / (1024 ** 3)
 
-def wait_for_disk_space(path: str = '/', min_gb: float = MIN_FREE_GB):
+def wait_for_disk_space(path: str = '/', min_gb: float = MIN_FREE_GB,
+                        max_wait_sec: int = 600):
+    """Block until min_gb is free, or raise after max_wait_sec.
+
+    Bounded so a stuck cleanup or runaway log file can't hang a worker
+    forever during a multi-day scrape — the outer chunk handler treats the
+    raise as a fail_task, which lets another worker retry the chunk.
+    """
+    waited = 0
+    poll = 60
     while get_free_gb(path) < min_gb:
-        print(f"[WARN] Only {get_free_gb(path):.1f}GB free, waiting for space (need {min_gb}GB)...")
-        time.sleep(60)
+        if waited >= max_wait_sec:
+            raise RuntimeError(
+                f"Disk-space wait exceeded {max_wait_sec}s "
+                f"({get_free_gb(path):.1f}GB free, need {min_gb}GB at {path}). "
+                f"Aborting chunk so it can be retried elsewhere."
+            )
+        print(f"[WARN] Only {get_free_gb(path):.1f}GB free, waiting for space "
+              f"(need {min_gb}GB, waited {waited}s/{max_wait_sec}s)...")
+        time.sleep(poll)
+        waited += poll
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1216,10 +1285,9 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
     shared_state = SharedState(features_memmap, metadata_file, failed_file, start_idx=0)
 
     # ── Step 4: Download + extract ──
+    # Thumbnail mode: no tile-row pre-computation needed (server renders
+    # the perspective view directly from yaw/pitch/fov).
     dl_config = dict(HARDCODED_CONFIG)
-    dl_config['_required_tile_rows'] = compute_required_tile_rows(
-        dl_config['zoom_level'], dl_config['view_fov'], dl_config['augment']
-    )
 
     item_queue = queue.Queue(maxsize=dl_config['queue_size'])
     stats = {'dl_ok': 0, 'dl_fail': 0, 'ext_ok': 0, 'views_produced': 0, 'dl_done': False}
@@ -1407,10 +1475,18 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
     return features_file, metadata_file, local_csv
 
 
-def _cleanup_chunk_files(work_dir: Path, chunk_id: str, local_csv: str = None):
-    """Delete local files for a processed chunk to free disk space."""
-    city = CITY_NAME
-    out_base = _output_base(city, chunk_id)
+def _cleanup_chunk_files(work_dir: Path, chunk_id: str, local_csv: str = None,
+                         out_base: str = None):
+    """Delete local files for a processed chunk to free disk space.
+
+    `out_base` should be passed by callers that hold the upload-thread
+    snapshot, to avoid reading the mutable global CITY_NAME / TOTAL_CHUNKS
+    from a different city's iteration (batch-mode race).
+    """
+    if out_base is None:
+        # Fall back to globals for legacy/main-thread callers (single-city
+        # only — batch-mode callers MUST pass out_base explicitly).
+        out_base = _output_base(CITY_NAME, chunk_id)
     for f in [
         str(work_dir / f"{out_base}.npy"),
         str(work_dir / f"Metadata_{out_base}.jsonl"),
@@ -1432,13 +1508,16 @@ def _cleanup_chunk_files(work_dir: Path, chunk_id: str, local_csv: str = None):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def upload_chunk_files(r2, chunk_id: str, features_file: str, metadata_file: str,
-                       local_csv: str, work_dir: Path):
-    """Upload NPY + metadata to R2 in parallel, then cleanup local files."""
-    city = CITY_NAME
-    out_base = _output_base(city, chunk_id)
-    npy_key = f"{FEATURES_BUCKET_PREFIX}/{out_base}.npy"
-    meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{out_base}.jsonl"
+                       local_csv: str, work_dir: Path,
+                       npy_key: str, meta_key: str, out_base: str):
+    """Upload NPY + metadata to R2 in parallel, then cleanup local files.
 
+    The destination keys are computed by the caller (main thread) so that
+    the background upload thread doesn't read mutable globals
+    (CITY_NAME / FEATURES_BUCKET_PREFIX / TOTAL_CHUNKS) — which the next
+    chunk's claim could overwrite mid-upload in batch mode and silently
+    misroute the file to another city's prefix.
+    """
     errors = []
 
     def _upload_npy():
@@ -1461,15 +1540,16 @@ def upload_chunk_files(r2, chunk_id: str, features_file: str, metadata_file: str
     if errors:
         raise RuntimeError("; ".join(errors))
 
-    _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+    _cleanup_chunk_files(work_dir, chunk_id, local_csv, out_base=out_base)
     print(f"[CHUNK {chunk_id}] Upload + cleanup complete")
 
 
 def _do_background_upload(error_ref, r2, chunk_id, features_file, metadata_file,
-                          local_csv, work_dir):
+                          local_csv, work_dir, npy_key, meta_key, out_base):
     """Thread target: upload chunk files and store any error in error_ref[0]."""
     try:
-        upload_chunk_files(r2, chunk_id, features_file, metadata_file, local_csv, work_dir)
+        upload_chunk_files(r2, chunk_id, features_file, metadata_file, local_csv,
+                           work_dir, npy_key, meta_key, out_base)
     except Exception as e:
         error_ref[0] = e
 
@@ -1883,13 +1963,22 @@ def main():
             else:
                 features_file, metadata_file, local_csv = result
 
-                # Launch background upload (parallel NPY + metadata)
-                # chunk_id = local file ID for naming; _redis_cid tracked in pending_upload
+                # Launch background upload (parallel NPY + metadata).
+                # IMPORTANT: snapshot CITY_NAME / FEATURES_BUCKET_PREFIX /
+                # TOTAL_CHUNKS into the args HERE on the main thread, before
+                # the next loop iteration potentially overwrites them in
+                # batch mode. Reading them inside the upload thread risked
+                # uploading this chunk's bytes to the next chunk's city
+                # prefix (silent cross-city contamination).
+                _ul_out_base = _output_base(CITY_NAME, chunk_id)
+                _ul_npy_key = f"{FEATURES_BUCKET_PREFIX}/{_ul_out_base}.npy"
+                _ul_meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{_ul_out_base}.jsonl"
                 err_ref = [None]
                 ul_thread = threading.Thread(
                     target=_do_background_upload,
                     args=(err_ref, r2, chunk_id, features_file, metadata_file,
-                          local_csv, work_dir),
+                          local_csv, work_dir,
+                          _ul_npy_key, _ul_meta_key, _ul_out_base),
                     daemon=True,
                 )
                 ul_thread.start()

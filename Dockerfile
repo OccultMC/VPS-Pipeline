@@ -23,8 +23,7 @@ RUN python -c "import torch; torch.hub._get_cache_or_reload('gmberton/MegaLoc', 
 COPY models/megaloc/model.safetensors /app/models/megaloc/model.safetensors
 
 # Application code
-COPY pipeline.py r2_storage.py redis_queue.py entrypoint.sh ./
-COPY gsvpd/ ./gsvpd/
+COPY pipeline.py gsv_thumbnail.py r2_storage.py redis_queue.py entrypoint.sh ./
 
 RUN dos2unix entrypoint.sh && chmod +x entrypoint.sh
 
