@@ -11,7 +11,11 @@ import asyncio
 import random
 from typing import Optional
 
-import aiohttp
+# Uses curl_cffi instead of aiohttp so the TLS + HTTP/2/3 fingerprint matches
+# real Chrome — Google's streetviewpixels abuse gate inspects the handshake
+# (JA3/JA4) and HTTP/2 SETTINGS frame, not just headers. Vanilla aiohttp gets
+# 403 PERMISSION_DENIED at scale even with a Chrome User-Agent.
+from curl_cffi.requests import AsyncSession
 import cv2
 import numpy as np
 
@@ -32,7 +36,7 @@ BLACK_THUMB_STD = 5.0
 
 
 async def fetch_thumbnail_view(
-    session: aiohttp.ClientSession,
+    session: AsyncSession,
     panoid: str,
     yaw: float,
     pitch: float,
@@ -63,53 +67,55 @@ async def fetch_thumbnail_view(
     )
     for attempt in range(1, retries + 1):
         try:
-            async with session.get(url) as response:
-                status = response.status
+            # curl_cffi's await session.get() returns the fully-loaded Response.
+            # No context manager; response.content is already bytes (no await).
+            response = await session.get(url, timeout=15)
+            status = response.status_code
 
-                if status == 200:
-                    data = await response.read()
-                    arr_bgr = cv2.imdecode(
-                        np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR
-                    )
-                    if arr_bgr is None:
-                        if stats is not None:
-                            stats['decode_fail'] = stats.get('decode_fail', 0) + 1
-                        return None
-
-                    # "No imagery here" placeholder: solid black JPEG.
-                    # Detected via low mean AND low std so legitimate dark
-                    # scenes (night, tunnels) with any texture still pass.
-                    if (arr_bgr.mean() < BLACK_THUMB_MEAN
-                            and arr_bgr.std() < BLACK_THUMB_STD):
-                        if stats is not None:
-                            stats['black_views'] = stats.get('black_views', 0) + 1
-                        return None
-
-                    return cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2RGB)
-
-                if status == 403:
-                    # Persistent IP-block signal. Flag once; the outer
-                    # downloader loop short-circuits remaining requests and
-                    # the worker self-destructs instead of poisoning the
-                    # queue with half-extracted features.
+            if status == 200:
+                data = response.content
+                arr_bgr = cv2.imdecode(
+                    np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR
+                )
+                if arr_bgr is None:
                     if stats is not None:
-                        stats['ip_blocked_403'] = True
-                        stats['http_403'] = stats.get('http_403', 0) + 1
+                        stats['decode_fail'] = stats.get('decode_fail', 0) + 1
                     return None
 
-                if status not in THUMB_RETRYABLE_STATUS or attempt >= retries:
+                # "No imagery here" placeholder: solid black JPEG.
+                # Detected via low mean AND low std so legitimate dark
+                # scenes (night, tunnels) with any texture still pass.
+                if (arr_bgr.mean() < BLACK_THUMB_MEAN
+                        and arr_bgr.std() < BLACK_THUMB_STD):
                     if stats is not None:
-                        stats[f'http_{status}'] = stats.get(f'http_{status}', 0) + 1
+                        stats['black_views'] = stats.get('black_views', 0) + 1
                     return None
 
-                # Retryable: respect Retry-After if present, else jittered backoff.
-                ra = response.headers.get('Retry-After')
-                try:
-                    delay = float(ra) if ra else backoff * (2 ** (attempt - 1))
-                except ValueError:
-                    delay = backoff * (2 ** (attempt - 1))
-                delay += random.uniform(0, backoff)
-                await asyncio.sleep(delay)
+                return cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2RGB)
+
+            if status == 403:
+                # Persistent IP-block signal. Flag once; the outer
+                # downloader loop short-circuits remaining requests and
+                # the worker self-destructs instead of poisoning the
+                # queue with half-extracted features.
+                if stats is not None:
+                    stats['ip_blocked_403'] = True
+                    stats['http_403'] = stats.get('http_403', 0) + 1
+                return None
+
+            if status not in THUMB_RETRYABLE_STATUS or attempt >= retries:
+                if stats is not None:
+                    stats[f'http_{status}'] = stats.get(f'http_{status}', 0) + 1
+                return None
+
+            # Retryable: respect Retry-After if present, else jittered backoff.
+            ra = response.headers.get('retry-after')
+            try:
+                delay = float(ra) if ra else backoff * (2 ** (attempt - 1))
+            except ValueError:
+                delay = backoff * (2 ** (attempt - 1))
+            delay += random.uniform(0, backoff)
+            await asyncio.sleep(delay)
 
         except Exception:
             if attempt < retries:

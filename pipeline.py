@@ -67,27 +67,13 @@ HARDCODED_CONFIG = {
 }
 
 
-# Realistic Chrome headers — sent on every streetviewpixels-pa.googleapis.com
-# request. Google's abuse gate is primarily IP-based but a distinctive UA
-# (aiohttp default) is one of the signals that feeds the "unusual traffic"
-# heuristic. Matching a real browser costs nothing and marginally extends
-# per-IP runway.
-_BROWSER_HEADERS = {
-    'User-Agent': (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-        '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-    ),
-    'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Referer': 'https://www.google.com/maps/',
-    'Sec-Fetch-Dest': 'image',
-    'Sec-Fetch-Mode': 'no-cors',
-    'Sec-Fetch-Site': 'same-site',
-    'Sec-Ch-Ua': '"Chromium";v="131", "Not_A Brand";v="24"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-}
+# Network signature is now handled entirely by curl_cffi's `impersonate`
+# flag at AsyncSession-creation time below — it sets a Chrome-identical TLS
+# fingerprint (JA3/JA4), HTTP/2/3 negotiation, full Sec-Ch-Ua header set, and
+# Accept-Encoding incl. brotli. The old _BROWSER_HEADERS dict only spoofed
+# User-Agent + a few headers and was still flagged by Google's abuse gate
+# under load because the TLS handshake gave aiohttp away. No explicit headers
+# block needed here anymore.
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Environment Variables
@@ -136,7 +122,7 @@ def _redis_retry(fn, *args, retries=5, delay=3, label="redis"):
 # Imports: Street View Downloader
 # ═══════════════════════════════════════════════════════════════════════════════
 
-import aiohttp
+from curl_cffi.requests import AsyncSession
 import random
 from gsv_thumbnail import fetch_thumbnail_view
 from concurrent.futures import ThreadPoolExecutor
@@ -331,7 +317,20 @@ def _run_with_timeout(fn, timeout_sec: int, stage: str):
 
 
 class GpuExtractor:
-    def __init__(self):
+    def __init__(self, gpu_id: int = 0, pool_mode: bool = False):
+        """
+        Args:
+            gpu_id: cuda device index this extractor binds to.
+                Used by the multi-GPU pool path so each child process
+                pins to one specific GPU. Single-GPU path leaves this 0.
+            pool_mode: when True, skip nn.DataParallel wrap. The pool spawns
+                one extractor per device, so DataParallel would actively
+                make things worse (round-trips through cuda:0). When False
+                (legacy single-process path), the old DataParallel behavior
+                is preserved for backwards compatibility.
+        """
+        self.gpu_id = gpu_id
+        self._pool_mode = pool_mode
         t0 = time.time()
         self._watchdog = _InitWatchdog(GPU_INIT_TIMEOUT * 2 + 120, "gpu_init_overall")
         self._watchdog.start()
@@ -452,14 +451,24 @@ class GpuExtractor:
                 "CUDA is not available! Check nvidia-smi, CUDA drivers, and container GPU passthrough. "
                 "torch.cuda.is_available() returned False."
             )
-        gpu_name = torch.cuda.get_device_name(0)
-        props = torch.cuda.get_device_properties(0)
+        # Pin to the assigned GPU so torch.cuda.* defaults to it.
+        # Multi-GPU pool path passes gpu_id != 0; single-GPU path leaves
+        # gpu_id=0 and behaviour matches the previous code exactly.
+        try:
+            torch.cuda.set_device(self.gpu_id)
+        except Exception as e:
+            raise RuntimeError(
+                f"torch.cuda.set_device({self.gpu_id}) failed: {e}"
+            )
+        gpu_name = torch.cuda.get_device_name(self.gpu_id)
+        props = torch.cuda.get_device_properties(self.gpu_id)
         gpu_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0)) / (1024**3)
-        print(f"[INIT]   CUDA OK — GPU: {gpu_name}, VRAM: {gpu_mem:.1f}GB", flush=True)
+        print(f"[INIT]   CUDA OK — cuda:{self.gpu_id} {gpu_name}, "
+              f"VRAM: {gpu_mem:.1f}GB", flush=True)
         print(f"[INIT]   CUDA version: {torch.version.cuda}, PyTorch: {torch.__version__}", flush=True)
 
         torch.set_float32_matmul_precision('high')
-        self.device = torch.device('cuda')
+        self.device = torch.device(f'cuda:{self.gpu_id}')
 
         # ── Step 2: Load MegaLoc model ──
         print(f"[INIT] Step 2/6: Loading MegaLoc model...", flush=True)
@@ -498,9 +507,18 @@ class GpuExtractor:
         # ── Step 4: DataParallel / compile ──
         self._watchdog.start("torch_compile")
         gpu_count = torch.cuda.device_count()
-        if gpu_count > 1:
-            print(f"[INIT] Step 4/6: Wrapping with DataParallel ({gpu_count} GPUs)...", flush=True)
+        # In pool_mode the orchestrator spawns one process per GPU; each
+        # process must NOT DataParallel-wrap (it would scatter through
+        # cuda:0 and undo the partitioning). Legacy single-process path
+        # keeps DataParallel for backwards compatibility on multi-GPU
+        # machines that fall back to the legacy code path.
+        if gpu_count > 1 and not self._pool_mode:
+            print(f"[INIT] Step 4/6: Wrapping with DataParallel ({gpu_count} GPUs, "
+                  f"legacy single-process path)...", flush=True)
             model = torch.nn.DataParallel(model)
+        elif self._pool_mode:
+            print(f"[INIT] Step 4/6: pool_mode — DataParallel skipped "
+                  f"(one process per GPU)", flush=True)
 
         if hasattr(torch, 'compile'):
             print(f"[INIT] Step 4/6: torch.compile()...", flush=True)
@@ -571,8 +589,8 @@ class GpuExtractor:
         print(f"[INIT] Step 6/6: Probing optimal batch size via VRAM measurement...", flush=True)
         self.batch_size = self._probe_max_batch_size()
 
-        vram_used = torch.cuda.memory_allocated(0) / (1024**3)
-        vram_reserved = torch.cuda.memory_reserved(0) / (1024**3)
+        vram_used = torch.cuda.memory_allocated(self.gpu_id) / (1024**3)
+        vram_reserved = torch.cuda.memory_reserved(self.gpu_id) / (1024**3)
         # Single greppable success line — used by orchestrator + log scrapers
         # to confirm the worker came up correctly before any chunks are claimed.
         print(f"[INIT] MODEL READY — init={time.time() - t0:.1f}s "
@@ -607,8 +625,8 @@ class GpuExtractor:
 
         try:
             torch.cuda.empty_cache()
-            baseline = torch.cuda.memory_allocated(0)
-            torch.cuda.reset_peak_memory_stats(0)
+            baseline = torch.cuda.memory_allocated(self.gpu_id)
+            torch.cuda.reset_peak_memory_stats(self.gpu_id)
 
             probe = torch.randn(PROBE_BATCH, 3, 322, 322, device=self.device)
             probe = (probe - self.mean) / self.std
@@ -617,7 +635,7 @@ class GpuExtractor:
                     _ = self.model(probe)
             torch.cuda.synchronize()
 
-            peak = torch.cuda.max_memory_allocated(0)
+            peak = torch.cuda.max_memory_allocated(self.gpu_id)
             del probe
             torch.cuda.empty_cache()
 
@@ -897,28 +915,22 @@ async def _download_single_pano(session, record, sem, config, item_queue, metada
                 shared_state.log_failure(panoid_str, f"exception: {e}")
 
 async def _run_downloader(records, config, item_queue, metadata, stats, shared_state):
-    from aiohttp import ClientTimeout
     print(f"[DL] entered records={len(records)} max_threads={config.get('max_threads')}",
           flush=True)
     sem = asyncio.Semaphore(config['max_threads'])
-    timeout = ClientTimeout(total=15, connect=8)
-
-    # TCPConnector is created INSIDE the running event loop to avoid
-    # "Timeout context manager should be used inside a task" / loop-binding issues
-    # when aiohttp binds resources to a different loop than ClientSession.
-    # Single host (streetviewpixels-pa.googleapis.com) so per-host budget
-    # gets the lion's share of the global connection cap.
-    connector = aiohttp.TCPConnector(limit=600, limit_per_host=400, ttl_dns_cache=300)
 
     try:
-        # Browser-like headers + shared cookie jar for the whole session.
-        # The cookie jar picks up NID/CONSENT from the warmup visit below so
-        # every tile request carries the same cookie set a real browser would.
-        async with aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-            headers=_BROWSER_HEADERS,
-            cookie_jar=aiohttp.CookieJar(),
+        # curl_cffi AsyncSession with Chrome 142 impersonation: full Chrome
+        # network signature (TLS JA3/JA4, HTTP/2 + HTTP/3 + ALPN, every
+        # Sec-Ch-Ua/Sec-Fetch header, brotli-capable Accept-Encoding) plus a
+        # built-in cookie jar that survives the maps.google.com warmup visit
+        # below. max_clients caps the underlying libcurl multi-handle's pool;
+        # 400 is high enough to feed the sem semaphore-controlled fan-out
+        # without thrashing connections.
+        async with AsyncSession(
+            impersonate='chrome142',
+            max_clients=400,
+            timeout=15,
         ) as session:
 
             # ── Warmup: grab NID/CONSENT from maps.google.com before tiling ──
@@ -926,14 +938,13 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
             # cbk*. Going straight to cbk* with zero cookies is a small bot
             # tell. Cost: 1 extra GET per chunk.
             try:
-                async with session.get(
+                wr = await session.get(
                     'https://www.google.com/maps/',
                     allow_redirects=True,
-                ) as wr:
-                    _ = await wr.read()
-                    cookie_names = sorted({c.key for c in session.cookie_jar})
-                    print(f"[DL][WARMUP] google.com/maps → status={wr.status} "
-                          f"cookies={cookie_names}", flush=True)
+                )
+                cookie_names = sorted(list(session.cookies.keys()))
+                print(f"[DL][WARMUP] google.com/maps → status={wr.status_code} "
+                      f"cookies={cookie_names}", flush=True)
             except Exception as e:
                 print(f"[DL][WARMUP] maps.google.com FAILED: "
                       f"{type(e).__name__}: {e} — continuing without cookies",
@@ -951,21 +962,21 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
                     f"&yaw=0.00&pitch=0.00&thumbfov={probe_fov}"
                 )
                 try:
-                    async with session.get(probe_url) as r:
-                        body = await r.read()
-                        print(f"[DL][PROBE] GET thumbnail panoid={probe_pid} → "
-                              f"status={r.status} len={len(body)} "
-                              f"ct={r.headers.get('Content-Type','')} "
-                              f"cl={r.headers.get('Content-Length','')}",
-                              flush=True)
-                        stats['probe_status'] = r.status
-                        if r.status == 403:
-                            # Google sorry.google.com page = IP is blocked.
-                            # Flag so the outer loop can unclaim + self-destruct
-                            # instead of burning API calls and poisoning the queue.
-                            stats['ip_blocked_403'] = True
-                            print(f"[DL][PROBE] IP appears 403-blocked by Google. "
-                                  f"Will unclaim chunk + self-destruct.", flush=True)
+                    r = await session.get(probe_url)
+                    body = r.content
+                    print(f"[DL][PROBE] GET thumbnail panoid={probe_pid} → "
+                          f"status={r.status_code} len={len(body)} "
+                          f"ct={r.headers.get('content-type','')} "
+                          f"cl={r.headers.get('content-length','')}",
+                          flush=True)
+                    stats['probe_status'] = r.status_code
+                    if r.status_code == 403:
+                        # Google sorry.google.com page = IP is blocked.
+                        # Flag so the outer loop can unclaim + self-destruct
+                        # instead of burning API calls and poisoning the queue.
+                        stats['ip_blocked_403'] = True
+                        print(f"[DL][PROBE] IP appears 403-blocked by Google. "
+                              f"Will unclaim chunk + self-destruct.", flush=True)
                 except Exception as e:
                     print(f"[DL][PROBE] GET thumbnail FAILED: "
                           f"{type(e).__name__}: {e}", flush=True)
@@ -990,15 +1001,15 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
                     if stats.get('dl_done'):
                         return
                     try:
-                        async with session.get(probe_url) as rr:
-                            await rr.read()
-                            if rr.status == 403:
-                                stats['ip_blocked_403'] = True
-                                print(f"[DL][REPROBE] Mid-chunk 403 detected "
-                                      f"(dl_ok={stats['dl_ok']}, "
-                                      f"dl_fail={stats['dl_fail']}) — "
-                                      f"abandoning chunk.", flush=True)
-                                return
+                        rr = await session.get(probe_url)
+                        _ = rr.content
+                        if rr.status_code == 403:
+                            stats['ip_blocked_403'] = True
+                            print(f"[DL][REPROBE] Mid-chunk 403 detected "
+                                  f"(dl_ok={stats['dl_ok']}, "
+                                  f"dl_fail={stats['dl_fail']}) — "
+                                  f"abandoning chunk.", flush=True)
+                            return
                     except Exception as e:
                         # Transient — don't flip the flag on a single failure
                         print(f"[DL][REPROBE] transient error: "
@@ -1266,14 +1277,18 @@ def upload_with_retry(r2, local_path, bucket_key, label="FILE", max_attempts=5):
 # Process a Single Chunk
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, work_dir: Path,
-                  preloaded=None, chunks_done_so_far: int = 0, redis_chunk_id: str = None):
+def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
+                  preloaded=None, chunks_done_so_far: int = 0, redis_chunk_id: str = None,
+                  gpu_pool: 'GpuWorkerPool' = None):
     """
     Extract features for a chunk. Returns (features_file, metadata_file, local_csv)
     for async upload, or None if chunk was empty.
 
     preloaded: optional (local_csv, records, metadata_map) to skip CSV download.
     redis_chunk_id: global chunk ID for Redis ops (batch mode). Defaults to chunk_id.
+    gpu_pool: when provided (n_gpus > 1), partitions records across the pool's
+        child processes and stitches partial NPYs. When None, runs the legacy
+        single-process extraction loop. `extractor` is ignored in pool mode.
     """
     _rcid = redis_chunk_id or chunk_id
     city = CITY_NAME
@@ -1312,6 +1327,86 @@ def process_chunk(r2, tq: TaskQueue, extractor: GpuExtractor, chunk_id: str, wor
     features_file = str(work_dir / f"{out_base}.npy")
     metadata_file = str(work_dir / f"Metadata_{out_base}.jsonl")
     failed_file = str(work_dir / f"failed_{chunk_id}.jsonl")
+
+    # ── Multi-GPU fan-out path ──
+    # When a pool is provided, dispatch the chunk's records across N child
+    # processes (one per GPU). Each child runs its own downloader+extractor
+    # on its partition; parent stitches the partials into the final NPY.
+    # Single-GPU path (gpu_pool=None) falls through to the legacy loop below.
+    if gpu_pool is not None and gpu_pool.n_gpus > 1:
+        # Each child over-allocates a memmap for its partition + writes
+        # metadata/failed jsonl. Worst-case sum ≈ chunk_size_npy across all
+        # children (it's still the same panos, just split). Plus the final
+        # stitched NPY. Make sure we have headroom before dispatching.
+        wait_for_disk_space(str(work_dir), MIN_FREE_GB)
+        try:
+            tq.report_status(REGION, INSTANCE_ID, "EXTRACTING", chunk_id=_rcid,
+                             total=total_views_est)
+        except Exception:
+            pass
+        t_pool_start = time.time()
+        print(f"[CHUNK {chunk_id}] Dispatching to {gpu_pool.n_gpus}-GPU pool "
+              f"({total_records} panos)", flush=True)
+        try:
+            partials = gpu_pool.process_chunk_partitioned(
+                chunk_id, records, work_dir,
+            )
+        except Exception as e:
+            # Pool dispatch failed (worker died, timeout, etc.). Let the
+            # caller fail_task this chunk; pool itself may still be healthy
+            # enough to handle the next chunk via its surviving workers.
+            print(f"[CHUNK {chunk_id}] Pool dispatch failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+            raise
+
+        # Check for IP block reported by any worker. Same semantics as
+        # single-process path: discard partial output, raise IPBlockedError.
+        if any((p.get('stats') or {}).get('ip_blocked_403') for p in partials):
+            dl_ok = sum((p.get('stats') or {}).get('dl_ok', 0) for p in partials)
+            dl_fail = sum((p.get('stats') or {}).get('dl_fail', 0) for p in partials)
+            print(f"[ERROR] Chunk {chunk_id}: IP 403-blocked by Google in pool "
+                  f"(dl_ok={dl_ok}, dl_fail={dl_fail}). Discarding partial.",
+                  flush=True)
+            # Best-effort cleanup of partial files
+            for p in partials:
+                for k in ('partial_npy', 'partial_meta', 'partial_failed'):
+                    v = p.get(k)
+                    if v and os.path.exists(v):
+                        try:
+                            os.remove(v)
+                        except OSError:
+                            pass
+            _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+            raise IPBlockedError(
+                f"Chunk {chunk_id}: IP 403-blocked by Google. "
+                f"Partial output discarded — unclaim + self-destruct."
+            )
+
+        try:
+            final_count, agg_stats = _stitch_partials(
+                partials, features_file, metadata_file, failed_file,
+                feature_dim=feature_dim,
+            )
+        except Exception as e:
+            print(f"[CHUNK {chunk_id}] Stitch failed: {type(e).__name__}: {e}",
+                  flush=True)
+            _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+            raise
+
+        elapsed = time.time() - t_pool_start
+        speed = final_count / elapsed if elapsed > 0 else 0
+        print(f"[CHUNK {chunk_id}] Pool extraction complete: "
+              f"features={final_count} dl_ok={agg_stats['dl_ok']} "
+              f"dl_fail={agg_stats['dl_fail']} elapsed={elapsed:.1f}s "
+              f"speed={speed:.1f} views/s", flush=True)
+
+        if final_count == 0 and total_records > 0:
+            print(f"[ERROR] Chunk {chunk_id}: 0 features from {total_records} panos (pool)")
+            _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+            raise RuntimeError(f"Zero features extracted from chunk {chunk_id} (pool)")
+
+        return features_file, metadata_file, local_csv
 
     # ~270MB for 1K panos × 8 views × 8448 dim × 4 bytes
     features_memmap = np.lib.format.open_memmap(
@@ -1592,6 +1687,823 @@ def _do_background_upload(error_ref, r2, chunk_id, features_file, metadata_file,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Async Upload Manager — bounded queue with backpressure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _UploadJob:
+    """One chunk's worth of files to upload. Decouples extraction from upload."""
+    __slots__ = ('redis_chunk_id', 'chunk_id', 'features_file', 'metadata_file',
+                 'local_csv', 'work_dir', 'npy_key', 'meta_key', 'out_base',
+                 'submit_time')
+
+    def __init__(self, redis_chunk_id, chunk_id, features_file, metadata_file,
+                 local_csv, work_dir, npy_key, meta_key, out_base):
+        self.redis_chunk_id = redis_chunk_id
+        self.chunk_id = chunk_id
+        self.features_file = features_file
+        self.metadata_file = metadata_file
+        self.local_csv = local_csv
+        self.work_dir = work_dir
+        self.npy_key = npy_key
+        self.meta_key = meta_key
+        self.out_base = out_base
+        self.submit_time = time.time()
+
+
+class AsyncUploadManager:
+    """Bounded-queue uploader so extraction never blocks on a slow R2 PUT.
+
+    Producer (extractor main loop) calls submit(job). If the queue is full
+    the call blocks — that's the backpressure: when uploads can't keep up,
+    extraction pauses instead of letting local disk fill or RSS balloon.
+
+    Consumer threads pop jobs, run upload_chunk_files() (which already does
+    NPY+metadata in parallel internally), and push (redis_chunk_id, error)
+    onto a completion queue. The main loop drains completions every
+    iteration and only marks chunks done in Redis after the upload landed
+    — so a failed PUT never poisons the queue with a falsely-completed
+    chunk.
+
+    Sized for the failure modes:
+      * max_pending=5 — caps local disk pressure. Each chunk's npy is up
+        to ~270 MB; 5 outstanding = ~1.4 GB worst case, well under
+        MIN_FREE_GB on a typical 100 GB instance.
+      * num_workers=2 — each upload_chunk_files internally fires 2 PUTs
+        (NPY + metadata) in parallel, so 2 workers = ~4 concurrent PUTs.
+        More workers don't help once R2 throughput saturates.
+    """
+
+    def __init__(self, r2, max_pending: int = 5, num_workers: int = 2,
+                 on_completion=None):
+        self.r2 = r2
+        self.max_pending = max_pending
+        self._upload_q: queue.Queue = queue.Queue(maxsize=max_pending)
+        self._completion_q: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        # Total successful + failed uploads observed by this manager (lifetime).
+        # Useful for stall-detection in the main loop ("nothing finished for 5 min").
+        self._lifetime_completed = 0
+        self._lifetime_failed = 0
+        self._stats_lock = threading.Lock()
+        self._on_completion = on_completion  # optional callback(redis_cid, error)
+        self._workers = []
+        for i in range(max(1, num_workers)):
+            t = threading.Thread(target=self._worker_loop, name=f"upload-{i}",
+                                 daemon=True)
+            t.start()
+            self._workers.append(t)
+        print(f"[UPLOAD] AsyncUploadManager started: "
+              f"max_pending={max_pending}, num_workers={num_workers}", flush=True)
+
+    # ── Producer API ──
+
+    def submit(self, job: _UploadJob, timeout: float = None) -> None:
+        """Enqueue a job. Blocks (backpressure) if the queue is full.
+
+        Raises queue.Full only if timeout is set and exceeded — main loop
+        passes timeout=None so it just waits, which is the desired
+        backpressure semantics.
+        """
+        self._upload_q.put(job, timeout=timeout)
+        print(f"[UPLOAD] queued chunk={job.chunk_id} "
+              f"(pending={self._upload_q.qsize()}/{self.max_pending})", flush=True)
+
+    def pending_count(self) -> int:
+        return self._upload_q.qsize()
+
+    # ── Consumer API (main loop) ──
+
+    def drain_completions(self):
+        """Pop all available completions without blocking.
+
+        Returns a list of (redis_chunk_id, error_or_None) tuples. The main
+        loop calls this every iteration to translate finished uploads into
+        Redis complete/fail calls.
+        """
+        results = []
+        while True:
+            try:
+                results.append(self._completion_q.get_nowait())
+            except queue.Empty:
+                break
+        return results
+
+    def wait_one_completion(self, timeout: float = None):
+        """Block until at least one upload finishes. Returns all completions
+        accumulated by then (including the one we waited for)."""
+        try:
+            first = self._completion_q.get(timeout=timeout)
+        except queue.Empty:
+            return []
+        results = [first]
+        results.extend(self.drain_completions())
+        return results
+
+    def drain_all(self, log_interval: float = 30.0):
+        """Block until every queued job has been processed. Returns the
+        accumulated completions for the caller to mark done/failed in Redis.
+
+        Called at shutdown so we never leave a healthy chunk's NPY un-uploaded.
+        """
+        results = []
+        # Phase 1: wait for queue itself to empty (every get() must be paired
+        # with task_done() — see _worker_loop).
+        last_log = time.time()
+        while self._upload_q.unfinished_tasks > 0:
+            # Pull any completions that have piled up while we wait
+            results.extend(self.drain_completions())
+            if time.time() - last_log >= log_interval:
+                print(f"[UPLOAD] drain_all: still {self._upload_q.unfinished_tasks} "
+                      f"task(s) in flight", flush=True)
+                last_log = time.time()
+            time.sleep(0.5)
+        # Phase 2: collect any final completions emitted after the queue cleared.
+        # task_done() is called BEFORE we put on completion_q, so a brief drain
+        # window is enough.
+        for _ in range(20):
+            results.extend(self.drain_completions())
+            time.sleep(0.1)
+        return results
+
+    def shutdown(self, drain: bool = True, timeout: float = 600.0):
+        """Stop workers. If drain=True (default), wait for queued jobs first.
+
+        Returns any final completions so the caller can mark them in Redis.
+        """
+        final = []
+        if drain:
+            final = self.drain_all()
+        self._stop.set()
+        # Wake any worker blocked on queue.get(timeout=...)
+        for _ in self._workers:
+            try:
+                self._upload_q.put_nowait(None)
+            except queue.Full:
+                pass
+        deadline = time.time() + timeout
+        for t in self._workers:
+            remaining = max(0.5, deadline - time.time())
+            t.join(timeout=remaining)
+        return final
+
+    # ── Stats ──
+
+    def stats(self):
+        with self._stats_lock:
+            return {
+                'pending': self._upload_q.qsize(),
+                'completed': self._lifetime_completed,
+                'failed': self._lifetime_failed,
+                'max_pending': self.max_pending,
+            }
+
+    # ── Internals ──
+
+    def _worker_loop(self):
+        while not self._stop.is_set():
+            try:
+                job = self._upload_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if job is None:
+                # Sentinel — wake up and exit. task_done so drain_all() unblocks.
+                self._upload_q.task_done()
+                break
+            err = None
+            t_start = time.time()
+            try:
+                upload_chunk_files(
+                    self.r2, job.chunk_id, job.features_file, job.metadata_file,
+                    job.local_csv, job.work_dir,
+                    job.npy_key, job.meta_key, job.out_base,
+                )
+            except Exception as e:
+                err = e
+                import traceback
+                print(f"[UPLOAD] FAILED chunk={job.chunk_id}: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                traceback.print_exc()
+            finally:
+                # task_done BEFORE pushing completion so drain_all sees a clean
+                # state before the main loop reads the completion. Reverse
+                # order would risk a race where drain_all returns "queue empty"
+                # but completions are still being drained one-by-one.
+                self._upload_q.task_done()
+                with self._stats_lock:
+                    if err is None:
+                        self._lifetime_completed += 1
+                    else:
+                        self._lifetime_failed += 1
+                self._completion_q.put((job.redis_chunk_id, err))
+                if err is None:
+                    print(f"[UPLOAD] done chunk={job.chunk_id} "
+                          f"({time.time() - t_start:.1f}s)", flush=True)
+                if self._on_completion:
+                    try:
+                        self._on_completion(job.redis_chunk_id, err)
+                    except Exception as cb_e:
+                        print(f"[UPLOAD] on_completion callback failed: {cb_e}",
+                              flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-GPU Worker Pool (Option C: one process per GPU)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Architecture:
+#   * Parent process: claims chunks, downloads+parses CSV, partitions records,
+#     dispatches to per-GPU child workers, merges partial NPYs back into the
+#     final NPY, submits to AsyncUploadManager. Handles Redis state.
+#   * Child process (one per GPU): owns a long-lived GpuExtractor pinned to
+#     cuda:gpu_id. On each "PROCESS" command it spawns a downloader thread
+#     for its partition's records, extracts features, writes
+#     partial_g{N}_{chunk}.npy + partial_g{N}_meta_{chunk}.jsonl.
+#
+# Why multi-process, not multi-thread:
+#   Python GIL serialises decode + memmap writes; multi-process gets every
+#   GPU's downloader and inference loop on its own interpreter so the only
+#   shared resource is the (network-bound) Google Street View server.
+#
+# Single-GPU detection:
+#   If torch.cuda.device_count() <= 1, the pool is NOT spawned and the
+#   pipeline runs the original single-process path unchanged. The env var
+#   DISABLE_MULTI_GPU=1 forces the legacy path even on multi-GPU machines
+#   (emergency fallback for debugging).
+
+# Spawn-context multiprocessing — fork would corrupt CUDA contexts. We
+# import lazily inside the helpers so module import doesn't drag in heavy
+# state in the child process before it has a chance to pin the GPU.
+
+
+def _child_extract_partition(extractor: 'GpuExtractor', records: List[dict],
+                              partition_id: int, work_dir: Path, chunk_id: str,
+                              gpu_id: int) -> dict:
+    """Run inside a child process: download + extract one partition.
+
+    Writes per-partition NPY + metadata to disk. Returns a dict the parent
+    uses to stitch the final outputs. Never raises into the parent — the
+    caller (_gpu_worker_main) wraps this in try/except and sends ERROR
+    over the result queue.
+    """
+    result = {
+        'gpu_id': gpu_id,
+        'partition_id': partition_id,
+        'partial_npy': None,
+        'partial_meta': None,
+        'partial_failed': None,
+        'feature_count': 0,
+        'stats': {'dl_ok': 0, 'dl_fail': 0, 'ext_ok': 0,
+                  'views_produced': 0, 'dl_done': False,
+                  'ip_blocked_403': False},
+    }
+
+    if not records:
+        return result
+
+    total_records = len(records)
+    views_per_pano = HARDCODED_CONFIG['num_views']
+    total_views_est = max(1, total_records * views_per_pano)
+    feature_dim = 8448
+
+    base = f"partial_g{partition_id}_{chunk_id}"
+    partial_npy = str(work_dir / f"{base}.npy")
+    partial_meta = str(work_dir / f"{base}_meta.jsonl")
+    partial_failed = str(work_dir / f"{base}_failed.jsonl")
+
+    features_memmap = np.lib.format.open_memmap(
+        partial_npy, mode='w+', dtype='float32',
+        shape=(total_views_est, feature_dim),
+    )
+    shared_state = SharedState(features_memmap, partial_meta, partial_failed, start_idx=0)
+
+    # downloader_thread expects {panoid: row_dict}; build locally so we don't
+    # have to ship metadata_map across processes (would just be derived from
+    # records anyway).
+    metadata_map = {}
+    for r in records:
+        pid = r.get('panoid') if isinstance(r, dict) else None
+        if pid:
+            metadata_map[pid] = r
+
+    item_queue = queue.Queue(maxsize=HARDCODED_CONFIG['queue_size'])
+    stats = result['stats']
+
+    dl_thread = threading.Thread(
+        target=downloader_thread,
+        args=(records, HARDCODED_CONFIG, item_queue, metadata_map, stats, shared_state),
+        name=f"dl-g{partition_id}",
+    )
+    dl_thread.start()
+
+    pending_batch: List[ViewItem] = []
+    pending_futures = None
+    last_log = time.time()
+    started = time.time()
+
+    try:
+        while True:
+            now = time.time()
+            if now - last_log >= 30:
+                elapsed = now - started
+                spd = stats['ext_ok'] / elapsed if elapsed > 0 else 0
+                # Per-worker progress line. Parent aggregates these into the
+                # overall PROGRESS line consumed by the orchestrator.
+                print(f"[GPU-{gpu_id}/{chunk_id}] views={stats['ext_ok']:,} "
+                      f"speed={spd:.1f}/s dl_ok={stats['dl_ok']} "
+                      f"dl_fail={stats['dl_fail']} queue={item_queue.qsize()}",
+                      flush=True)
+                last_log = now
+
+            current_batch: List[ViewItem] = []
+            while len(current_batch) < extractor.batch_size:
+                try:
+                    item = item_queue.get(timeout=0.01)
+                    if item is _SENTINEL:
+                        continue
+                    current_batch.append(item)
+                except queue.Empty:
+                    break
+
+            if not current_batch:
+                if pending_batch and pending_futures is not None:
+                    try:
+                        feats_np, meta_batch, _ = extractor.infer_prefetched(
+                            pending_batch, pending_futures)
+                        if feats_np is not None and len(meta_batch) > 0:
+                            shared_state.write_batch(feats_np, meta_batch)
+                            stats['ext_ok'] += len(meta_batch)
+                            del feats_np, meta_batch
+                    except Exception as e:
+                        print(f"[GPU-{gpu_id}] drain batch fail: "
+                              f"{type(e).__name__}: {e}", flush=True)
+                    finally:
+                        pending_batch, pending_futures = [], None
+                if not dl_thread.is_alive():
+                    break
+                continue
+
+            current_futures = extractor.start_decode(current_batch)
+            if pending_batch and pending_futures is not None:
+                try:
+                    feats_np, meta_batch, _ = extractor.infer_prefetched(
+                        pending_batch, pending_futures)
+                    if feats_np is not None and len(meta_batch) > 0:
+                        shared_state.write_batch(feats_np, meta_batch)
+                        stats['ext_ok'] += len(meta_batch)
+                        del feats_np, meta_batch
+                except Exception as e:
+                    print(f"[GPU-{gpu_id}] batch fail: "
+                          f"{type(e).__name__}: {e}", flush=True)
+            pending_batch, pending_futures = current_batch, current_futures
+    finally:
+        # Make absolutely sure the downloader thread exits before we touch
+        # the memmap close path — otherwise it could write past write_idx
+        # while we're truncating.
+        dl_thread.join(timeout=120)
+        final_count = shared_state.write_idx
+        shared_state.close()
+        # Release memmap before parent stitches it on its side.
+        try:
+            del features_memmap
+        except Exception:
+            pass
+        gc.collect()
+
+    result['partial_npy'] = partial_npy
+    result['partial_meta'] = partial_meta
+    result['partial_failed'] = partial_failed
+    result['feature_count'] = int(final_count)
+    return result
+
+
+def _gpu_worker_main(gpu_id: int, in_q, out_q):
+    """Child-process entry point. Long-lived: serves multiple chunks until STOP.
+
+    The parent spawns one of these per GPU. We pin to cuda:gpu_id BEFORE
+    instantiating GpuExtractor so the model lands on the right device and
+    the OOM probe measures the right card.
+
+    Communication protocol:
+      Parent → child: ('PROCESS', chunk_id, records, work_dir_str, partition_id)
+                      ('STOP',)
+      Child → parent (out_q): ('READY', gpu_id)         # once at startup
+                              ('DONE', result_dict)     # per chunk
+                              ('ERROR', error_string)   # init or per-chunk failure
+    """
+    # Re-establish flush=True print behaviour in the child.
+    import sys as _sys
+    _sys.stdout.reconfigure(line_buffering=True) if hasattr(_sys.stdout, 'reconfigure') else None
+    print(f"[GPU-{gpu_id}] child started pid={os.getpid()}", flush=True)
+
+    try:
+        # Pin device early so all subsequent torch.* calls default to it.
+        torch.cuda.set_device(gpu_id)
+        extractor = GpuExtractor(gpu_id=gpu_id, pool_mode=True)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            out_q.put(('ERROR', f"gpu={gpu_id} init: {type(e).__name__}: {e}\n{tb}"))
+        except Exception:
+            pass
+        print(f"[GPU-{gpu_id}] FATAL init: {e}\n{tb}", flush=True)
+        return
+
+    try:
+        out_q.put(('READY', gpu_id))
+    except Exception as e:
+        print(f"[GPU-{gpu_id}] failed to signal READY: {e}", flush=True)
+        return
+
+    while True:
+        try:
+            msg = in_q.get()
+        except (EOFError, KeyboardInterrupt):
+            print(f"[GPU-{gpu_id}] in_q closed; exiting", flush=True)
+            break
+        if not isinstance(msg, tuple) or not msg:
+            continue
+        cmd = msg[0]
+        if cmd == 'STOP':
+            print(f"[GPU-{gpu_id}] STOP received; exiting", flush=True)
+            break
+        if cmd != 'PROCESS':
+            print(f"[GPU-{gpu_id}] unknown cmd {cmd!r}; ignoring", flush=True)
+            continue
+        try:
+            _, chunk_id, records, work_dir_str, partition_id = msg
+        except ValueError as e:
+            try:
+                out_q.put(('ERROR', f"gpu={gpu_id} malformed PROCESS msg: {e}"))
+            except Exception:
+                pass
+            continue
+        work_dir = Path(work_dir_str)
+        t_start = time.time()
+        try:
+            result = _child_extract_partition(
+                extractor, records, partition_id, work_dir, chunk_id, gpu_id,
+            )
+            result['elapsed_sec'] = time.time() - t_start
+            out_q.put(('DONE', result))
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            try:
+                out_q.put(('ERROR', f"gpu={gpu_id} chunk={chunk_id}: "
+                                    f"{type(e).__name__}: {e}\n{tb}"))
+            except Exception:
+                pass
+            print(f"[GPU-{gpu_id}] chunk {chunk_id} FAILED: {e}\n{tb}", flush=True)
+            # Don't break — try next chunk. The parent decides whether to
+            # mark the chunk failed and continue with the remaining workers.
+        finally:
+            # Aggressive cleanup between chunks: free CUDA cache, force GC.
+            # Long-running pools accumulate fragmentation otherwise.
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            gc.collect()
+
+    # Graceful cleanup on STOP.
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print(f"[GPU-{gpu_id}] child exiting", flush=True)
+
+
+class GpuWorkerPool:
+    """Long-lived multi-process GPU pool.
+
+    Lifecycle:
+      pool = GpuWorkerPool(n_gpus=4)        # spawn + wait for READY
+      partials = pool.process_chunk_partitioned(chunk_id, records, work_dir)
+      pool.shutdown()                       # send STOP, join, terminate stragglers
+
+    Failure semantics:
+      * If any worker dies during init → constructor raises after killing
+        siblings. Caller should fall back to single-GPU path.
+      * If any worker errors on a chunk → process_chunk_partitioned raises
+        RuntimeError describing which GPU(s) failed. The parent's process_chunk
+        catches and fail_task's that Redis chunk; the pool stays alive for
+        future chunks (each worker is independent).
+      * If a worker dies (process exit) mid-chunk → the parent detects
+        non-alive process while waiting on out_q and raises. The dead
+        worker is gone for the rest of the run; pool degrades gracefully
+        (we just don't dispatch to that partition next time).
+    """
+
+    INIT_TIMEOUT_SEC = 600     # 10 min for all workers to load model + probe
+    CHUNK_TIMEOUT_SEC = 7200   # 2 hours per chunk worst case
+
+    def __init__(self, n_gpus: int):
+        if n_gpus < 1:
+            raise ValueError(f"GpuWorkerPool requires n_gpus>=1 (got {n_gpus})")
+        self.n_gpus = n_gpus
+        self._alive = [False] * n_gpus  # toggled True on READY
+        import torch.multiprocessing as mp
+        self._mp = mp
+        # 'spawn' is mandatory: CUDA cannot survive os.fork().
+        try:
+            self._ctx = mp.get_context('spawn')
+        except RuntimeError:
+            # Already set somewhere upstream; that's fine.
+            self._ctx = mp.get_context()
+        self.in_qs = [self._ctx.Queue(maxsize=4) for _ in range(n_gpus)]
+        self.out_q = self._ctx.Queue()
+        self.procs = []
+        print(f"[POOL] spawning {n_gpus} GPU worker process(es)...", flush=True)
+        for i in range(n_gpus):
+            p = self._ctx.Process(
+                target=_gpu_worker_main,
+                args=(i, self.in_qs[i], self.out_q),
+                name=f"gpu-worker-{i}",
+                daemon=False,  # CUDA child cannot be daemon (CUDA forbids it)
+            )
+            p.start()
+            self.procs.append(p)
+
+        # Wait for READY from every worker. Strict — if any dies before
+        # signalling, abort the whole pool so the caller can fall back.
+        ready = 0
+        deadline = time.time() + self.INIT_TIMEOUT_SEC
+        while ready < n_gpus and time.time() < deadline:
+            # Detect early death of any worker.
+            for idx, p in enumerate(self.procs):
+                if not p.is_alive() and not self._alive[idx]:
+                    self._kill_all()
+                    raise RuntimeError(
+                        f"GPU worker {idx} (pid {p.pid}) died during init "
+                        f"with exit code {p.exitcode}"
+                    )
+            try:
+                sig, payload = self.out_q.get(timeout=15)
+            except queue.Empty:
+                continue
+            if sig == 'READY':
+                gid = int(payload)
+                if 0 <= gid < n_gpus and not self._alive[gid]:
+                    self._alive[gid] = True
+                    ready += 1
+                    print(f"[POOL] GPU {gid} ready ({ready}/{n_gpus})", flush=True)
+            elif sig == 'ERROR':
+                self._kill_all()
+                raise RuntimeError(f"GPU worker init error: {payload}")
+            else:
+                print(f"[POOL] ignored startup msg {sig!r}", flush=True)
+
+        if ready < n_gpus:
+            self._kill_all()
+            raise RuntimeError(
+                f"GpuWorkerPool init timeout: only {ready}/{n_gpus} workers "
+                f"ready after {self.INIT_TIMEOUT_SEC}s"
+            )
+        print(f"[POOL] all {n_gpus} workers ready", flush=True)
+
+    # ── Dispatch ──
+
+    def process_chunk_partitioned(self, chunk_id: str, records: List[dict],
+                                   work_dir: Path,
+                                   timeout: float = None) -> List[dict]:
+        """Partition records across alive workers and collect partial outputs.
+
+        Returns the list of partial-result dicts (one per dispatched partition).
+        Raises RuntimeError if any worker reports ERROR or dies before DONE.
+        """
+        timeout = timeout if timeout is not None else self.CHUNK_TIMEOUT_SEC
+
+        alive_indices = [i for i, ok in enumerate(self._alive)
+                         if ok and self.procs[i].is_alive()]
+        if not alive_indices:
+            raise RuntimeError("GpuWorkerPool has no alive workers")
+
+        partitions = self._partition_records(records, len(alive_indices))
+        # Send each partition; record the (gpu_index, partition_id) for collection.
+        for slot, gpu_idx in enumerate(alive_indices):
+            part = partitions[slot]
+            self.in_qs[gpu_idx].put(
+                ('PROCESS', chunk_id, part, str(work_dir), slot)
+            )
+
+        expected = len(alive_indices)
+        partials: List[dict] = [None] * expected
+        errors: List[str] = []
+        deadline = time.time() + timeout
+        done_count = 0
+
+        while done_count < expected and time.time() < deadline:
+            # Detect worker death (process exited while we were waiting).
+            for gpu_idx in alive_indices:
+                p = self.procs[gpu_idx]
+                if not p.is_alive():
+                    self._alive[gpu_idx] = False
+                    msg = (f"GPU worker {gpu_idx} died mid-chunk "
+                           f"(pid {p.pid}, exit {p.exitcode})")
+                    if msg not in errors:
+                        errors.append(msg)
+            try:
+                sig, payload = self.out_q.get(timeout=5)
+            except queue.Empty:
+                continue
+            if sig == 'DONE':
+                pid = payload.get('partition_id', -1)
+                if 0 <= pid < expected and partials[pid] is None:
+                    partials[pid] = payload
+                    done_count += 1
+            elif sig == 'ERROR':
+                errors.append(str(payload))
+                done_count += 1  # count the slot so we don't deadlock
+            else:
+                print(f"[POOL] ignored runtime msg {sig!r}", flush=True)
+
+        if errors:
+            raise RuntimeError(
+                f"GpuWorkerPool error(s) on chunk {chunk_id}: " +
+                " | ".join(errors[:5])
+            )
+        missing = [i for i, p in enumerate(partials) if p is None]
+        if missing:
+            raise RuntimeError(
+                f"GpuWorkerPool timeout on chunk {chunk_id}: "
+                f"partitions {missing} never reported DONE in {timeout:.0f}s"
+            )
+        return partials
+
+    @staticmethod
+    def _partition_records(records: List[dict], n: int) -> List[List[dict]]:
+        """Split records into n partitions via stride (round-robin).
+
+        Why stride and not contiguous slices: CSV rows often cluster nearby
+        panos together. Contiguous slices would dump all of "downtown" on one
+        GPU and force its IP through Google's per-area rate limit; striding
+        spreads geographically clustered panos across GPUs so the per-IP
+        request budget for any sub-area is shared.
+        """
+        if n <= 1:
+            return [list(records)]
+        out = [[] for _ in range(n)]
+        for i, r in enumerate(records):
+            out[i % n].append(r)
+        return out
+
+    # ── Shutdown ──
+
+    def shutdown(self, drain_timeout: float = 60.0):
+        """Send STOP to all workers and join. Terminates stragglers."""
+        print(f"[POOL] shutting down...", flush=True)
+        for i, q in enumerate(self.in_qs):
+            if self.procs[i].is_alive():
+                try:
+                    q.put(('STOP',), timeout=5)
+                except Exception:
+                    pass
+        deadline = time.time() + drain_timeout
+        for p in self.procs:
+            remaining = max(1.0, deadline - time.time())
+            p.join(timeout=remaining)
+            if p.is_alive():
+                print(f"[POOL] worker {p.pid} did not exit; terminating", flush=True)
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        # Final reap of any zombies.
+        for p in self.procs:
+            try:
+                p.join(timeout=5)
+            except Exception:
+                pass
+        print(f"[POOL] shutdown complete", flush=True)
+
+    def _kill_all(self):
+        for p in self.procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        for p in self.procs:
+            try:
+                p.join(timeout=10)
+            except Exception:
+                pass
+
+
+def _stitch_partials(partials: List[dict], features_file: str,
+                     metadata_file: str, failed_file: str,
+                     feature_dim: int = 8448) -> Tuple[int, dict]:
+    """Concatenate per-GPU partial outputs into the final NPY + metadata files.
+
+    Re-indexes `feature_index` in each metadata line so it points into the
+    final stitched NPY rather than the partial that produced it.
+
+    Returns (total_count, aggregated_stats).
+    """
+    total_count = sum(int(p.get('feature_count', 0)) for p in partials)
+    agg_stats = {'dl_ok': 0, 'dl_fail': 0, 'ext_ok': 0, 'views_produced': 0,
+                 'ip_blocked_403': False}
+    for p in partials:
+        s = p.get('stats') or {}
+        agg_stats['dl_ok'] += int(s.get('dl_ok', 0))
+        agg_stats['dl_fail'] += int(s.get('dl_fail', 0))
+        agg_stats['ext_ok'] += int(s.get('ext_ok', 0))
+        agg_stats['views_produced'] += int(s.get('views_produced', 0))
+        if s.get('ip_blocked_403'):
+            agg_stats['ip_blocked_403'] = True
+
+    if total_count == 0:
+        # Touch the metadata + failed files to avoid downstream "missing file"
+        # confusion. NPY left non-existent → caller treats as empty chunk.
+        try:
+            open(metadata_file, 'w').close()
+            open(failed_file, 'w').close()
+        except Exception:
+            pass
+        return 0, agg_stats
+
+    final_mm = np.lib.format.open_memmap(
+        features_file, mode='w+', dtype='float32',
+        shape=(total_count, feature_dim),
+    )
+
+    cursor = 0
+    try:
+        with open(metadata_file, 'w', encoding='utf-8') as meta_out, \
+             open(failed_file, 'w', encoding='utf-8') as fail_out:
+            # Process partitions in partition_id order so the final NPY's row
+            # ordering is deterministic across runs.
+            ordered = sorted(partials, key=lambda x: x.get('partition_id', 0))
+            for p in ordered:
+                n = int(p.get('feature_count', 0))
+                src_npy = p.get('partial_npy')
+                src_meta = p.get('partial_meta')
+                src_failed = p.get('partial_failed')
+
+                if n > 0 and src_npy and os.path.exists(src_npy):
+                    try:
+                        src = np.load(src_npy, mmap_mode='r')
+                        # Tolerate src being larger than n (over-allocated memmap)
+                        if src.shape[0] < n:
+                            print(f"[STITCH][WARN] {src_npy} has only "
+                                  f"{src.shape[0]} rows, expected {n}", flush=True)
+                            n = src.shape[0]
+                        final_mm[cursor:cursor + n] = src[:n]
+                        del src
+                    except Exception as e:
+                        print(f"[STITCH][ERROR] failed to copy {src_npy}: {e}",
+                              flush=True)
+                        raise
+
+                    if src_meta and os.path.exists(src_meta):
+                        with open(src_meta, 'r', encoding='utf-8') as mf:
+                            for line in mf:
+                                if not line.strip():
+                                    continue
+                                try:
+                                    rec = json.loads(line)
+                                except Exception:
+                                    continue  # drop malformed lines
+                                if 'feature_index' in rec:
+                                    try:
+                                        rec['feature_index'] = (
+                                            cursor + int(rec['feature_index'])
+                                        )
+                                    except Exception:
+                                        pass
+                                meta_out.write(json.dumps(rec) + '\n')
+                    cursor += n
+                # Append failures verbatim (no re-indexing needed)
+                if src_failed and os.path.exists(src_failed):
+                    try:
+                        with open(src_failed, 'r', encoding='utf-8') as ff:
+                            shutil.copyfileobj(ff, fail_out)
+                    except Exception as e:
+                        print(f"[STITCH][WARN] failed to copy failed log: {e}",
+                              flush=True)
+    finally:
+        try:
+            final_mm.flush()
+            del final_mm
+        except Exception:
+            pass
+        gc.collect()
+
+        # Cleanup partial files. Failures here are non-fatal — the chunk
+        # is already stitched to the final destination.
+        for p in partials:
+            for k in ('partial_npy', 'partial_meta', 'partial_failed'):
+                v = p.get(k)
+                if v and os.path.exists(v):
+                    try:
+                        os.remove(v)
+                    except OSError:
+                        pass
+
+    return cursor, agg_stats
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Prefetch Next Chunk (background CSV download during extraction)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1815,17 +2727,69 @@ def main():
         self_destruct()
         return
 
-    # ── Init GPU extractor ONCE (expensive — 30-60s) ──
-    print("[INFO] Initializing GPU extractor...")
+    # ── Init GPU extractor(s) ──
+    # Single-GPU machines (or DISABLE_MULTI_GPU=1) → one GpuExtractor in this
+    # process, legacy behaviour. Multi-GPU machines → spawn a GpuWorkerPool
+    # with one child process per device. The extractor variable in this
+    # process is unused in pool mode but we keep it None-checked so failures
+    # to spawn the pool fall back to single-process.
     try:
         tq.report_status(REGION, INSTANCE_ID, "LOADING_MODEL")
     except Exception:
         pass
-    extractor = GpuExtractor()
+
+    try:
+        n_gpus = torch.cuda.device_count()
+    except Exception as e:
+        print(f"[FATAL] torch.cuda.device_count() failed: {e}", flush=True)
+        sys.exit(1)
+
+    disable_multi = os.environ.get('DISABLE_MULTI_GPU', '').strip() in ('1', 'true', 'yes')
+    use_pool = (n_gpus > 1) and not disable_multi
+    extractor = None
+    gpu_pool = None
+
+    if use_pool:
+        print(f"[INFO] Multi-GPU detected ({n_gpus} GPUs) — spawning worker pool...",
+              flush=True)
+        try:
+            gpu_pool = GpuWorkerPool(n_gpus=n_gpus)
+            print(f"[INFO] Pool active — extraction will run across {n_gpus} GPUs",
+                  flush=True)
+        except Exception as e:
+            print(f"[WARN] GpuWorkerPool init failed: {type(e).__name__}: {e}",
+                  flush=True)
+            print(f"[WARN] Falling back to single-process extraction "
+                  f"(DataParallel across {n_gpus} GPUs)", flush=True)
+            gpu_pool = None
+            try:
+                extractor = GpuExtractor()
+            except Exception as e2:
+                print(f"[FATAL] Fallback extractor also failed: {e2}", flush=True)
+                upload_logs_to_r2()
+                sys.exit(1)
+    else:
+        if n_gpus > 1 and disable_multi:
+            print(f"[INFO] {n_gpus} GPUs visible but DISABLE_MULTI_GPU=1 — "
+                  f"using single-process path", flush=True)
+        else:
+            print(f"[INFO] Single GPU ({n_gpus} visible) — using single-process path",
+                  flush=True)
+        try:
+            extractor = GpuExtractor()
+        except Exception as e:
+            print(f"[FATAL] GpuExtractor init failed: {e}", flush=True)
+            upload_logs_to_r2()
+            sys.exit(1)
 
     # ── Pipelined chunk queue loop ──
-    # Overlaps: upload of chunk N runs in background while chunk N+1 extracts.
-    # Prefetch: next chunk's CSV is downloaded during current extraction.
+    # Overlaps: uploads run in a bounded background pool while extraction
+    # claims and processes the next chunk. The pool caps at 5 pending — if
+    # uploads can't keep up, submit() blocks the extractor (backpressure),
+    # so local disk doesn't fill and RSS stays bounded. A chunk is only
+    # marked complete in Redis after its upload succeeds; failed uploads
+    # mark the chunk failed (and reconcile-on-startup will pick up any
+    # R2 objects that landed despite the failure flag).
     chunks_done = 0
     chunks_failed = 0
     idle_cycles = 0
@@ -1834,35 +2798,49 @@ def main():
     MAX_IDLE_SECONDS = 600  # 10 min hard idle timeout → self-destruct
     skip_city_prefixes = set()  # CSV prefixes with missing R2 files — skip entire city
 
+    upload_mgr = AsyncUploadManager(
+        r2,
+        max_pending=int(os.environ.get('UPLOAD_MAX_PENDING', '5')),
+        num_workers=int(os.environ.get('UPLOAD_WORKERS', '2')),
+    )
+
+    def _handle_completions(completions):
+        """Translate finished upload jobs into Redis state. Returns
+        (n_done_delta, n_failed_delta) so caller can keep counters."""
+        d, f = 0, 0
+        for redis_cid, err in completions:
+            if err is None:
+                if _redis_retry(tq.complete_task, REGION, redis_cid, INSTANCE_ID,
+                                label=f"complete_task({redis_cid})"):
+                    d += 1
+                    print(f"[INFO] Completed chunk {redis_cid} "
+                          f"(running total +{d} this batch)")
+                else:
+                    # Data is safely on R2 — reconcile-on-restart will tidy up.
+                    print(f"[WARN] Could not mark {redis_cid} done in Redis "
+                          "(NPY uploaded; reconcile will fix)")
+                    d += 1
+            else:
+                msg = f"{type(err).__name__}: {str(err)[:200]}"
+                print(f"[ERROR] Upload for {redis_cid} failed: {msg}")
+                try:
+                    tq.fail_task(REGION, redis_cid, INSTANCE_ID, msg)
+                except Exception as re:
+                    print(f"[WARN] fail_task({redis_cid}) failed: {re}")
+                f += 1
+        return d, f
+
     # Pipeline state
-    pending_upload = None   # (thread, redis_chunk_id, error_ref)
     prefetched = None       # (chunk_id, local_csv, records, metadata_map[, batch_meta])
 
     while True:
-        # ── Drain previous background upload ──
-        if pending_upload is not None:
-            ul_thread, ul_chunk_id, ul_error = pending_upload
-            ul_thread.join()
-            if ul_error[0] is not None:
-                chunks_failed += 1
-                err = ul_error[0]
-                print(f"[ERROR] Background upload for {ul_chunk_id} failed: {err}")
-                try:
-                    tq.fail_task(REGION, ul_chunk_id, INSTANCE_ID,
-                                 f"{type(err).__name__}: {str(err)[:200]}")
-                except Exception:
-                    pass
-            else:
-                if _redis_retry(tq.complete_task, REGION, ul_chunk_id, INSTANCE_ID,
-                                label=f"complete_task({ul_chunk_id})"):
-                    chunks_done += 1
-                    print(f"[INFO] Completed chunk {ul_chunk_id} ({chunks_done} total)")
-                else:
-                    # Data is on R2 — reconcile will fix this on next worker startup
-                    print(f"[WARN] Could not mark {ul_chunk_id} done in Redis "
-                          "(data safe on R2, will reconcile)")
-                    chunks_done += 1
-            pending_upload = None
+        # ── Drain any uploads that finished while we were extracting ──
+        # Non-blocking — just translates completions into Redis state. The
+        # extractor doesn't wait on uploads here; backpressure happens later
+        # at upload_mgr.submit() if the queue is full.
+        d, f = _handle_completions(upload_mgr.drain_completions())
+        chunks_done += d
+        chunks_failed += f
 
         # ── Get next chunk: from prefetch or fresh claim ──
         _bmeta = None  # batch metadata for current chunk
@@ -1986,7 +2964,8 @@ def main():
             result = process_chunk(r2, tq, extractor, chunk_id, work_dir,
                                    preloaded=preloaded_data,
                                    chunks_done_so_far=chunks_done,
-                                   redis_chunk_id=_redis_cid)
+                                   redis_chunk_id=_redis_cid,
+                                   gpu_pool=gpu_pool)
 
             # Wait for prefetch to finish before starting upload
             pf_thread.join()
@@ -2000,32 +2979,54 @@ def main():
             else:
                 features_file, metadata_file, local_csv = result
 
-                # Launch background upload (parallel NPY + metadata).
-                # IMPORTANT: snapshot CITY_NAME / FEATURES_BUCKET_PREFIX /
-                # TOTAL_CHUNKS into the args HERE on the main thread, before
-                # the next loop iteration potentially overwrites them in
-                # batch mode. Reading them inside the upload thread risked
-                # uploading this chunk's bytes to the next chunk's city
+                # Snapshot the per-chunk paths HERE on the main thread,
+                # before batch-mode globals can be overwritten by the next
+                # claim. Reading them inside the upload worker risked
+                # uploading this chunk's bytes under the NEXT chunk's city
                 # prefix (silent cross-city contamination).
                 _ul_out_base = _output_base(CITY_NAME, chunk_id)
                 _ul_npy_key = f"{FEATURES_BUCKET_PREFIX}/{_ul_out_base}.npy"
                 _ul_meta_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{_ul_out_base}.jsonl"
-                err_ref = [None]
-                ul_thread = threading.Thread(
-                    target=_do_background_upload,
-                    args=(err_ref, r2, chunk_id, features_file, metadata_file,
-                          local_csv, work_dir,
-                          _ul_npy_key, _ul_meta_key, _ul_out_base),
-                    daemon=True,
+
+                job = _UploadJob(
+                    redis_chunk_id=_redis_cid, chunk_id=chunk_id,
+                    features_file=features_file, metadata_file=metadata_file,
+                    local_csv=local_csv, work_dir=work_dir,
+                    npy_key=_ul_npy_key, meta_key=_ul_meta_key,
+                    out_base=_ul_out_base,
                 )
-                ul_thread.start()
-                pending_upload = (ul_thread, _redis_cid, err_ref)
+
+                # ── Backpressure ──
+                # If the pool already has max_pending uploads in flight,
+                # submit() blocks until a slot frees. The extractor pauses
+                # here rather than letting local disk fill. We deliberately
+                # drain completions WHILE waiting so Redis state stays
+                # current and so multi-pending failures unblock the
+                # extractor as soon as one finishes.
+                if upload_mgr.pending_count() >= upload_mgr.max_pending:
+                    print(f"[BACKPRESSURE] {upload_mgr.pending_count()} pending uploads — "
+                          f"pausing extraction until a slot frees", flush=True)
+                    try:
+                        tq.report_status(REGION, INSTANCE_ID, "UPLOAD_BACKPRESSURE",
+                                         chunk_id=_redis_cid,
+                                         chunks_done=chunks_done)
+                    except Exception:
+                        pass
+                    # Drain at least one completion before submitting.
+                    while upload_mgr.pending_count() >= upload_mgr.max_pending:
+                        completions = upload_mgr.wait_one_completion(timeout=30)
+                        d, f = _handle_completions(completions)
+                        chunks_done += d
+                        chunks_failed += f
+                upload_mgr.submit(job)
+
                 try:
                     tq.report_status(REGION, INSTANCE_ID, "UPLOADING",
                                      chunk_id=_redis_cid, chunks_done=chunks_done)
                 except Exception:
                     pass
-                # Loop immediately → start next chunk while upload runs
+                # Loop immediately → claim + extract the next chunk while
+                # this one's upload runs in the background pool.
 
         except IPBlockedError as e:
             # Google has 403-blocked this instance's IP. Do NOT fail_task
@@ -2057,13 +3058,27 @@ def main():
                 except Exception as re:
                     print(f"[WARN] Failed to unclaim prefetched chunk: {re}")
 
-            # Drain any pending background upload before dying so we don't
-            # lose a legitimately-completed earlier chunk.
-            if pending_upload is not None:
+            # Drain pending uploads before dying so we don't lose a chunk
+            # whose extraction already succeeded. Failed uploads at this
+            # point still fail_task in Redis so reconcile can recover.
+            try:
+                final_completions = upload_mgr.shutdown(drain=True, timeout=600)
+                d, f = _handle_completions(final_completions)
+                chunks_done += d
+                chunks_failed += f
+            except Exception as ue:
+                print(f"[WARN] Upload manager shutdown during IP-block failed: {ue}",
+                      flush=True)
+
+            # Clean GPU pool teardown so child processes don't outlive the
+            # parent (Vast can re-use the container; orphaned CUDA contexts
+            # would leak VRAM on a relaunch attempt).
+            if gpu_pool is not None:
                 try:
-                    pending_upload[0].join(timeout=300)
-                except Exception:
-                    pass
+                    gpu_pool.shutdown(drain_timeout=30.0)
+                except Exception as gpe:
+                    print(f"[WARN] gpu_pool.shutdown on IP-block failed: {gpe}",
+                          flush=True)
 
             print("[IP-BLOCK] Self-destructing to release this IP.", flush=True)
             upload_logs_to_r2()
@@ -2096,28 +3111,27 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-    # ── Wait for final background upload before exit ──
-    if pending_upload is not None:
-        print("[INFO] Waiting for final background upload to complete...")
-        ul_thread, ul_chunk_id, ul_error = pending_upload
-        ul_thread.join()
-        if ul_error[0] is not None:
-            chunks_failed += 1
-            print(f"[ERROR] Final upload failed for {ul_chunk_id}: {ul_error[0]}")
-            try:
-                tq.fail_task(REGION, ul_chunk_id, INSTANCE_ID,
-                             str(ul_error[0])[:200])
-            except Exception:
-                pass
-        else:
-            if _redis_retry(tq.complete_task, REGION, ul_chunk_id, INSTANCE_ID,
-                            label=f"complete_task({ul_chunk_id})"):
-                chunks_done += 1
-                print(f"[INFO] Final chunk {ul_chunk_id} completed ({chunks_done} total)")
-            else:
-                print(f"[WARN] Could not mark final {ul_chunk_id} done in Redis "
-                      "(data safe on R2, will reconcile)")
-                chunks_done += 1
+    # ── Wait for all in-flight uploads before exit ──
+    # Block on the bounded upload pool. Anything that finishes here gets
+    # marked complete/failed in Redis. We don't kill workers until every
+    # job is drained — losing a finished extraction would force a re-scrape.
+    print(f"[INFO] Waiting for {upload_mgr.pending_count()} in-flight upload(s) "
+          f"to complete before exit...")
+    final_completions = upload_mgr.shutdown(drain=True, timeout=900)
+    d, f = _handle_completions(final_completions)
+    chunks_done += d
+    chunks_failed += f
+    final_stats = upload_mgr.stats()
+    print(f"[INFO] Upload manager final: lifetime completed={final_stats['completed']}, "
+          f"failed={final_stats['failed']}")
+
+    # Tear down the GPU pool (if any) before self-destruct so child
+    # processes get a clean STOP and don't leak CUDA contexts.
+    if gpu_pool is not None:
+        try:
+            gpu_pool.shutdown(drain_timeout=60.0)
+        except Exception as e:
+            print(f"[WARN] gpu_pool.shutdown failed: {e}", flush=True)
 
     # ── Done — self-destruct ──
     try:

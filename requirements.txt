@@ -3,6 +3,11 @@ numpy>=1.24.0
 pillow>=10.0.0
 opencv-python-headless>=4.8.0
 aiohttp>=3.9.0
+# curl_cffi impersonates real Chrome at the TLS + HTTP/2/3 layer (JA3/JA4
+# fingerprint, ALPN, SETTINGS frame, full Sec-Ch-Ua header set). Google's
+# streetviewpixels abuse gate fingerprints all of this; aiohttp's vanilla TLS
+# handshake gets flagged at scale even with a perfect User-Agent.
+curl-cffi>=0.7.0
 boto3>=1.28.0
 
 rich>=14.0.0
