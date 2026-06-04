@@ -55,7 +55,13 @@ async def fetch_thumbnail_view(
     Failure handling:
       * 200 + valid decode + non-black     -> return RGB array
       * 200 + decode fail or near-black    -> None (count black via stats)
-      * 403                                -> set stats['ip_blocked_403'], None
+      * 403                                -> retry with backoff (Google
+                                              occasionally flags a single
+                                              request for a split second);
+                                              only after every retry also
+                                              returns 403 do we conclude the
+                                              IP is blocked and set
+                                              stats['ip_blocked_403']
       * 5xx / 429                          -> retry with Retry-After + jittered
                                               exponential backoff
       * other 4xx                          -> None (no retry — permanent)
@@ -94,13 +100,26 @@ async def fetch_thumbnail_view(
                 return cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2RGB)
 
             if status == 403:
-                # Persistent IP-block signal. Flag once; the outer
-                # downloader loop short-circuits remaining requests and
-                # the worker self-destructs instead of poisoning the
-                # queue with half-extracted features.
+                # Two flavours of 403 from this endpoint:
+                #   (a) transient — Google flags a single request for a
+                #       split second; the next attempt succeeds.
+                #   (b) persistent IP block — every request from this IP
+                #       returns 403 until the cooldown lifts (hours).
+                # Retry with backoff to absorb (a). If we exhaust retries
+                # the 403 is persistent → flag so the outer downloader
+                # short-circuits and the worker self-destructs instead of
+                # poisoning the queue with half-extracted features.
+                if stats is not None:
+                    stats['http_403'] = stats.get('http_403', 0) + 1
+
+                if attempt < retries:
+                    delay = (backoff * (2 ** (attempt - 1))
+                             + random.uniform(0, backoff))
+                    await asyncio.sleep(delay)
+                    continue
+
                 if stats is not None:
                     stats['ip_blocked_403'] = True
-                    stats['http_403'] = stats.get('http_403', 0) + 1
                 return None
 
             if status not in THUMB_RETRYABLE_STATUS or attempt >= retries:
