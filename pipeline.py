@@ -53,7 +53,7 @@ HARDCODED_CONFIG = {
     'view_fov': 70.0,          # degrees
     'num_views': 8,            # 360° / 8 = 45° spacing
     'view_offset': 0.0,        # base yaw added to heading_deg (or 0 if absent)
-    'view_pitch': 10.0,        # +10° = looks down slightly (matches Google URL pitch)
+    'view_pitch': 5.0,         # +5° = looks down slightly (matches Google URL pitch)
 
     'output_dir': None,
     # batch_size is set dynamically by GpuExtractor._probe_max_batch_size()
