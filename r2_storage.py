@@ -77,15 +77,16 @@ class R2Client:
                         progress_callback(transferred[0], file_size)
                     callback = _cb
 
-                # Single PUT for anything under 512MB: R2's single-PUT limit
-                # is ~5GB and our largest NPY is ~258MB, so the whole file
-                # goes in ONE request that either lands or fails atomically.
-                # Multipart to R2 from rented machines was failing every
-                # attempt ("connection closed before valid response") and
-                # each retry created yet another orphaned multipart upload.
-                # Files above the threshold (none today) use 64MB parts.
+                # Single PUT for anything under 2GB: R2's single-PUT limit
+                # is ~5GB and our largest NPY is ~775MB (24 views/pano ×
+                # 1000 panos), so the whole file goes in ONE request that
+                # either lands or fails atomically. Multipart to R2 from
+                # rented machines was failing every attempt ("connection
+                # closed before valid response") and each retry created yet
+                # another orphaned multipart upload. Files above the
+                # threshold (none today) use 64MB parts.
                 config = boto3.s3.transfer.TransferConfig(
-                    multipart_threshold=512 * 1024 * 1024,
+                    multipart_threshold=2 * 1024 * 1024 * 1024,
                     multipart_chunksize=64 * 1024 * 1024,
                     max_concurrency=4,
                 )

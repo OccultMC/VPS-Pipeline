@@ -40,18 +40,33 @@ os.environ["MKL_NUM_THREADS"] = "1"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 HARDCODED_CONFIG = {
-    # Lowered from 150 → 30 to stay under Google's per-IP 403 threshold.
-    # Local scraper sustains 60 panos/sec @ max_threads=20 without ever
-    # triggering the block; 30 is a modest bump with GPU pipelining.
-    # Tunable via MAX_THREADS env var.
-    'max_threads': int(os.environ.get('MAX_THREADS', '30')),
+    # Concurrent panos. The per-IP budget that matters is CONCURRENT HTTP
+    # REQUESTS: the old tuned-safe point was 30 panos × 8 views = 240
+    # in-flight. At 24 views/pano, 10 panos keeps the same 240 in-flight
+    # (and roughly the same request rate). Tunable via MAX_THREADS env var.
+    'max_threads': int(os.environ.get('MAX_THREADS', '10')),
 
-    # Server-rendered thumbnail mode: 8 perspective views per pano fetched
-    # directly from streetviewpixels-pa.googleapis.com — no tile fetch, no
-    # equirect stitch, no client-side projection.
+    # Server-rendered thumbnail mode: perspective views fetched directly
+    # from streetviewpixels-pa.googleapis.com — no tile fetch, no equirect
+    # stitch, no client-side projection.
+    #
+    # View set per pano (24 total):
+    #   16 × FOV 70 — full ring, 360/16 = 22.5° spacing
+    #    8 × FOV 40 — zoomed ring, 360/8 = 45° spacing, no offset (same
+    #                 8 yaw angles the old capture used)
+    'num_wide_views': 16,
+    'wide_fov': 70.0,
+    'num_zoom_views': 8,
+    'zoom_fov': 40.0,
+    'num_views': 24,           # derived: num_wide_views + num_zoom_views
+
+    # The endpoint's JPEGs at 322 are full of compression artifacts.
+    # Fetch at 644×644 and bicubic-downscale to 322 — the 2× supersample
+    # averages the JPEG noise away. No intermediate re-encode of any kind
+    # (PNG included): the downscaled RGB array goes straight to the GPU,
+    # which is strictly lossless from the resize onward.
     'view_resolution': 322,    # MegaLoc input dim (fed straight to the GPU)
-    'view_fov': 70.0,          # degrees
-    'num_views': 8,            # 360° / 8 = 45° spacing
+    'fetch_resolution': 644,   # network fetch size (2× supersample)
     'view_offset': 0.0,        # base yaw added to heading_deg (or 0 if absent)
     'view_pitch': 5.0,         # +5° = looks down slightly (matches Google URL pitch)
 
@@ -91,7 +106,10 @@ INSTANCE_ID = (os.environ.get('INSTANCE_ID', '')
 VAST_API_KEY = os.environ.get('VAST_API_KEY', '')
 
 MAX_DISK_GB = 100
-MIN_FREE_GB = 5
+# Free-disk floor. At 24 views/pano a chunk NPY is ~775MB; worst case on
+# disk simultaneously: 5 pending uploads (~3.9GB) + 2 live memmaps with
+# chunk overlap (~1.6GB) + CSVs/logs.
+MIN_FREE_GB = 12
 TOTAL_CHUNKS = 0  # Set from Redis metadata at startup
 
 
@@ -890,17 +908,25 @@ async def _download_single_pano(session, record, sem, config, item_queue, metada
     panoid_str = record['panoid']
     heading_deg = record.get('heading_deg')
 
-    num_views = config['num_views']
-    fov = config['view_fov']
     resolution = config['view_resolution']
+    fetch_res = config.get('fetch_resolution', resolution)
     pitch = config.get('view_pitch', 0.0)
     offset = config.get('view_offset', 0.0)
 
-    # Yaws: evenly spaced; aligned to street heading if CSV provided one,
+    # View set: a full wide-FOV ring plus a zoomed ring on the classic 8
+    # angles. Yaws aligned to street heading if the CSV provided one,
     # otherwise oriented to true north.
     base_yaw = (heading_deg if heading_deg is not None else 0.0) + offset
-    step = 360.0 / num_views
-    yaws = [(base_yaw + step * i) % 360.0 for i in range(num_views)]
+    views = []  # (yaw, fov) per view — wide ring first, then zoom ring
+    n_wide = config.get('num_wide_views', 16)
+    wide_fov = config.get('wide_fov', 70.0)
+    for i in range(n_wide):
+        views.append(((base_yaw + 360.0 / n_wide * i) % 360.0, wide_fov))
+    n_zoom = config.get('num_zoom_views', 8)
+    zoom_fov = config.get('zoom_fov', 40.0)
+    for i in range(n_zoom):
+        views.append(((base_yaw + 360.0 / n_zoom * i) % 360.0, zoom_fov))
+    num_views = len(views)
 
     # Jitter each pano's start so the sem doesn't release in uniform bursts.
     jitter_max = config.get('pano_jitter_max', 0.0)
@@ -926,8 +952,9 @@ async def _download_single_pano(session, record, sem, config, item_queue, metada
                                if v is None]
                 tasks = [
                     fetch_thumbnail_view(
-                        session, panoid_str, yaws[i], pitch, fov,
-                        resolution, resolution, stats=stats,
+                        session, panoid_str, views[i][0], pitch, views[i][1],
+                        fetch_res, fetch_res, out_size=resolution,
+                        stats=stats,
                     )
                     for i in missing_idx
                 ]
@@ -1040,8 +1067,9 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
             # ── Connectivity probe: fetch 1 thumbnail from the first real pano ──
             if records:
                 probe_pid = records[0].get('panoid', '')
-                probe_resolution = config.get('view_resolution', 322)
-                probe_fov = int(round(config.get('view_fov', 70.0)))
+                probe_resolution = config.get('fetch_resolution',
+                                              config.get('view_resolution', 322))
+                probe_fov = int(round(config.get('wide_fov', 70.0)))
                 probe_url = (
                     f"https://streetviewpixels-pa.googleapis.com/v1/thumbnail"
                     f"?panoid={probe_pid}&cb_client=maps_sv.tactile.gps"
@@ -1854,7 +1882,7 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
         overlap_pf = None
 
     if run is None:
-        # ~270MB memmap for 1K panos × 8 views × 8448 dim × 4 bytes,
+        # ~775MB memmap for 1K panos × 24 views × 8448 dim × 4 bytes,
         # allocated inside _start_chunk_run together with the sink + stats.
         run = _start_chunk_run(work_dir, item_queue, chunk_id, _rcid,
                                local_csv, records, metadata_map, city)

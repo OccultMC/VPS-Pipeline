@@ -54,12 +54,18 @@ def _log_fetch_exc(exc: BaseException):
           f"(throttled — at most one line per 30s)", flush=True)
 
 
-def _decode_and_check(body: bytes):
+def _decode_and_check(body: bytes, out_size: Optional[int] = None):
     """Decode JPEG bytes → RGB array plus a status tag.
 
     Runs in a thread-pool executor: cv2.imdecode + the black-placeholder
     mean/std check done inline on the asyncio event loop across hundreds of
     concurrent fetches visibly starves the loop and stalls in-flight requests.
+
+    out_size: when set and the decoded image is larger, bicubic-downscale to
+    out_size × out_size. The endpoint's JPEGs carry heavy compression
+    artifacts at small sizes — fetching at 2× and supersampling down
+    averages the blocking/ringing away. The array stays raw RGB end-to-end
+    (no re-encode, PNG or otherwise) on its way to the GPU.
 
     Returns ('ok', rgb) | ('decode_fail', None) | ('black', None).
     """
@@ -68,9 +74,12 @@ def _decode_and_check(body: bytes):
         return 'decode_fail', None
     # "No imagery here" placeholder: solid black JPEG. Detected via low
     # mean AND low std so legitimate dark scenes (night, tunnels) with
-    # any texture still pass.
+    # any texture still pass. Checked at native resolution, pre-resize.
     if arr_bgr.mean() < BLACK_THUMB_MEAN and arr_bgr.std() < BLACK_THUMB_STD:
         return 'black', None
+    if out_size and (arr_bgr.shape[0] != out_size or arr_bgr.shape[1] != out_size):
+        arr_bgr = cv2.resize(arr_bgr, (out_size, out_size),
+                             interpolation=cv2.INTER_CUBIC)
     return 'ok', cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2RGB)
 
 
@@ -85,8 +94,12 @@ async def fetch_thumbnail_view(
     retries: int = 5,
     backoff: float = 0.3,
     stats: Optional[dict] = None,
+    out_size: Optional[int] = None,
 ) -> Optional[np.ndarray]:
     """Fetch one server-rendered perspective view from Google's thumbnail endpoint.
+
+    out_size: bicubic-downscale the decoded image to out_size × out_size
+    (fetch at w×h = 2× for a supersampled, artifact-free result).
 
     Returns numpy uint8 HWC RGB array, or None on any failure
     (4xx, persistent 5xx, decode error, black/garbage placeholder).
@@ -128,7 +141,7 @@ async def fetch_thumbnail_view(
                 # Decode + black-check off the event loop — done inline it
                 # blocks every in-flight request for the imdecode duration.
                 tag, rgb = await asyncio.get_running_loop().run_in_executor(
-                    None, _decode_and_check, data
+                    None, _decode_and_check, data, out_size
                 )
                 if tag == 'decode_fail':
                     if stats is not None:
