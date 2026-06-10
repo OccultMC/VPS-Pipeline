@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 import math
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -190,12 +190,16 @@ class IPBlockedError(RuntimeError):
 
 
 class ViewItem:
-    __slots__ = ('panoid', 'view_data', 'lat', 'lng')
-    def __init__(self, panoid: str, view_data, lat: float, lng: float):
+    __slots__ = ('panoid', 'view_data', 'lat', 'lng', 'sink')
+    def __init__(self, panoid: str, view_data, lat: float, lng: float, sink=None):
         self.panoid = panoid
         self.view_data = view_data  # RGB numpy array (uint8 HWC)
         self.lat = lat
         self.lng = lng
+        # SharedState this view belongs to. With cross-chunk overlap two
+        # chunks' items share one queue — the extraction loop routes each
+        # row to its own chunk's memmap/JSONL via this reference.
+        self.sink = sink
 
 class SharedState:
     """Thread-safe writing to memmap + metadata + failures."""
@@ -206,6 +210,10 @@ class SharedState:
         self.metadata_handle = open(metadata_file_path, 'w', encoding='utf-8')
         self.failed_handle = open(failed_file_path, 'w', encoding='utf-8')
         self._batch_count = 0
+        # Views handed to the extractor but dropped (decode failure, OOM
+        # skip, whole-batch error). Completion accounting for a chunk is:
+        # downloader dead AND write_idx + dropped >= stats['views_produced'].
+        self.dropped = 0
 
     def write_batch(self, features_batch: np.ndarray, metadata_batch: List[dict]):
         n = len(features_batch)
@@ -666,9 +674,17 @@ class GpuExtractor:
 
     @staticmethod
     def _decode_item(item: ViewItem):
-        """Convert ViewItem RGB numpy array → float32 CHW CPU tensor."""
+        """Convert ViewItem RGB numpy array → uint8 HWC CPU tensor.
+
+        uint8 stays uint8 until it reaches the GPU: the float32 conversion
+        used to happen on the CPU, making every PCIe transfer 4× larger
+        (1.2MB vs 311KB per 322×322 view). /255 + normalize now run on GPU.
+        """
         try:
-            return transforms.functional.to_tensor(item.view_data)
+            t = torch.from_numpy(np.ascontiguousarray(item.view_data))
+            if t.ndim != 3 or t.shape[-1] != 3 or t.dtype != torch.uint8:
+                raise ValueError(f"unexpected view tensor {t.dtype} {tuple(t.shape)}")
+            return t
         except Exception as e:
             print(f"[WARN] Decode failed panoid={item.panoid}: {type(e).__name__}: {e}", flush=True)
             return None
@@ -677,10 +693,35 @@ class GpuExtractor:
         """Non-blocking: submit numpy→tensor conversion for all items; return list of futures."""
         return [self.executor.submit(self._decode_item, item) for item in items]
 
+    def _staging_buffer(self, n: int, h: int, w: int):
+        """Reusable pinned uint8 staging buffer. cudaHostAlloc is expensive
+        and serializes with the GPU — the old per-batch pin_memory() call
+        allocated ~160MB of fresh pinned memory every batch."""
+        buf = getattr(self, '_pin_buf', None)
+        if (buf is None or buf.shape[0] < n
+                or buf.shape[1] != h or buf.shape[2] != w):
+            cap = max(n, self.batch_size)
+            buf = torch.empty((cap, h, w, 3), dtype=torch.uint8,
+                              pin_memory=True)
+            self._pin_buf = buf
+        return buf
+
     def _run_inference(self, items: List[ViewItem], valid_tensors: list, valid_indices: list):
-        """GPU inference with pin_memory transfer, fp16 autocast, and OOM auto-retry."""
+        """GPU inference with pinned uint8 staging, fp16 autocast, and OOM auto-retry."""
         try:
-            images = torch.stack(valid_tensors).pin_memory().to(self.device, non_blocking=True)
+            n = len(valid_tensors)
+            h, w = valid_tensors[0].shape[0], valid_tensors[0].shape[1]
+            try:
+                buf = self._staging_buffer(n, h, w)
+                for i, t in enumerate(valid_tensors):
+                    buf[i].copy_(t)
+                staged = buf[:n]
+            except Exception:
+                # Mixed shapes or pinned-alloc failure — stack copies instead.
+                staged = torch.stack(valid_tensors).pin_memory()
+            # uint8 HWC over PCIe (4× less traffic), float + scale on GPU.
+            images = staged.to(self.device, non_blocking=True)
+            images = images.permute(0, 3, 1, 2).float().div_(255.0)
             if images.shape[-2:] != (322, 322):
                 images = torch.nn.functional.interpolate(
                     images, size=(322, 322), mode='bilinear', align_corners=False
@@ -931,10 +972,12 @@ async def _download_single_pano(session, record, sem, config, item_queue, metada
 
             # All N views good — push as ViewItems sharing the same
             # panoid + lat/lng. SharedState.write_batch keeps memmap
-            # rows and JSONL lines aligned under a lock.
+            # rows and JSONL lines aligned under a lock. Each item carries
+            # its chunk's sink so overlapped chunks can share the queue.
             meta = metadata.get(panoid_str, {'lat': 0.0, 'lng': 0.0})
             items = [
-                ViewItem(panoid_str, view_arr, meta['lat'], meta['lng'])
+                ViewItem(panoid_str, view_arr, meta['lat'], meta['lng'],
+                         sink=shared_state)
                 for view_arr in view_results
             ]
             if not await _queue_put_items(item_queue, items, stats):
@@ -1400,9 +1443,257 @@ def upload_with_retry(r2, local_path, bucket_key, label="FILE", max_attempts=5):
 # Process a Single Chunk
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Cross-chunk overlap: when the current chunk has fewer than this fraction of
+# its panos still downloading (its straggler tail), the prefetched next
+# chunk's downloader is started into the SAME item queue so the GPU and the
+# network never sit idle at chunk boundaries. CHUNK_OVERLAP=0 disables.
+CHUNK_OVERLAP = os.environ.get('CHUNK_OVERLAP', '1') == '1'
+OVERLAP_TAIL_FRACTION = float(os.environ.get('OVERLAP_TAIL_FRACTION', '0.02'))
+
+
+class _ChunkRun:
+    """Live extraction state for one chunk: its memmap sink, stats dict and
+    downloader thread. Created either at the top of process_chunk (normal) or
+    mid-extraction of the PREVIOUS chunk (overlap), in which case it is handed
+    off to the next process_chunk call with its downloader already running."""
+    __slots__ = ('chunk_id', 'redis_cid', 'local_csv', 'total_records',
+                 'features_file', 'metadata_file', 'failed_file', 'out_base',
+                 'sink', 'stats', 'dl_thread', 'total_views_est', 'bmeta',
+                 'pending_batch', 'pending_futures')
+
+    def is_complete(self) -> bool:
+        """All downloader-produced views are written or dropped, and the
+        downloader can produce no more. Order matters: check the thread
+        FIRST so views_produced is final when the counters are read."""
+        if self.dl_thread.is_alive():
+            return False
+        return (self.sink.write_idx + self.sink.dropped
+                >= self.stats.get('views_produced', 0))
+
+
+def _start_chunk_run(work_dir: Path, item_queue, chunk_id: str, redis_cid: str,
+                     local_csv: str, records, metadata_map, city: str,
+                     bmeta=None, total_chunks=None) -> _ChunkRun:
+    """Allocate output files + memmap and start the downloader for a chunk.
+
+    total_chunks: the chunk's CITY total for output naming. Must be passed
+    explicitly for overlap runs — the global TOTAL_CHUNKS still holds the
+    CURRENT chunk's city total at overlap-start time (batch mode)."""
+    total_records = len(records)
+    views_per_pano = HARDCODED_CONFIG['num_views']
+    total_views_est = total_records * views_per_pano
+
+    if total_chunks is None:
+        total_chunks = TOTAL_CHUNKS
+    out_base = f"{city}_{_chunk_num(chunk_id)}.{total_chunks}"
+    features_file = str(work_dir / f"{out_base}.npy")
+    metadata_file = str(work_dir / f"Metadata_{out_base}.jsonl")
+    failed_file = str(work_dir / f"failed_{chunk_id}.jsonl")
+
+    features_memmap = np.lib.format.open_memmap(
+        features_file, mode='w+', dtype='float32',
+        shape=(total_views_est, 8448)
+    )
+    sink = SharedState(features_memmap, metadata_file, failed_file, start_idx=0)
+
+    dl_config = dict(HARDCODED_CONFIG)
+    stats = {'dl_ok': 0, 'dl_fail': 0, 'ext_ok': 0, 'views_produced': 0,
+             'dl_done': False}
+    # Back-reference so the extraction loop can credit ext_ok to the right
+    # chunk when overlapped batches mix two chunks' views.
+    sink.owner_stats = stats
+    dl_thread = threading.Thread(
+        target=downloader_thread,
+        args=(records, dl_config, item_queue, metadata_map, stats, sink)
+    )
+    dl_thread.start()
+
+    run = _ChunkRun()
+    run.chunk_id = chunk_id
+    run.redis_cid = redis_cid
+    run.local_csv = local_csv
+    run.total_records = total_records
+    run.features_file = features_file
+    run.metadata_file = metadata_file
+    run.failed_file = failed_file
+    run.out_base = out_base
+    run.sink = sink
+    run.stats = stats
+    run.dl_thread = dl_thread
+    run.total_views_est = total_views_est
+    run.bmeta = bmeta
+    run.pending_batch = []
+    run.pending_futures = None
+    return run
+
+
+def _abort_run(run: '_ChunkRun', tq, item_queue, work_dir: Path,
+               reason: str, hb=None):
+    """Wind down an overlap run that can't continue (current chunk raised,
+    IP block, shutdown): stop its downloader, unclaim its chunk, delete its
+    partial files. Never raises."""
+    try:
+        run.stats['stop_requested'] = True
+        deadline = time.time() + 60
+        while run.dl_thread.is_alive() and time.time() < deadline:
+            try:
+                while True:
+                    item_queue.get_nowait()
+            except queue.Empty:
+                pass
+            run.dl_thread.join(timeout=1.0)
+    except Exception:
+        pass
+    try:
+        run.sink.close()
+    except Exception:
+        pass
+    try:
+        tq.unclaim_task(REGION, run.redis_cid, INSTANCE_ID,
+                        reason=reason, back=True)
+    except Exception as e:
+        print(f"[OVERLAP] unclaim of {run.redis_cid} failed: {e}", flush=True)
+    if hb is not None:
+        try:
+            hb.unregister(run.redis_cid)
+        except Exception:
+            pass
+    _cleanup_chunk_files(work_dir, run.chunk_id, run.local_csv,
+                         out_base=run.out_base)
+
+
+def _try_start_overlap(overlap_pf, r2, tq, work_dir: Path, item_queue, hb):
+    """Consume the prefetched next chunk and start its downloader into the
+    shared queue. Returns the new _ChunkRun, or None with the prefetch entry
+    left intact for the main loop (empty chunk, low disk, errors) — except
+    the already-on-R2 case, which is completed and consumed here."""
+    pf = overlap_pf[0]
+    try:
+        next_id, pf_csv, pf_records, pf_meta = pf[0], pf[1], pf[2], pf[3]
+        pf_bmeta = pf[4] if len(pf) > 4 else None
+    except Exception:
+        return None
+    if not pf_records:
+        return None  # empty chunk — cheap for the main loop to complete
+
+    if pf_bmeta:
+        n_city = pf_bmeta['city_name']
+        file_cid = f"chunk_{pf_bmeta['chunk_num']:04d}"
+        feat_prefix = pf_bmeta['features_prefix']
+        n_total = pf_bmeta['city_total']
+    else:
+        n_city = CITY_NAME
+        file_cid = next_id
+        feat_prefix = FEATURES_BUCKET_PREFIX
+        n_total = TOTAL_CHUNKS
+
+    # Same skip check the main loop would do — never re-extract a chunk
+    # whose NPY + metadata already landed on R2.
+    out_b = f"{n_city}_{_chunk_num(file_cid)}.{n_total}"
+    try:
+        if (r2.object_size(f"{feat_prefix}/{out_b}.npy") > 0
+                and r2.object_size(f"{feat_prefix}/Metadata_{out_b}.jsonl") > 0):
+            print(f"[OVERLAP] {next_id} output already on R2 — completing "
+                  f"instead of overlapping", flush=True)
+            overlap_pf[0] = None
+            try:
+                tq.complete_task(REGION, next_id, INSTANCE_ID)
+            except Exception:
+                pass
+            if hb is not None:
+                hb.unregister(next_id)
+            try:
+                os.remove(pf_csv)
+            except OSError:
+                pass
+            return None
+    except Exception:
+        pass  # can't check — proceed with the overlap
+
+    # A second ~270MB memmap comes alive — make sure the disk can take it
+    # without blocking the extraction thread for long.
+    try:
+        wait_for_disk_space(str(work_dir), MIN_FREE_GB, max_wait_sec=5)
+    except Exception:
+        print("[OVERLAP] low disk — leaving next chunk to the main loop",
+              flush=True)
+        return None
+
+    print(f"[OVERLAP] Starting next chunk {next_id} ({len(pf_records)} panos) "
+          f"during current chunk's straggler tail", flush=True)
+    try:
+        new_run = _start_chunk_run(work_dir, item_queue, file_cid, next_id,
+                                   pf_csv, pf_records, pf_meta, n_city,
+                                   bmeta=pf_bmeta, total_chunks=n_total)
+    except Exception as e:
+        # Setup failed (e.g. memmap allocation) — leave the prefetch entry
+        # for the main loop's normal path rather than losing the claim.
+        print(f"[OVERLAP] start failed ({type(e).__name__}: {e}) — "
+              f"falling back to sequential processing", flush=True)
+        return None
+    overlap_pf[0] = None  # consumed — main loop must not double-process it
+    return new_run
+
+
+def _truncate_npy(path: str, final_count: int):
+    """Shrink an NPY to its first `final_count` rows IN PLACE by patching the
+    header's shape and truncating the file — replaces the old read-copy-
+    rewrite which pushed ~260MB through RAM and doubled disk I/O per chunk.
+    Falls back to the copy method if the header isn't exactly as
+    np.lib.format wrote it."""
+    import ast
+    try:
+        with open(path, 'r+b') as f:
+            magic = f.read(6)
+            if magic != b'\x93NUMPY':
+                raise ValueError("bad NPY magic")
+            major, _minor = f.read(2)
+            if major == 1:
+                hlen = int.from_bytes(f.read(2), 'little')
+                hstart = 10
+            else:
+                hlen = int.from_bytes(f.read(4), 'little')
+                hstart = 12
+            header = f.read(hlen).decode('latin1')
+            d = ast.literal_eval(header)
+            old_shape = tuple(d['shape'])
+            if final_count > old_shape[0]:
+                raise ValueError("final_count larger than allocated shape")
+            new_shape = (final_count,) + old_shape[1:]
+            new_header = (
+                "{'descr': %r, 'fortran_order': %r, 'shape': %r, }"
+                % (d['descr'], d['fortran_order'], new_shape)
+            )
+            # Same padding scheme as np.lib.format: spaces, trailing \n,
+            # total header length unchanged (the shape only shrinks).
+            if len(new_header) + 1 > hlen:
+                raise ValueError("new header does not fit in existing header")
+            padded = new_header + ' ' * (hlen - 1 - len(new_header)) + '\n'
+            f.seek(hstart)
+            f.write(padded.encode('latin1'))
+        row_bytes = int(np.dtype(d['descr']).itemsize)
+        for dim in old_shape[1:]:
+            row_bytes *= int(dim)
+        os.truncate(path, hstart + hlen + final_count * row_bytes)
+        check = np.load(path, mmap_mode='r')
+        if check.shape != new_shape:
+            raise ValueError(f"post-truncate shape {check.shape} != {new_shape}")
+        del check
+    except Exception as e:
+        print(f"[WARN] In-place NPY truncate failed ({type(e).__name__}: {e}) "
+              f"— falling back to copy", flush=True)
+        mm = np.lib.format.open_memmap(path, mode='r+')
+        truncated = mm[:final_count].copy()
+        del mm
+        np.save(path, truncated)
+        del truncated
+
+
 def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
                   preloaded=None, chunks_done_so_far: int = 0, redis_chunk_id: str = None,
-                  gpu_pool: 'GpuWorkerPool' = None):
+                  gpu_pool: 'GpuWorkerPool' = None, item_queue=None,
+                  overlap_pf=None, handoff: '_ChunkRun' = None,
+                  handoff_out=None, hb=None):
     """
     Extract features for a chunk. Returns (features_file, metadata_file, local_csv)
     for async upload, or None if chunk was empty.
@@ -1412,11 +1703,34 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
     gpu_pool: when provided (n_gpus > 1), partitions records across the pool's
         child processes and stitches partial NPYs. When None, runs the legacy
         single-process extraction loop. `extractor` is ignored in pool mode.
+    item_queue: shared download→extract queue (single-GPU path). Must be the
+        SAME object across calls for cross-chunk overlap; created locally if
+        omitted (overlap disabled in that case).
+    overlap_pf: the main loop's prefetch result ref ([None] or
+        [(next_id, csv, records, meta, bmeta)]). When the current chunk
+        enters its straggler tail, the next chunk's downloader is started
+        into the shared queue and the entry is consumed (set to None).
+    handoff: a _ChunkRun for THIS chunk whose downloader was already started
+        by the previous call's overlap — skips CSV/setup entirely.
+    handoff_out: single-element list; on return it holds the next chunk's
+        live _ChunkRun (or None) for the caller to pass back as `handoff`.
     """
     _rcid = redis_chunk_id or chunk_id
     city = CITY_NAME
 
-    if preloaded:
+    run = None
+    if handoff is not None:
+        # Overlap handoff: downloader already running into item_queue; files,
+        # sink and stats were created at overlap-start with this chunk's own
+        # city naming. The prefetch thread already downloaded its CSV.
+        run = handoff
+        local_csv = run.local_csv
+        records = None
+        metadata_map = None
+        total_records = run.total_records
+        print(f"[CHUNK {chunk_id}] Resuming overlapped run: {total_records} "
+              f"panos, {run.stats['ext_ok']} views already extracted", flush=True)
+    elif preloaded:
         local_csv, records, metadata_map = preloaded
         total_records = len(records)
         print(f"[CHUNK {chunk_id}] Using pre-fetched CSV ({total_records} panos)")
@@ -1531,27 +1845,28 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
 
         return features_file, metadata_file, local_csv
 
-    # ~270MB for 1K panos × 8 views × 8448 dim × 4 bytes
-    features_memmap = np.lib.format.open_memmap(
-        features_file, mode='w+', dtype='float32',
-        shape=(total_views_est, feature_dim)
-    )
-
-    shared_state = SharedState(features_memmap, metadata_file, failed_file, start_idx=0)
-
-    # ── Step 4: Download + extract ──
+    # ── Step 4: Download + extract (single-GPU path) ──
     # Thumbnail mode: no tile-row pre-computation needed (server renders
     # the perspective view directly from yaw/pitch/fov).
-    dl_config = dict(HARDCODED_CONFIG)
+    if item_queue is None:
+        # Legacy caller without a shared queue — overlap can't span calls.
+        item_queue = queue.Queue(maxsize=HARDCODED_CONFIG['queue_size'])
+        overlap_pf = None
 
-    item_queue = queue.Queue(maxsize=dl_config['queue_size'])
-    stats = {'dl_ok': 0, 'dl_fail': 0, 'ext_ok': 0, 'views_produced': 0, 'dl_done': False}
+    if run is None:
+        # ~270MB memmap for 1K panos × 8 views × 8448 dim × 4 bytes,
+        # allocated inside _start_chunk_run together with the sink + stats.
+        run = _start_chunk_run(work_dir, item_queue, chunk_id, _rcid,
+                               local_csv, records, metadata_map, city)
 
-    dl_thread = threading.Thread(
-        target=downloader_thread,
-        args=(records, dl_config, item_queue, metadata_map, stats, shared_state)
-    )
-    dl_thread.start()
+    shared_state = run.sink
+    stats = run.stats
+    dl_thread = run.dl_thread
+    features_file = run.features_file
+    metadata_file = run.metadata_file
+    total_views_est = run.total_views_est
+    next_run: Optional[_ChunkRun] = None
+    overlap_attempted = False
 
     # ── Extraction loop ──
     loop_start = time.time()
@@ -1571,10 +1886,77 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
     except Exception:
         pass
 
-    pending_batch: List[ViewItem] = []
-    pending_futures = None
+    pending_batch: List[ViewItem] = run.pending_batch or []
+    pending_futures = run.pending_futures
+    run.pending_batch = []
+    run.pending_futures = None
     last_gc = 0
+    if stats['ext_ok']:
+        # Handed-off run: progress already happened — seed the stall
+        # detector so the head start isn't misread as a stall window.
+        last_progress_count = stats['ext_ok']
 
+    def _flush_pending():
+        """Run inference on the pending batch, routing each row to its own
+        chunk's sink (overlap can mix two chunks in one batch)."""
+        nonlocal pending_batch, pending_futures, last_progress_time, \
+            last_progress_count, last_gc
+        if not pending_batch or pending_futures is None:
+            pending_batch = []
+            pending_futures = None
+            return
+        batch_start = time.time()
+        try:
+            feats_np, meta_batch, valid_indices = extractor.infer_prefetched(
+                pending_batch, pending_futures)
+            if feats_np is None:
+                for it in pending_batch:
+                    it.sink.dropped += 1
+            else:
+                # feats_np rows align with valid_indices order. Group rows
+                # by sink; single-sink batches skip the fancy-index copy.
+                valid_set = set(valid_indices)
+                for i, it in enumerate(pending_batch):
+                    if i not in valid_set:
+                        it.sink.dropped += 1
+                groups = {}
+                for row, vi in enumerate(valid_indices):
+                    s = pending_batch[vi].sink
+                    g = groups.get(id(s))
+                    if g is None:
+                        g = (s, [], [])
+                        groups[id(s)] = g
+                    g[1].append(row)
+                    g[2].append(meta_batch[row])
+                for s, rows, metas in groups.values():
+                    if len(rows) == feats_np.shape[0]:
+                        s.write_batch(feats_np, metas)
+                    else:
+                        s.write_batch(feats_np[rows], metas)
+                    owner = getattr(s, 'owner_stats', None)
+                    if owner is not None:
+                        owner['ext_ok'] += len(metas)
+                del feats_np, meta_batch
+                last_progress_time = time.time()
+                last_progress_count = stats['ext_ok']
+            batch_times.append(time.time() - batch_start)
+            # Watermark, not modulo — ext_ok grows by batch-size steps and
+            # rarely lands exactly on a 5000 multiple.
+            if stats['ext_ok'] - last_gc >= 5000:
+                gc.collect()
+                last_gc = stats['ext_ok']
+        except Exception as e:
+            print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            for it in pending_batch:
+                it.sink.dropped += 1
+        finally:
+            pending_batch = []
+            pending_futures = None
+
+    loop_error = None
+    interrupted = False
     try:
         while True:
             now = time.time()
@@ -1601,6 +1983,32 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
                     print(f"[WARN] Heartbeat failed: {e}", flush=True)
                 last_heartbeat_time = now
 
+            # ── Chunk complete? (downloader dead + every produced view
+            # written or dropped). With overlap the queue is rarely empty,
+            # so this must be checked here, not only on a dry queue. ──
+            if run.is_complete():
+                if pending_batch and any(it.sink is shared_state
+                                         for it in pending_batch):
+                    _flush_pending()
+                    continue
+                break
+
+            # ── Cross-chunk overlap: current chunk is in its straggler
+            # tail and the next chunk's CSV is prefetched — start its
+            # downloader into the SAME queue so neither the network nor
+            # the GPU idles across the chunk boundary. ──
+            if (CHUNK_OVERLAP and next_run is None and not overlap_attempted
+                    and gpu_pool is None
+                    and overlap_pf is not None and overlap_pf[0] is not None
+                    and not stats.get('ip_blocked_403')):
+                remaining_panos = (total_records - stats['dl_ok']
+                                   - stats['dl_fail'])
+                if remaining_panos <= max(
+                        8, int(total_records * OVERLAP_TAIL_FRACTION)):
+                    overlap_attempted = True
+                    next_run = _try_start_overlap(
+                        overlap_pf, r2, tq, work_dir, item_queue, hb)
+
             # ── Stall detection ──
             since_progress = now - last_progress_time
             if since_progress > STALL_TIMEOUT and stats['ext_ok'] == last_progress_count:
@@ -1620,12 +2028,17 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
                       f"views={stats['ext_ok']:,}/{total_views_est:,} ({pct}%) | "
                       f"speed={speed:.1f} views/s | eta={eta/60:.1f}min | "
                       f"dl_ok={stats['dl_ok']} | dl_fail={stats['dl_fail']} | "
-                      f"queue={item_queue.qsize()}", flush=True)
+                      f"queue={item_queue.qsize()}"
+                      + (f" | overlap={next_run.chunk_id}" if next_run else ""),
+                      flush=True)
                 last_log_time = now
 
             # ── Fill next batch ──
             current_batch: List[ViewItem] = []
             fill_deadline = None
+            dl_feeding = (dl_thread.is_alive()
+                          or (next_run is not None
+                              and next_run.dl_thread.is_alive()))
             while len(current_batch) < extractor.batch_size:
                 try:
                     item = item_queue.get(timeout=0.01)
@@ -1637,64 +2050,24 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
                     # only momentarily dried up, keep polling up to ~75ms
                     # before dispatching an inefficient tiny GPU batch.
                     if (len(current_batch) >= extractor.batch_size // 2
-                            or not dl_thread.is_alive()):
+                            or not dl_feeding):
                         break
                     if fill_deadline is None:
                         fill_deadline = time.time() + 0.075
                     if time.time() >= fill_deadline:
                         break
 
-            # ── No new items: drain pending then check for exit ──
+            # ── No new items: drain pending then loop (completion is
+            # detected at the top of the loop) ──
             if not current_batch:
-                if pending_batch and pending_futures is not None:
-                    batch_start = time.time()
-                    try:
-                        feats_np, meta_batch, _ = extractor.infer_prefetched(pending_batch, pending_futures)
-                        if feats_np is not None and len(meta_batch) > 0:
-                            shared_state.write_batch(feats_np, meta_batch)
-                            stats['ext_ok'] += len(meta_batch)
-                            last_progress_time = time.time()
-                            last_progress_count = stats['ext_ok']
-                            del feats_np, meta_batch
-                        batch_times.append(time.time() - batch_start)
-                        # Watermark, not modulo — ext_ok grows by batch-size
-                        # steps and rarely lands exactly on a 5000 multiple.
-                        if stats['ext_ok'] - last_gc >= 5000:
-                            gc.collect()
-                            last_gc = stats['ext_ok']
-                    except Exception as e:
-                        print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
-                        import traceback
-                        traceback.print_exc()
-                    finally:
-                        pending_batch = []
-                        pending_futures = None
-                if not dl_thread.is_alive():
-                    break
+                _flush_pending()
                 continue
 
             # ── Submit decode of current batch ──
             current_futures = extractor.start_decode(current_batch)
 
             # ── GPU inference on pending batch ──
-            if pending_batch and pending_futures is not None:
-                batch_start = time.time()
-                try:
-                    feats_np, meta_batch, _ = extractor.infer_prefetched(pending_batch, pending_futures)
-                    if feats_np is not None and len(meta_batch) > 0:
-                        shared_state.write_batch(feats_np, meta_batch)
-                        stats['ext_ok'] += len(meta_batch)
-                        last_progress_time = time.time()
-                        last_progress_count = stats['ext_ok']
-                        del feats_np, meta_batch
-                    batch_times.append(time.time() - batch_start)
-                    if stats['ext_ok'] - last_gc >= 5000:
-                        gc.collect()
-                        last_gc = stats['ext_ok']
-                except Exception as e:
-                    print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
-                    import traceback
-                    traceback.print_exc()
+            _flush_pending()
 
             # ── Promote current batch to pending ──
             pending_batch = current_batch
@@ -1702,27 +2075,59 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
 
     except KeyboardInterrupt:
         print("[WARN] Interrupted", flush=True)
+        interrupted = True
+    except BaseException as e:
+        loop_error = e
 
-    # Signal the downloader to wind down (checked in its dispatch loop and
-    # its executor put-loop) and drain item_queue while joining — a full
-    # queue with no consumer would otherwise deadlock the join forever.
-    stats['stop_requested'] = True
-    _join_deadline = time.time() + 120
-    while dl_thread.is_alive() and time.time() < _join_deadline:
-        try:
-            while True:
-                item_queue.get_nowait()
-        except queue.Empty:
-            pass
-        dl_thread.join(timeout=1.0)
-    if dl_thread.is_alive():
-        print("[WARN] Downloader thread did not exit within 120s — "
-              "proceeding without it", flush=True)
+    # ── Wind down ──
+    # Normal exit: the current downloader is already dead (run.is_complete).
+    # Abnormal exit (stall, interrupt, batch crash): stop BOTH downloaders
+    # and drain the shared queue while joining — a full queue with no
+    # consumer would deadlock the join forever. The overlap run cannot
+    # survive an abnormal exit (the drain throws its items away), so it is
+    # aborted and unclaimed.
+    if dl_thread.is_alive() or loop_error is not None or interrupted:
+        stats['stop_requested'] = True
+        if next_run is not None:
+            next_run.stats['stop_requested'] = True
+        _join_deadline = time.time() + 120
+        while dl_thread.is_alive() and time.time() < _join_deadline:
+            try:
+                while True:
+                    item_queue.get_nowait()
+            except queue.Empty:
+                pass
+            dl_thread.join(timeout=1.0)
+        if dl_thread.is_alive():
+            print("[WARN] Downloader thread did not exit within 120s — "
+                  "proceeding without it", flush=True)
+        if next_run is not None:
+            _abort_run(next_run, tq, item_queue, work_dir,
+                       reason="sibling_chunk_aborted", hb=hb)
+            next_run = None
+
+    # Leftover pending items at a clean break can only belong to the overlap
+    # run (the current chunk's accounting closed) — carry them across the
+    # handoff or their views would never be written and the next chunk's
+    # completion accounting would never close.
+    if next_run is not None and pending_batch:
+        next_run.pending_batch = pending_batch
+        next_run.pending_futures = pending_futures
+        pending_batch = []
+        pending_futures = None
+
     final_count = shared_state.write_idx
     shared_state.close()
 
+    if loop_error is not None:
+        _cleanup_chunk_files(work_dir, chunk_id, local_csv,
+                             out_base=run.out_base)
+        raise loop_error
+
     # ── Truncate memmap to actual size ──
-    del features_memmap
+    mm_ref = shared_state.memmap
+    shared_state.memmap = None
+    del mm_ref
     gc.collect()
 
     # ── If IP got 403-blocked at any point, this chunk is unfinished. ──
@@ -1735,7 +2140,14 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
               f"(dl_ok={stats['dl_ok']}, dl_fail={stats['dl_fail']}, "
               f"partial_features={final_count}). Discarding partial output.",
               flush=True)
-        _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+        # The overlap run shares this instance's IP — same block. Abort it
+        # so its chunk is unclaimed before we self-destruct.
+        if next_run is not None:
+            _abort_run(next_run, tq, item_queue, work_dir,
+                       reason="ip_blocked_403_overlap", hb=hb)
+            next_run = None
+        _cleanup_chunk_files(work_dir, chunk_id, local_csv,
+                             out_base=run.out_base)
         raise IPBlockedError(
             f"Chunk {chunk_id}: IP 403-blocked by Google (probe returned "
             "sorry.google.com). Partial output discarded — unclaim + "
@@ -1744,18 +2156,31 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
 
     if final_count == 0 and total_records > 0:
         print(f"[ERROR] Chunk {chunk_id}: 0 features from {total_records} panos!")
-        _cleanup_chunk_files(work_dir, chunk_id, local_csv)
+        # Exception paths in the caller never consume handoffs — abort the
+        # overlap run (unclaims its chunk) rather than leaking it.
+        if next_run is not None:
+            _abort_run(next_run, tq, item_queue, work_dir,
+                       reason="sibling_chunk_failed", hb=hb)
+            next_run = None
+        _cleanup_chunk_files(work_dir, chunk_id, local_csv,
+                             out_base=run.out_base)
         raise RuntimeError(f"Zero features extracted from chunk {chunk_id}")
 
     if final_count > 0 and final_count < total_views_est:
         print(f"[CHUNK {chunk_id}] Truncating features: {total_views_est} → {final_count}")
-        mm = np.lib.format.open_memmap(features_file, mode='r+')
-        truncated = mm[:final_count].copy()
-        del mm
-        np.save(features_file, truncated)
-        del truncated
+        _truncate_npy(features_file, final_count)
 
     print(f"[CHUNK {chunk_id}] Extraction complete: {final_count} features")
+
+    # Hand the live overlap run (if any) back to the caller, which passes it
+    # to the next process_chunk call as `handoff`.
+    if handoff_out is not None:
+        handoff_out[0] = next_run
+    elif next_run is not None:
+        # No caller slot to receive it — should not happen, but never leak a
+        # claimed chunk.
+        _abort_run(next_run, tq, item_queue, work_dir,
+                   reason="no_handoff_slot", hb=hb)
 
     # Return file paths for async upload (caller handles upload + cleanup)
     return features_file, metadata_file, local_csv
@@ -3141,6 +3566,11 @@ def main():
 
     # Pipeline state
     prefetched = None       # (chunk_id, local_csv, records, metadata_map[, batch_meta])
+    # Shared download→extract queue: ONE queue across all chunks so an
+    # overlapped next-chunk downloader can feed it while the current chunk's
+    # straggler tail drains (single-GPU path only; pool mode ignores it).
+    shared_item_queue = queue.Queue(maxsize=HARDCODED_CONFIG['queue_size'])
+    live_handoff = None     # _ChunkRun whose downloader is already running
 
     while True:
         # ── Drain any uploads that finished while we were extracting ──
@@ -3151,9 +3581,19 @@ def main():
         chunks_done += d
         chunks_failed += f
 
-        # ── Get next chunk: from prefetch or fresh claim ──
+        # ── Get next chunk: live handoff, prefetch, or fresh claim ──
         _bmeta = None  # batch metadata for current chunk
-        if prefetched is not None:
+        cur_handoff = None
+        if live_handoff is not None:
+            # The previous process_chunk already started this chunk's
+            # downloader (cross-chunk overlap). Its files/sink exist; the
+            # R2 skip check was done at overlap start.
+            cur_handoff = live_handoff
+            live_handoff = None
+            chunk_id = cur_handoff.redis_cid
+            _bmeta = cur_handoff.bmeta
+            preloaded_data = None
+        elif prefetched is not None:
             chunk_id = prefetched[0]
             pf_csv, pf_records, pf_meta = prefetched[1], prefetched[2], prefetched[3]
             _bmeta = prefetched[4] if len(prefetched) > 4 else None
@@ -3246,8 +3686,10 @@ def main():
             print(f"[BATCH] {_redis_cid} → {CITY_NAME} {chunk_id} "
                   f"(csv={CSV_BUCKET_PREFIX}, feat={FEATURES_BUCKET_PREFIX})")
 
-            # Skip entire city if its CSV prefix previously 404'd
-            if CSV_BUCKET_PREFIX in skip_city_prefixes:
+            # Skip entire city if its CSV prefix previously 404'd. NEVER for
+            # a handed-off chunk: its CSV already downloaded fine and its
+            # downloader is running — bailing here would leak the run.
+            if CSV_BUCKET_PREFIX in skip_city_prefixes and cur_handoff is None:
                 print(f"[SKIP-CITY] {CITY_NAME} — CSVs missing on R2, skipping {_redis_cid}")
                 try:
                     tq.fail_task(REGION, _redis_cid, INSTANCE_ID,
@@ -3262,28 +3704,30 @@ def main():
         # Requires BOTH the NPY and its metadata JSONL with size > 0,
         # mirroring the startup reconcile — an NPY whose metadata upload
         # failed (or a zero-byte torn object) must be re-extracted, not
-        # marked done.
-        out_base = _output_base(CITY_NAME, chunk_id)
-        npy_key = f"{FEATURES_BUCKET_PREFIX}/{out_base}.npy"
-        meta_skip_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{out_base}.jsonl"
-        try:
-            if r2.object_size(npy_key) > 0 and r2.object_size(meta_skip_key) > 0:
-                print(f"[SKIP] Chunk {chunk_id} output (NPY + metadata) already "
-                      f"on R2 — marking done")
-                try:
-                    tq.complete_task(REGION, _redis_cid, INSTANCE_ID)
-                except Exception:
-                    pass
-                hb.unregister(_redis_cid)
-                chunks_done += 1
-                prefetched = None
-                continue
-        except Exception:
-            pass  # If check fails, process normally
+        # marked done. Handed-off chunks were checked at overlap start.
+        if cur_handoff is None:
+            out_base = _output_base(CITY_NAME, chunk_id)
+            npy_key = f"{FEATURES_BUCKET_PREFIX}/{out_base}.npy"
+            meta_skip_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{out_base}.jsonl"
+            try:
+                if r2.object_size(npy_key) > 0 and r2.object_size(meta_skip_key) > 0:
+                    print(f"[SKIP] Chunk {chunk_id} output (NPY + metadata) already "
+                          f"on R2 — marking done")
+                    try:
+                        tq.complete_task(REGION, _redis_cid, INSTANCE_ID)
+                    except Exception:
+                        pass
+                    hb.unregister(_redis_cid)
+                    chunks_done += 1
+                    prefetched = None
+                    continue
+            except Exception:
+                pass  # If check fails, process normally
 
         print(f"\n{'='*60}")
-        print(f"[INFO] {'Pre-fetched' if preloaded_data else 'Claimed'} chunk: {chunk_id} "
-              f"(completed so far: {chunks_done})")
+        print(f"[INFO] "
+              f"{'Overlapped' if cur_handoff is not None else ('Pre-fetched' if preloaded_data else 'Claimed')} "
+              f"chunk: {chunk_id} (completed so far: {chunks_done})")
         print(f"{'='*60}")
 
         # ── Prefetch next chunk's CSV in background during extraction ──
@@ -3296,12 +3740,22 @@ def main():
         pf_thread.start()
 
         # ── Process current chunk ──
+        handoff_slot = [None]
         try:
             result = process_chunk(r2, tq, extractor, chunk_id, work_dir,
                                    preloaded=preloaded_data,
                                    chunks_done_so_far=chunks_done,
                                    redis_chunk_id=_redis_cid,
-                                   gpu_pool=gpu_pool)
+                                   gpu_pool=gpu_pool,
+                                   item_queue=shared_item_queue,
+                                   overlap_pf=pf_result,
+                                   handoff=cur_handoff,
+                                   handoff_out=handoff_slot,
+                                   hb=hb)
+            # If the straggler-tail overlap kicked in, the next chunk's
+            # downloader is already running — carry it into the next
+            # iteration instead of consuming the (already-spent) prefetch.
+            live_handoff = handoff_slot[0]
 
             # Wait for prefetch to finish before starting upload
             pf_thread.join()
