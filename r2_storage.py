@@ -50,9 +50,9 @@ class R2Client:
             aws_access_key_id=self.access_key_id,
             aws_secret_access_key=self.secret_access_key,
             config=Config(
-                retries={"max_attempts": 3, "mode": "adaptive"},
+                retries={"max_attempts": 8, "mode": "adaptive"},
                 s3={"addressing_style": "path"},
-                read_timeout=120,     # 2 min per chunk — 8MB at 0.1 MB/s = 80s
+                read_timeout=120,     # 2 min per request
                 connect_timeout=30,
             ),
             region_name="auto",
@@ -67,15 +67,6 @@ class R2Client:
         local_path = str(local_path)
         file_size = os.path.getsize(local_path)
 
-        # Use smaller chunks and single-threaded upload for files >1GB
-        # to avoid overwhelming flaky connections on rented machines.
-        if file_size > 1 * 1024 * 1024 * 1024:  # >1GB
-            chunk_size = 8 * 1024 * 1024       # 8MB parts
-            concurrency = 1                     # sequential uploads
-        else:
-            chunk_size = 25 * 1024 * 1024       # 25MB parts
-            concurrency = 4
-
         for attempt in range(1, max_retries + 1):
             try:
                 callback = None
@@ -86,10 +77,17 @@ class R2Client:
                         progress_callback(transferred[0], file_size)
                     callback = _cb
 
+                # Single PUT for anything under 512MB: R2's single-PUT limit
+                # is ~5GB and our largest NPY is ~258MB, so the whole file
+                # goes in ONE request that either lands or fails atomically.
+                # Multipart to R2 from rented machines was failing every
+                # attempt ("connection closed before valid response") and
+                # each retry created yet another orphaned multipart upload.
+                # Files above the threshold (none today) use 64MB parts.
                 config = boto3.s3.transfer.TransferConfig(
-                    multipart_threshold=chunk_size,
-                    multipart_chunksize=chunk_size,
-                    max_concurrency=concurrency,
+                    multipart_threshold=512 * 1024 * 1024,
+                    multipart_chunksize=64 * 1024 * 1024,
+                    max_concurrency=4,
                 )
                 self.s3.upload_file(local_path, self.bucket_name, bucket_key,
                                     Callback=callback, Config=config)
@@ -104,11 +102,47 @@ class R2Client:
             except Exception as e:
                 print(f"[R2] Upload attempt {attempt}/{max_retries}: {e}")
                 if attempt < max_retries:
-                    # Reset client to clear stale connections before retry
+                    # Reset client to clear stale connections and abort any
+                    # orphaned multipart upload before retry
                     self.reset_client()
+                    self.abort_pending_multipart(bucket_key)
                     time.sleep(2 ** attempt)
 
+        self.abort_pending_multipart(bucket_key)
         return False
+
+    def abort_pending_multipart(self, bucket_key: str) -> int:
+        """Abort any in-progress multipart uploads for this exact key.
+
+        Failed multipart attempts leave orphaned uploads server-side; each
+        retry that re-creates the upload from scratch adds another orphan
+        whose parts count against storage forever. Call before re-attempting
+        a key and on final failure. Returns the number aborted.
+        """
+        aborted = 0
+        try:
+            resp = self.s3.list_multipart_uploads(
+                Bucket=self.bucket_name, Prefix=bucket_key
+            )
+            for up in resp.get("Uploads", []):
+                if up.get("Key") != bucket_key:
+                    continue
+                upload_id = up.get("UploadId", "")
+                try:
+                    self.s3.abort_multipart_upload(
+                        Bucket=self.bucket_name, Key=bucket_key,
+                        UploadId=upload_id,
+                    )
+                    aborted += 1
+                except Exception as e:
+                    print(f"[R2] Abort multipart {upload_id[:12]} for "
+                          f"{bucket_key} failed: {e}")
+            if aborted:
+                print(f"[R2] Aborted {aborted} pending multipart upload(s) "
+                      f"for {bucket_key}")
+        except Exception as e:
+            print(f"[R2] list_multipart_uploads failed for {bucket_key}: {e}")
+        return aborted
 
     def upload_json(self, bucket_key: str, data: dict, max_retries: int = 3) -> bool:
         """Upload a dict as JSON to R2 without needing a temp file."""
@@ -140,13 +174,45 @@ class R2Client:
                     keys.append(key)
         return keys
 
-    def file_exists(self, bucket_key: str) -> bool:
-        """Check if an object exists in the bucket."""
+    def file_exists(self, bucket_key: str, expected_size: int = None) -> bool:
+        """Check if an object exists in the bucket.
+
+        If expected_size is given, the object's ContentLength must match —
+        a half-landed or stale object must not pass as "already uploaded".
+        """
         try:
-            self.s3.head_object(Bucket=self.bucket_name, Key=bucket_key)
+            resp = self.s3.head_object(Bucket=self.bucket_name, Key=bucket_key)
+            if expected_size is not None and resp.get("ContentLength") != expected_size:
+                return False
             return True
         except Exception:
             return False
+
+    def object_size(self, bucket_key: str) -> int:
+        """Return the object's size in bytes, or -1 if missing/unreachable."""
+        try:
+            resp = self.s3.head_object(Bucket=self.bucket_name, Key=bucket_key)
+            return int(resp.get("ContentLength", 0))
+        except Exception:
+            return -1
+
+    def object_missing(self, bucket_key: str) -> Optional[bool]:
+        """Classify a key: True = definitely missing (404/NoSuchKey),
+        False = exists, None = transient error (unknown).
+
+        Used to distinguish "city CSVs really aren't on R2" (blacklist)
+        from "R2 is having a moment" (retry later, no blacklist)."""
+        try:
+            self.s3.head_object(Bucket=self.bucket_name, Key=bucket_key)
+            return False
+        except ClientError as e:
+            code = str((e.response.get("Error") or {}).get("Code", ""))
+            status = (e.response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+            if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+                return True
+            return None
+        except Exception:
+            return None
 
     def delete_object(self, bucket_key: str) -> bool:
         """Delete an object from R2."""

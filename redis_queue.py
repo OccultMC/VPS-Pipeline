@@ -29,6 +29,19 @@ class TaskQueue:
 
     def __init__(self, redis_url: str, redis_token: str):
         self.redis = Redis(url=redis_url, token=redis_token)
+        # upstash_redis 1.6.0 builds httpx.Client(timeout=None) internally —
+        # any Redis call can hang forever on a dead connection, freezing the
+        # worker. Patch a 10s timeout onto the underlying httpx client
+        # (attribute path verified against upstash_redis/http.py: SyncHttpClient
+        # stores it at Redis._http._client).
+        try:
+            import httpx
+            self.redis._http._client.timeout = httpx.Timeout(10.0)
+            logger.info("Patched Upstash httpx client timeout to 10s")
+        except (AttributeError, ImportError) as e:
+            print(f"[WARN] Could not patch Upstash httpx timeout "
+                  f"({type(e).__name__}: {e}) — Redis calls may hang "
+                  f"indefinitely on dead connections", flush=True)
 
     # ── Key helpers ───────────────────────────────────────────────────────
 
@@ -49,6 +62,9 @@ class TaskQueue:
 
     def _fcnt_key(self, region: str) -> str:
         return f"job:{region}:fcnt"
+
+    def _ucnt_key(self, region: str) -> str:
+        return f"job:{region}:ucnt"
 
     def _worker_status_key(self, region: str, worker_id: str) -> str:
         return f"job:{region}:ws:{worker_id}"
@@ -88,6 +104,14 @@ class TaskQueue:
             f"{total_panos} panos"
         )
 
+    # LPOP todo + HSET active in one atomic server-side script — a crash
+    # between the two calls would otherwise lose the chunk entirely.
+    _CLAIM_LUA = (
+        "local cid = redis.call('LPOP', KEYS[1]) "
+        "if cid then redis.call('HSET', KEYS[2], cid, ARGV[1]) end "
+        "return cid"
+    )
+
     def claim_task(self, region: str, worker_id: str) -> Optional[str]:
         """
         Atomically pop a chunk from the todo list and mark it active.
@@ -96,6 +120,20 @@ class TaskQueue:
         """
         todo_key = self._todo_key(region)
         active_key = self._active_key(region)
+
+        try:
+            chunk_id = self.redis.eval(
+                self._CLAIM_LUA,
+                keys=[todo_key, active_key],
+                args=[f"{worker_id}|{time.time()}"],
+            )
+            if chunk_id is None:
+                return None
+            logger.info(f"Claimed chunk {chunk_id} for worker {worker_id}")
+            return chunk_id
+        except Exception as e:
+            print(f"[WARN] claim_task EVAL failed ({type(e).__name__}: {e}) "
+                  f"— falling back to non-atomic LPOP+HSET", flush=True)
 
         chunk_id = self.redis.lpop(todo_key)
         if chunk_id is None:
@@ -107,32 +145,68 @@ class TaskQueue:
         return chunk_id
 
     def complete_task(self, region: str, chunk_id: str, worker_id: str):
-        """Move a task from active to done."""
+        """Move a task from active to done.
+
+        SADD done BEFORE HDEL active: a crash between the two leaves the
+        chunk in both sets, which reclaim/reconcile resolve as a no-op
+        duplicate. The reverse order would lose the chunk entirely.
+        """
         active_key = self._active_key(region)
         done_key = self._done_key(region)
 
-        self.redis.hdel(active_key, chunk_id)
         self.redis.sadd(done_key, chunk_id)
+        self.redis.hdel(active_key, chunk_id)
         logger.info(f"Completed chunk {chunk_id} (worker {worker_id})")
 
-    def unclaim_task(self, region: str, chunk_id: str, worker_id: str, reason: str = ""):
+    MAX_UNCLAIMS = 10
+
+    def unclaim_task(self, region: str, chunk_id: str, worker_id: str,
+                     reason: str = "", back: bool = False):
         """
         Return a task to todo WITHOUT incrementing the fail counter.
 
-        Use when the failure is self-inflicted (e.g. this worker's IP got
-        403-blocked by Google) so a fresh worker on a different IP isn't
-        punished for the previous worker's misfortune. The chunk is pushed
-        to the FRONT of the todo list so it's retried promptly.
+        Use when the failure is self-inflicted or infrastructural (IP
+        403-block, upload failure, disk pressure) so a fresh worker isn't
+        punished for the previous worker's misfortune.
+
+        back=False (default) → LPUSH front: genuine-IP-block path, a new
+        instance with a fresh IP should pick the chunk up first.
+        back=True → RPUSH back: infra failures, let other chunks go first.
+
+        A separate unclaim counter (ucnt) caps infinite unclaim ping-pong:
+        after MAX_UNCLAIMS the chunk is routed to the failed set instead.
         """
         active_key = self._active_key(region)
         todo_key = self._todo_key(region)
 
+        try:
+            ucnt = self.redis.hincrby(self._ucnt_key(region), chunk_id, 1)
+        except Exception as e:
+            print(f"[WARN] unclaim counter HINCRBY failed for {chunk_id}: {e}",
+                  flush=True)
+            ucnt = 1
+
+        if ucnt >= self.MAX_UNCLAIMS:
+            print(f"[WARN] !!! chunk {chunk_id} unclaimed {ucnt} times "
+                  f"(worker {worker_id}, reason: {reason}) — routing to "
+                  f"FAILED set instead of requeueing !!!", flush=True)
+            self.redis.sadd(self._failed_key(region), chunk_id)
+            self.redis.hdel(active_key, chunk_id)
+            logger.warning(
+                f"Chunk {chunk_id} permanently failed after {ucnt} unclaims"
+            )
+            return
+
         self.redis.hdel(active_key, chunk_id)
-        # lpush so the chunk is picked up quickly by the next worker
-        self.redis.lpush(todo_key, chunk_id)
+        if back:
+            self.redis.rpush(todo_key, chunk_id)
+        else:
+            # lpush so the chunk is picked up quickly by the next worker
+            self.redis.lpush(todo_key, chunk_id)
         logger.warning(
             f"Unclaimed chunk {chunk_id} (worker {worker_id}) — {reason} — "
-            "returned to todo without fail-count bump"
+            f"returned to todo ({'back' if back else 'front'}) without "
+            f"fail-count bump (unclaim {ucnt}/{self.MAX_UNCLAIMS})"
         )
 
     def fail_task(
@@ -166,6 +240,34 @@ class TaskQueue:
         active_key = self._active_key(region)
         self.redis.hset(active_key, chunk_id, f"{worker_id}|{time.time()}")
 
+    # Only refresh the timestamp if the chunk is still active — an
+    # unconditional HSET racing a concurrent complete/unclaim would
+    # re-insert a chunk that was just removed from the active hash.
+    _HB_LUA = (
+        "if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then "
+        "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]) return 1 "
+        "else return 0 end"
+    )
+
+    def heartbeat_if_active(self, region: str, worker_id: str, chunk_id: str) -> bool:
+        """Heartbeat only if the chunk is still in the active hash.
+
+        Used by the background HeartbeatThread, which can race the main
+        thread's complete_task/unclaim_task. Falls back to a plain
+        heartbeat if EVAL is unavailable.
+        """
+        active_key = self._active_key(region)
+        try:
+            res = self.redis.eval(
+                self._HB_LUA,
+                keys=[active_key],
+                args=[chunk_id, f"{worker_id}|{time.time()}"],
+            )
+            return bool(res)
+        except Exception:
+            self.redis.hset(active_key, chunk_id, f"{worker_id}|{time.time()}")
+            return True
+
     # ── Stale task recovery ───────────────────────────────────────────────
 
     def reclaim_stale(
@@ -194,14 +296,25 @@ class TaskQueue:
                 claimed_at = 0.0
 
             if now - claimed_at > timeout:
-                self.redis.hdel(active_key, chunk_id)
-                self.redis.rpush(todo_key, chunk_id)
-                reclaimed.append(chunk_id)
-                worker = parts[0] if len(parts) > 1 else "unknown"
-                logger.warning(
-                    f"Reclaimed stale chunk {chunk_id} "
-                    f"(was held by {worker} for {now - claimed_at:.0f}s)"
-                )
+                # Skip chunks already done — a complete_task that raced a
+                # previous reclaim can leave a stale active entry behind.
+                try:
+                    if self.redis.sismember(self._done_key(region), chunk_id):
+                        self.redis.hdel(active_key, chunk_id)
+                        continue
+                except Exception:
+                    pass
+                # Only requeue if WE removed the active entry (hdel == 1) —
+                # another worker's concurrent reclaim already requeued it
+                # otherwise, and a second rpush would duplicate the chunk.
+                if self.redis.hdel(active_key, chunk_id) == 1:
+                    self.redis.rpush(todo_key, chunk_id)
+                    reclaimed.append(chunk_id)
+                    worker = parts[0] if len(parts) > 1 else "unknown"
+                    logger.warning(
+                        f"Reclaimed stale chunk {chunk_id} "
+                        f"(was held by {worker} for {now - claimed_at:.0f}s)"
+                    )
 
         return reclaimed
 
@@ -436,12 +549,13 @@ class TaskQueue:
                     logger.info(f"redo_city: no done/failed chunks found for city '{city_name}' in {region}")
                     return []
 
-        # Move from done/failed → todo, clear fail counts
+        # Move from done/failed → todo, clear fail + unclaim counts
         reset = sorted(candidates)
         for chunk_id in reset:
             self.redis.srem(done_key, chunk_id)
             self.redis.srem(failed_key, chunk_id)
             self.redis.hdel(fcnt_key, chunk_id)
+            self.redis.hdel(self._ucnt_key(region), chunk_id)
 
         self.redis.rpush(todo_key, *reset)
 
@@ -471,6 +585,7 @@ class TaskQueue:
             self._done_key(region),
             self._failed_key(region),
             self._fcnt_key(region),
+            self._ucnt_key(region),
             self._meta_key(region),
             self._cmap_key(region),
         )

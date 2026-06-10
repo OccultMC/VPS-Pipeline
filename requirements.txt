@@ -18,5 +18,7 @@ torchvision>=0.15.0
 safetensors>=0.3.0
 timm>=0.9.0
 
-# Redis task queue (Upstash HTTP)
-upstash-redis>=1.0.0
+# Redis task queue (Upstash HTTP). Pinned: redis_queue.py patches a 10s
+# timeout onto the private Redis._http._client httpx attribute, whose path
+# was verified against this exact version's upstash_redis/http.py.
+upstash-redis==1.6.0

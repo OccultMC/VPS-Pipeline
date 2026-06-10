@@ -804,6 +804,38 @@ def load_csv(csv_path: str) -> Tuple[List[dict], Dict[str, Dict]]:
 # Async Downloader
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _blocking_put_items(item_queue, items, stats):
+    """Runs in an executor thread: blocking-put items onto the stdlib queue.
+
+    Checks the stop flag each second so shutdown can't deadlock on a full
+    queue whose consumer (extraction loop) has already exited.
+    Returns False if aborted by the stop flag.
+    """
+    for item in items:
+        while True:
+            if stats.get('stop_requested'):
+                return False
+            try:
+                item_queue.put(item, timeout=1.0)
+                break
+            except queue.Full:
+                continue
+    return True
+
+
+async def _queue_put_items(item_queue, items, stats):
+    """Bridge asyncio → blocking stdlib queue without freezing the event loop.
+
+    A direct item_queue.put(timeout=...) on the event loop blocks EVERY
+    in-flight request whenever the queue is full — the whole downloader
+    freezes until the GPU drains a batch. Run the blocking put in the
+    default executor instead.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _blocking_put_items, item_queue, items, stats)
+
+
 async def _download_single_pano(session, record, sem, config, item_queue, metadata, stats, shared_state):
     """Fetch all `num_views` server-rendered perspective views for one pano.
 
@@ -835,70 +867,82 @@ async def _download_single_pano(session, record, sem, config, item_queue, metada
         await asyncio.sleep(random.uniform(0, jitter_max))
 
     retries = 3
+    # Accumulate views across attempts so retries only refetch the yaws
+    # that actually failed — refetching all num_views on every retry
+    # multiplies per-IP request cost for no benefit.
+    view_results = [None] * num_views
     for attempt in range(1, retries + 1):
-        # Short-circuit if a previous request flagged this IP as blocked —
-        # no point wasting requests while the downloader is winding down.
-        if stats.get('ip_blocked_403'):
+        # Short-circuit if the probe flagged this IP as blocked or the
+        # extraction loop requested shutdown — don't waste requests.
+        if stats.get('ip_blocked_403') or stats.get('stop_requested'):
             return
         try:
             async with sem:
-                # Fan out N parallel thumbnail fetches. Each call handles its
-                # own 5xx/429 retry; we get back numpy RGB arrays or None.
+                # Fan out parallel thumbnail fetches for the still-missing
+                # yaws only. Each call handles its own 5xx/429 retry; we
+                # get back numpy RGB arrays or None.
+                missing_idx = [i for i, v in enumerate(view_results)
+                               if v is None]
                 tasks = [
                     fetch_thumbnail_view(
-                        session, panoid_str, y, pitch, fov,
+                        session, panoid_str, yaws[i], pitch, fov,
                         resolution, resolution, stats=stats,
                     )
-                    for y in yaws
+                    for i in missing_idx
                 ]
-                view_arrays = await asyncio.gather(*tasks)
+                fetched = await asyncio.gather(*tasks)
+                for i, arr in zip(missing_idx, fetched):
+                    view_results[i] = arr
 
-                # Re-check 403 flag — fetch_thumbnail_view sets it on any 403.
-                if stats.get('ip_blocked_403'):
-                    _throttle.maybe(
-                        'ip_blocked',
-                        f"[DL] HTTP 403 from streetviewpixels-pa — IP blocked, "
-                        f"winding down (http_403={stats.get('http_403', 0)})"
-                    )
-                    return
-
-                missing = sum(1 for v in view_arrays if v is None)
-                if missing:
-                    if attempt < retries:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    stats['dl_fail'] += 1
-                    stats.setdefault('fail_partial_views', 0)
-                    stats['fail_partial_views'] += 1
-                    _throttle.maybe(
-                        'partial_views',
-                        f"[DL] partial_views panoid={panoid_str} "
-                        f"missing={missing}/{num_views} "
-                        f"(total fail_partial_views={stats['fail_partial_views']}, "
-                        f"black={stats.get('black_views', 0)})"
-                    )
-                    shared_state.log_failure(
-                        panoid_str, f"partial_views:{missing}/{num_views}"
-                    )
-                    return
-
-                # All N views good — push as ViewItems sharing the same
-                # panoid + lat/lng. SharedState.write_batch keeps memmap
-                # rows and JSONL lines aligned under a lock.
-                meta = metadata.get(panoid_str, {'lat': 0.0, 'lng': 0.0})
-                for view_arr in view_arrays:
-                    item = ViewItem(panoid_str, view_arr, meta['lat'], meta['lng'])
-                    while True:
-                        try:
-                            item_queue.put(item, timeout=1.0)
-                            break
-                        except queue.Full:
-                            continue
-
-                stats['dl_ok'] += 1
-                stats['views_produced'] += num_views
-                del view_arrays
+            # Re-check 403 flag — only the probe machinery sets it now
+            # (a single pano's persistent 403 no longer flips it).
+            if stats.get('ip_blocked_403'):
+                _throttle.maybe(
+                    'ip_blocked',
+                    f"[DL] HTTP 403 from streetviewpixels-pa — IP blocked, "
+                    f"winding down (http_403={stats.get('http_403', 0)})"
+                )
                 return
+
+            missing = sum(1 for v in view_results if v is None)
+            if missing:
+                if attempt < retries:
+                    # Back off OUTSIDE the semaphore so a sleeping pano
+                    # doesn't hold one of the per-IP download slots.
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                # All-N-or-drop gate: partial panos would create row-count
+                # drift between NPY and JSONL across chunks.
+                stats['dl_fail'] += 1
+                stats.setdefault('fail_partial_views', 0)
+                stats['fail_partial_views'] += 1
+                _throttle.maybe(
+                    'partial_views',
+                    f"[DL] partial_views panoid={panoid_str} "
+                    f"missing={missing}/{num_views} "
+                    f"(total fail_partial_views={stats['fail_partial_views']}, "
+                    f"black={stats.get('black_views', 0)}, "
+                    f"suspect_403={stats.get('suspect_403', 0)})"
+                )
+                shared_state.log_failure(
+                    panoid_str, f"partial_views:{missing}/{num_views}"
+                )
+                return
+
+            # All N views good — push as ViewItems sharing the same
+            # panoid + lat/lng. SharedState.write_batch keeps memmap
+            # rows and JSONL lines aligned under a lock.
+            meta = metadata.get(panoid_str, {'lat': 0.0, 'lng': 0.0})
+            items = [
+                ViewItem(panoid_str, view_arr, meta['lat'], meta['lng'])
+                for view_arr in view_results
+            ]
+            if not await _queue_put_items(item_queue, items, stats):
+                return  # shutdown requested while queue was full
+
+            stats['dl_ok'] += 1
+            stats['views_produced'] += num_views
+            return
 
         except Exception as e:
             if attempt < retries:
@@ -1023,6 +1067,10 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
                     print("[DL] Mid-chunk 403 — skipping remaining panos.",
                           flush=True)
                     break
+                if stats.get('stop_requested'):
+                    print("[DL] Stop requested — skipping remaining panos.",
+                          flush=True)
+                    break
                 chunk = records[i:i + CHUNK]
                 print(f"[DL] Dispatching {len(chunk)} pano tasks "
                       f"(offset={i}/{len(records)})", flush=True)
@@ -1056,6 +1104,8 @@ async def _run_downloader(records, config, item_queue, metadata, stats, shared_s
               f"partial={stats.get('fail_partial_views', 0)} "
               f"black={stats.get('black_views', 0)} "
               f"http403={stats.get('http_403', 0)} "
+              f"suspect403={stats.get('suspect_403', 0)} "
+              f"fetch_exc={stats.get('fetch_exc', 0)} "
               f"exc={stats.get('fail_exc', 0)}", flush=True)
 
 
@@ -1163,6 +1213,42 @@ def upload_logs_to_r2():
         print(f"[WARN] Failed to upload logs to R2: {e}")
 
 
+MAX_LOG_BYTES = 200 * 1024 * 1024  # truncate tee'd log past this size
+
+
+def _truncate_log_if_huge():
+    """Upload-then-truncate the tee'd log once it exceeds MAX_LOG_BYTES.
+
+    A multi-day scrape's stdout can otherwise fill the disk. Called from
+    the 30s heartbeat block in the extraction loop.
+    """
+    try:
+        if os.path.getsize(LOG_FILE) < MAX_LOG_BYTES:
+            return
+    except OSError:
+        return
+    print(f"[INFO] Log file exceeded {MAX_LOG_BYTES // (1024**2)}MB — "
+          f"uploading to R2 then truncating", flush=True)
+    try:
+        upload_logs_to_r2()
+    except Exception:
+        pass
+    try:
+        old_fh = sys.stdout.log_file if isinstance(sys.stdout, TeeWriter) else None
+        new_fh = open(LOG_FILE, "w", encoding="utf-8", errors="replace")
+        for stream in (sys.stdout, sys.stderr):
+            if isinstance(stream, TeeWriter):
+                stream.log_file = new_fh
+        if old_fh is not None:
+            try:
+                old_fh.close()
+            except Exception:
+                pass
+        print("[INFO] Log file truncated after upload", flush=True)
+    except Exception as e:
+        print(f"[WARN] Log truncate failed: {e}", flush=True)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Self-Destruct
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1186,14 +1272,25 @@ def self_destruct():
             except Exception as e:
                 print(f"[WARN] Instance ID auto-detect failed: {e}")
 
+    # Missing creds: sleeping forever would burn money on a paid GPU.
+    # Upload logs and exit(1) so the entrypoint's failure path (retry →
+    # API self-destruct) takes over.
     if not instance_id:
-        print("[WARN] Cannot self-destruct: unable to determine INSTANCE_ID — sleeping forever")
-        while True:
-            time.sleep(3600)
+        print("[ERROR] Cannot self-destruct: unable to determine INSTANCE_ID — "
+              "uploading logs and exiting(1) for entrypoint to handle", flush=True)
+        try:
+            upload_logs_to_r2()
+        except Exception:
+            pass
+        os._exit(1)
     if not VAST_API_KEY:
-        print("[WARN] Cannot self-destruct: VAST_API_KEY not set — sleeping forever")
-        while True:
-            time.sleep(3600)
+        print("[ERROR] Cannot self-destruct: VAST_API_KEY not set — "
+              "uploading logs and exiting(1) for entrypoint to handle", flush=True)
+        try:
+            upload_logs_to_r2()
+        except Exception:
+            pass
+        os._exit(1)
 
     # Use the plural form `destroy instances <id>` — singular prompts for
     # interactive [y/N] confirmation, reports exit=0 on empty stdin but leaves
@@ -1231,44 +1328,70 @@ def self_destruct():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 MAX_EXTENDED_RETRIES = 30
+# Total wall-clock budget for one file's upload (initial + extended retries).
+# Without it a dead network parks the worker for ~31 min per file; with it
+# the failure surfaces to the caller, which unclaims the chunk so a
+# (possibly healthier) worker retries.
+UPLOAD_MAX_WALL_S = int(os.environ.get('UPLOAD_MAX_WALL_S', '600'))
 
 
 def upload_with_retry(r2, local_path, bucket_key, label="FILE", max_attempts=5):
-    """Upload a file to R2 with exponential backoff and extended retry."""
+    """Upload a file to R2 with exponential backoff, extended retry, and a
+    wall-clock deadline (UPLOAD_MAX_WALL_S). Returns False on deadline."""
     file_size = os.path.getsize(local_path)
+    deadline = time.time() + UPLOAD_MAX_WALL_S
+
+    def _already_landed():
+        # Upload may succeed server-side but the connection resets before we
+        # see the response. Size must match — a stale/partial object on the
+        # key must NOT pass as success.
+        try:
+            if r2.file_exists(bucket_key, expected_size=file_size):
+                print(f"[INFO] File already on R2 with matching size "
+                      f"({file_size:,} bytes): {bucket_key}")
+                return True
+        except Exception:
+            pass
+        return False
 
     for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            if _already_landed():
+                return True
+            r2.abort_pending_multipart(bucket_key)
         print(f"[INFO] Uploading {label} ({file_size / (1024**2):.1f} MB), attempt {attempt}/{max_attempts}...")
         if r2.upload_file(local_path, bucket_key, max_retries=1):
             return True
         print(f"[WARN] Upload attempt {attempt}/{max_attempts} failed for {bucket_key}")
+        if time.time() >= deadline:
+            print(f"[ERROR] Upload deadline ({UPLOAD_MAX_WALL_S}s) exceeded for "
+                  f"{bucket_key} — giving up so the chunk can be retried elsewhere")
+            r2.abort_pending_multipart(bucket_key)
+            return False
         if attempt < max_attempts:
             wait = min(2 ** attempt, 120)
             time.sleep(wait)
 
-    # Extended retry with client reset — check if file already landed on R2
-    # (upload may succeed server-side but connection resets before response)
+    # Extended retry with client reset
     for retry_count in range(1, MAX_EXTENDED_RETRIES + 1):
-        try:
-            if r2.file_exists(bucket_key):
-                print(f"[INFO] File already on R2 (uploaded but response lost): {bucket_key}")
-                return True
-        except Exception:
-            pass
+        if _already_landed():
+            return True
+        if time.time() >= deadline:
+            print(f"[ERROR] Upload deadline ({UPLOAD_MAX_WALL_S}s) exceeded for "
+                  f"{bucket_key} after {retry_count - 1} extended retries — giving up")
+            break
         print(f"[WARN] Extended retry #{retry_count}/{MAX_EXTENDED_RETRIES} for {bucket_key}")
         r2.reset_client()
+        r2.abort_pending_multipart(bucket_key)
         time.sleep(60)
         if r2.upload_file(local_path, bucket_key, max_retries=1):
             return True
 
     # Final existence check before declaring permanent failure
-    try:
-        if r2.file_exists(bucket_key):
-            print(f"[INFO] File already on R2 after retries exhausted: {bucket_key}")
-            return True
-    except Exception:
-        pass
+    if _already_landed():
+        return True
 
+    r2.abort_pending_multipart(bucket_key)
     print(f"[ERROR] Upload permanently failed for {bucket_key}")
     return False
 
@@ -1450,15 +1573,18 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
 
     pending_batch: List[ViewItem] = []
     pending_futures = None
+    last_gc = 0
 
     try:
         while True:
-            wait_for_disk_space(str(work_dir), MIN_FREE_GB)
-
             now = time.time()
 
-            # ── Redis heartbeat + status report ──
+            # ── Redis heartbeat + status report + housekeeping (30s) ──
             if now - last_heartbeat_time >= HEARTBEAT_INTERVAL:
+                # Disk check + log rotation moved here from the hot loop —
+                # a statvfs + getsize per batch iteration is pure overhead.
+                wait_for_disk_space(str(work_dir), MIN_FREE_GB)
+                _truncate_log_if_huge()
                 try:
                     tq.heartbeat(REGION, INSTANCE_ID, _rcid)
                     elapsed = now - loop_start
@@ -1499,6 +1625,7 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
 
             # ── Fill next batch ──
             current_batch: List[ViewItem] = []
+            fill_deadline = None
             while len(current_batch) < extractor.batch_size:
                 try:
                     item = item_queue.get(timeout=0.01)
@@ -1506,7 +1633,16 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
                         continue
                     current_batch.append(item)
                 except queue.Empty:
-                    break
+                    # Coalesce: if the batch is still small and the queue
+                    # only momentarily dried up, keep polling up to ~75ms
+                    # before dispatching an inefficient tiny GPU batch.
+                    if (len(current_batch) >= extractor.batch_size // 2
+                            or not dl_thread.is_alive()):
+                        break
+                    if fill_deadline is None:
+                        fill_deadline = time.time() + 0.075
+                    if time.time() >= fill_deadline:
+                        break
 
             # ── No new items: drain pending then check for exit ──
             if not current_batch:
@@ -1521,8 +1657,11 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
                             last_progress_count = stats['ext_ok']
                             del feats_np, meta_batch
                         batch_times.append(time.time() - batch_start)
-                        if stats['ext_ok'] % 5000 == 0:
+                        # Watermark, not modulo — ext_ok grows by batch-size
+                        # steps and rarely lands exactly on a 5000 multiple.
+                        if stats['ext_ok'] - last_gc >= 5000:
                             gc.collect()
+                            last_gc = stats['ext_ok']
                     except Exception as e:
                         print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
                         import traceback
@@ -1549,8 +1688,9 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
                         last_progress_count = stats['ext_ok']
                         del feats_np, meta_batch
                     batch_times.append(time.time() - batch_start)
-                    if stats['ext_ok'] % 5000 == 0:
+                    if stats['ext_ok'] - last_gc >= 5000:
                         gc.collect()
+                        last_gc = stats['ext_ok']
                 except Exception as e:
                     print(f"[ERROR] Batch extraction failed: {type(e).__name__}: {e}", flush=True)
                     import traceback
@@ -1563,7 +1703,21 @@ def process_chunk(r2, tq: TaskQueue, extractor, chunk_id: str, work_dir: Path,
     except KeyboardInterrupt:
         print("[WARN] Interrupted", flush=True)
 
-    dl_thread.join()
+    # Signal the downloader to wind down (checked in its dispatch loop and
+    # its executor put-loop) and drain item_queue while joining — a full
+    # queue with no consumer would otherwise deadlock the join forever.
+    stats['stop_requested'] = True
+    _join_deadline = time.time() + 120
+    while dl_thread.is_alive() and time.time() < _join_deadline:
+        try:
+            while True:
+                item_queue.get_nowait()
+        except queue.Empty:
+            pass
+        dl_thread.join(timeout=1.0)
+    if dl_thread.is_alive():
+        print("[WARN] Downloader thread did not exit within 120s — "
+              "proceeding without it", flush=True)
     final_count = shared_state.write_idx
     shared_state.close()
 
@@ -1628,6 +1782,16 @@ def _cleanup_chunk_files(work_dir: Path, chunk_id: str, local_csv: str = None,
             os.remove(f)
         except OSError:
             pass
+    # Pool-mode partials: a failed pool chunk leaves partial_g*_{chunk_id}*
+    # files (~258MB each) that would otherwise accumulate and fill the disk.
+    try:
+        for pf in Path(work_dir).glob(f"partial_g*_{chunk_id}*"):
+            try:
+                os.remove(pf)
+            except OSError:
+                pass
+    except Exception:
+        pass
     if local_csv:
         try:
             os.remove(local_csv)
@@ -1883,6 +2047,15 @@ class AsyncUploadManager:
                 print(f"[UPLOAD] FAILED chunk={job.chunk_id}: "
                       f"{type(e).__name__}: {e}", flush=True)
                 traceback.print_exc()
+                # The chunk gets unclaimed for another (possibly healthier)
+                # worker — clean local files so this worker's disk doesn't
+                # fill with orphans it will never upload.
+                try:
+                    _cleanup_chunk_files(job.work_dir, job.chunk_id,
+                                         job.local_csv, out_base=job.out_base)
+                except Exception as ce:
+                    print(f"[UPLOAD] cleanup after failure failed: {ce}",
+                          flush=True)
             finally:
                 # task_done BEFORE pushing completion so drain_all sees a clean
                 # state before the main loop reads the completion. Reverse
@@ -1904,6 +2077,62 @@ class AsyncUploadManager:
                     except Exception as cb_e:
                         print(f"[UPLOAD] on_completion callback failed: {cb_e}",
                               flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Background Heartbeat — keeps every claimed chunk fresh in Redis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class HeartbeatThread(threading.Thread):
+    """Daemon that heartbeats every registered chunk every `interval` seconds.
+
+    The in-loop heartbeat only covers single-GPU extraction. Pool mode
+    (process_chunk_partitioned blocks the main thread up to 7200s), the
+    upload phase, and prefetched chunks all exceed STALE_TIMEOUT=300s with
+    no heartbeat — reclaim_stale requeues them and the fleet does duplicate
+    work. Register a chunk at claim time, unregister on complete/fail/unclaim.
+    The in-loop heartbeat stays (harmless duplicate).
+    """
+
+    def __init__(self, tq: TaskQueue, region: str, worker_id: str,
+                 interval: float = 30.0):
+        super().__init__(name="heartbeat", daemon=True)
+        self.tq = tq
+        self.region = region
+        self.worker_id = worker_id
+        self.interval = interval
+        self._chunks: Set[str] = set()
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
+
+    def register(self, chunk_id: str):
+        if not chunk_id:
+            return
+        with self._lock:
+            self._chunks.add(chunk_id)
+
+    def unregister(self, chunk_id: str):
+        if not chunk_id:
+            return
+        with self._lock:
+            self._chunks.discard(chunk_id)
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def run(self):
+        while not self._stop_evt.wait(self.interval):
+            with self._lock:
+                chunks = list(self._chunks)
+            for cid in chunks:
+                try:
+                    # Conditional heartbeat: only refreshes chunks still in
+                    # the active hash, so a racing complete/unclaim can't be
+                    # undone by a late HSET from this thread.
+                    self.tq.heartbeat_if_active(self.region, self.worker_id, cid)
+                except Exception as e:
+                    print(f"[WARN] Background heartbeat for {cid} failed: {e}",
+                          flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1988,9 +2217,20 @@ def _child_extract_partition(extractor: 'GpuExtractor', records: List[dict],
     item_queue = queue.Queue(maxsize=HARDCODED_CONFIG['queue_size'])
     stats = result['stats']
 
+    # Per-IP request budget: every pool child shares this instance's single
+    # public IP. Divide MAX_THREADS across the children instead of giving
+    # each the full budget — n_gpus × 30 concurrent panos from one IP trips
+    # Google's per-IP 403 gate. The total stays at MAX_THREADS (sacred).
+    child_config = dict(HARDCODED_CONFIG)
+    try:
+        _n_dev = max(1, torch.cuda.device_count())
+    except Exception:
+        _n_dev = 1
+    child_config['max_threads'] = max(4, HARDCODED_CONFIG['max_threads'] // _n_dev)
+
     dl_thread = threading.Thread(
         target=downloader_thread,
-        args=(records, HARDCODED_CONFIG, item_queue, metadata_map, stats, shared_state),
+        args=(records, child_config, item_queue, metadata_map, stats, shared_state),
         name=f"dl-g{partition_id}",
     )
     dl_thread.start()
@@ -2058,8 +2298,17 @@ def _child_extract_partition(extractor: 'GpuExtractor', records: List[dict],
     finally:
         # Make absolutely sure the downloader thread exits before we touch
         # the memmap close path — otherwise it could write past write_idx
-        # while we're truncating.
-        dl_thread.join(timeout=120)
+        # while we're truncating. Set the stop flag + drain the queue while
+        # joining so a full queue with no consumer can't deadlock the join.
+        stats['stop_requested'] = True
+        _join_deadline = time.time() + 120
+        while dl_thread.is_alive() and time.time() < _join_deadline:
+            try:
+                while True:
+                    item_queue.get_nowait()
+            except queue.Empty:
+                pass
+            dl_thread.join(timeout=1.0)
         final_count = shared_state.write_idx
         shared_state.close()
         # Release memmap before parent stitches it on its side.
@@ -2117,7 +2366,19 @@ def _gpu_worker_main(gpu_id: int, in_q, out_q):
 
     while True:
         try:
-            msg = in_q.get()
+            msg = in_q.get(timeout=60)
+        except queue.Empty:
+            # A blocking get() with a dead parent would park this child (and
+            # its CUDA context) forever. If we've been reparented to init
+            # (ppid==1, Linux container), the parent is gone — exit.
+            try:
+                if os.getppid() == 1:
+                    print(f"[GPU-{gpu_id}] parent died (reparented to init); "
+                          f"exiting", flush=True)
+                    break
+            except Exception:
+                pass
+            continue
         except (EOFError, KeyboardInterrupt):
             print(f"[GPU-{gpu_id}] in_q closed; exiting", flush=True)
             break
@@ -2507,14 +2768,26 @@ def _stitch_partials(partials: List[dict], features_file: str,
 # Prefetch Next Chunk (background CSV download during extraction)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _do_prefetch(result_ref, r2, tq, work_dir, skip_prefixes=None):
+def _do_prefetch(result_ref, r2, tq, work_dir, skip_prefixes=None, hb=None):
     """Thread target: claim next chunk + download/parse CSV. Stores result in result_ref[0].
-    skip_prefixes: shared set of city CSV prefixes to skip (missing on R2)."""
+    skip_prefixes: shared set of city CSV prefixes to skip (missing on R2).
+    hb: optional HeartbeatThread — the claimed chunk is registered so it
+    doesn't go stale while the current chunk is still extracting."""
     try:
         next_id = tq.claim_task(REGION, INSTANCE_ID)
         if next_id is None:
             return
+    except Exception as e:
+        print(f"[PREFETCH] Claim error: {e}")
+        return
 
+    if hb is not None:
+        hb.register(next_id)
+
+    # Everything after a successful claim must either hand the chunk to the
+    # main loop (result_ref) or put it back — an exception here would leave
+    # it dangling in active until reclaim_stale.
+    try:
         # Batch mode: look up per-chunk metadata
         _bmeta = None
         try:
@@ -2539,6 +2812,8 @@ def _do_prefetch(result_ref, r2, tq, work_dir, skip_prefixes=None):
                              f"city_csv_missing:{csv_prefix}")
             except Exception:
                 pass
+            if hb is not None:
+                hb.unregister(next_id)
             return
 
         csv_fn = f"{city}_{file_cid}.csv"
@@ -2547,24 +2822,46 @@ def _do_prefetch(result_ref, r2, tq, work_dir, skip_prefixes=None):
 
         print(f"[PREFETCH] Downloading CSV for next chunk {next_id}...")
         if not r2.download_file(csv_key, local_csv, max_retries=3):
-            print(f"[PREFETCH] CSV download failed for {next_id}, returning to queue")
-            # Blacklist this city prefix
-            if skip_prefixes is not None:
-                skip_prefixes.add(csv_prefix)
-                print(f"[PREFETCH] Blacklisting city prefix '{csv_prefix}' — "
-                      f"all future chunks from {city} will be skipped")
-            try:
-                tq.fail_task(REGION, next_id, INSTANCE_ID,
-                             f"city_csv_missing:{csv_prefix}")
-            except Exception:
-                pass
+            # Classify: real 404 (city CSVs genuinely absent) vs transient
+            # R2/network failure. Blacklisting a whole city because R2 had
+            # a bad minute permanently failed every one of its chunks.
+            missing = r2.object_missing(csv_key)
+            if missing is True:
+                print(f"[PREFETCH] CSV {csv_key} missing on R2 (404)")
+                if skip_prefixes is not None:
+                    skip_prefixes.add(csv_prefix)
+                    print(f"[PREFETCH] Blacklisting city prefix '{csv_prefix}' — "
+                          f"all future chunks from {city} will be skipped")
+                try:
+                    tq.fail_task(REGION, next_id, INSTANCE_ID,
+                                 f"city_csv_missing:{csv_prefix}")
+                except Exception:
+                    pass
+            else:
+                print(f"[PREFETCH] CSV download failed for {next_id} "
+                      f"(transient) — unclaiming, NOT blacklisting")
+                try:
+                    tq.unclaim_task(REGION, next_id, INSTANCE_ID,
+                                    reason="csv_download_transient", back=True)
+                except Exception:
+                    pass
+            if hb is not None:
+                hb.unregister(next_id)
             return
 
         records, metadata_map = load_csv(local_csv)
         result_ref[0] = (next_id, local_csv, records, metadata_map, _bmeta)
         print(f"[PREFETCH] Ready: chunk {next_id} ({len(records)} panos)")
     except Exception as e:
-        print(f"[PREFETCH] Error: {e}")
+        print(f"[PREFETCH] Error after claim: {type(e).__name__}: {e} — "
+              f"unclaiming {next_id}")
+        try:
+            tq.unclaim_task(REGION, next_id, INSTANCE_ID,
+                            reason=f"prefetch_error: {str(e)[:100]}", back=True)
+        except Exception as re:
+            print(f"[PREFETCH] unclaim failed: {re}")
+        if hb is not None:
+            hb.unregister(next_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2804,6 +3101,11 @@ def main():
         num_workers=int(os.environ.get('UPLOAD_WORKERS', '2')),
     )
 
+    # Background heartbeat covering ALL claimed chunks (pool extraction,
+    # upload phase, prefetched chunk) — not just the single-GPU loop.
+    hb = HeartbeatThread(tq, REGION, INSTANCE_ID)
+    hb.start()
+
     def _handle_completions(completions):
         """Translate finished upload jobs into Redis state. Returns
         (n_done_delta, n_failed_delta) so caller can keep counters."""
@@ -2823,11 +3125,18 @@ def main():
             else:
                 msg = f"{type(err).__name__}: {str(err)[:200]}"
                 print(f"[ERROR] Upload for {redis_cid} failed: {msg}")
+                # Upload failure is an infra problem, not a content problem —
+                # the extracted features were fine. Unclaim (no fcnt bump,
+                # capped by the unclaim counter) so a possibly-healthier
+                # worker retries; local files were already cleaned by the
+                # upload worker.
                 try:
-                    tq.fail_task(REGION, redis_cid, INSTANCE_ID, msg)
+                    tq.unclaim_task(REGION, redis_cid, INSTANCE_ID,
+                                    reason=f"upload_failed: {msg}", back=True)
                 except Exception as re:
-                    print(f"[WARN] fail_task({redis_cid}) failed: {re}")
+                    print(f"[WARN] unclaim_task({redis_cid}) failed: {re}")
                 f += 1
+            hb.unregister(redis_cid)
         return d, f
 
     # Pipeline state
@@ -2890,6 +3199,18 @@ def main():
                     except Exception:
                         pass
 
+                # Periodically recover lost tasks (claimed via LPOP but never
+                # marked active — worker crashed between the two calls).
+                # Startup-only recovery misses chunks lost mid-run; without
+                # this the fleet idles forever on a job that isn't complete.
+                if idle_cycles % 10 == 0:
+                    try:
+                        lost = tq.recover_lost_tasks(REGION)
+                        if lost:
+                            print(f"[IDLE] Recovered {len(lost)} lost tasks: {lost}")
+                    except Exception:
+                        pass
+
                 # Hard idle timeout — self-destruct if idle too long
                 idle_elapsed = time.time() - idle_start_time
                 if idle_elapsed >= MAX_IDLE_SECONDS:
@@ -2897,6 +3218,11 @@ def main():
                     break
                 time.sleep(5)  # Reduced from 30s for faster queue response
                 continue
+
+            # Keep the freshly claimed chunk alive in Redis through pool
+            # extraction / upload phases (prefetched chunks are registered
+            # inside _do_prefetch).
+            hb.register(chunk_id)
 
             preloaded_data = None
 
@@ -2928,19 +3254,27 @@ def main():
                                  f"city_csv_missing:{CSV_BUCKET_PREFIX}")
                 except Exception:
                     pass
+                hb.unregister(_redis_cid)
                 prefetched = None
                 continue
 
         # ── Skip if output already exists on R2 (avoids re-extracting) ──
+        # Requires BOTH the NPY and its metadata JSONL with size > 0,
+        # mirroring the startup reconcile — an NPY whose metadata upload
+        # failed (or a zero-byte torn object) must be re-extracted, not
+        # marked done.
         out_base = _output_base(CITY_NAME, chunk_id)
         npy_key = f"{FEATURES_BUCKET_PREFIX}/{out_base}.npy"
+        meta_skip_key = f"{FEATURES_BUCKET_PREFIX}/Metadata_{out_base}.jsonl"
         try:
-            if r2.file_exists(npy_key):
-                print(f"[SKIP] Chunk {chunk_id} output already on R2 — marking done")
+            if r2.object_size(npy_key) > 0 and r2.object_size(meta_skip_key) > 0:
+                print(f"[SKIP] Chunk {chunk_id} output (NPY + metadata) already "
+                      f"on R2 — marking done")
                 try:
                     tq.complete_task(REGION, _redis_cid, INSTANCE_ID)
                 except Exception:
                     pass
+                hb.unregister(_redis_cid)
                 chunks_done += 1
                 prefetched = None
                 continue
@@ -2955,7 +3289,9 @@ def main():
         # ── Prefetch next chunk's CSV in background during extraction ──
         pf_result = [None]
         pf_thread = threading.Thread(
-            target=_do_prefetch, args=(pf_result, r2, tq, work_dir, skip_city_prefixes), daemon=True
+            target=_do_prefetch,
+            args=(pf_result, r2, tq, work_dir, skip_city_prefixes, hb),
+            daemon=True,
         )
         pf_thread.start()
 
@@ -2974,6 +3310,7 @@ def main():
             if result is None:
                 # Empty chunk — mark complete immediately
                 tq.complete_task(REGION, _redis_cid, INSTANCE_ID)
+                hb.unregister(_redis_cid)
                 chunks_done += 1
                 print(f"[INFO] Completed empty chunk {chunk_id} ({chunks_done} total)")
             else:
@@ -3039,6 +3376,7 @@ def main():
                                 reason="ip_blocked_403")
             except Exception as re:
                 print(f"[WARN] Failed to unclaim {_redis_cid}: {re}")
+            hb.unregister(_redis_cid)
             _cleanup_chunk_files(work_dir, chunk_id)
 
             # Also unclaim the prefetched chunk if one is pending — same IP,
@@ -3050,6 +3388,7 @@ def main():
                     pf_next_id = pf_result_val[0]
                     tq.unclaim_task(REGION, pf_next_id, INSTANCE_ID,
                                     reason="ip_blocked_403_prefetch")
+                    hb.unregister(pf_next_id)
                     # Delete the prefetched CSV since we're bailing
                     try:
                         os.remove(pf_result_val[1])
@@ -3091,17 +3430,60 @@ def main():
             print(f"[ERROR] Chunk {chunk_id} failed: {error_msg}")
             import traceback
             traceback.print_exc()
-            try:
-                tq.fail_task(REGION, _redis_cid, INSTANCE_ID, error_msg)
-            except Exception as re:
-                print(f"[WARN] Failed to return chunk to queue: {re}")
-            _cleanup_chunk_files(work_dir, chunk_id)
 
-            # If CSV download failed (404), skip all future chunks from this city
-            if "Failed to download" in str(e) and CSV_BUCKET_PREFIX:
-                skip_city_prefixes.add(CSV_BUCKET_PREFIX)
-                print(f"[SKIP-CITY] Blacklisting city prefix '{CSV_BUCKET_PREFIX}' "
-                      f"— all future chunks from {CITY_NAME} will be skipped")
+            # ── Classify the failure ──
+            # Content failures (zero features extracted) → fail_task: the
+            # fcnt 3-strike is right for a chunk that genuinely produces
+            # nothing. Infra failures (CSV download, disk, stall, pool
+            # death) → unclaim_task(back=True): no fcnt bump, ucnt-capped,
+            # so a healthier worker retries without the chunk getting
+            # permanently failed for this worker's misfortune.
+            err_str = str(e)
+            csv_dl_failed = "Failed to download" in err_str
+            content_failure = "Zero features extracted" in err_str
+
+            if csv_dl_failed and CSV_BUCKET_PREFIX:
+                # Blacklist the city ONLY on a real 404/NoSuchKey — R2
+                # having a bad minute must not permanently fail every
+                # chunk of a city.
+                csv_key = f"{CSV_BUCKET_PREFIX}/{CITY_NAME}_{chunk_id}.csv"
+                missing = None
+                try:
+                    missing = r2.object_missing(csv_key)
+                except Exception:
+                    pass
+                if missing is True:
+                    skip_city_prefixes.add(CSV_BUCKET_PREFIX)
+                    print(f"[SKIP-CITY] CSV {csv_key} missing on R2 (404) — "
+                          f"blacklisting prefix '{CSV_BUCKET_PREFIX}', all "
+                          f"future chunks from {CITY_NAME} will be skipped")
+                    try:
+                        tq.fail_task(REGION, _redis_cid, INSTANCE_ID, error_msg)
+                    except Exception as re:
+                        print(f"[WARN] Failed to return chunk to queue: {re}")
+                else:
+                    print(f"[WARN] CSV download failed for {chunk_id} "
+                          f"(transient) — unclaiming, NOT blacklisting")
+                    try:
+                        tq.unclaim_task(
+                            REGION, _redis_cid, INSTANCE_ID,
+                            reason=f"csv_download_transient: {error_msg}",
+                            back=True)
+                    except Exception as re:
+                        print(f"[WARN] Failed to unclaim chunk: {re}")
+            elif content_failure:
+                try:
+                    tq.fail_task(REGION, _redis_cid, INSTANCE_ID, error_msg)
+                except Exception as re:
+                    print(f"[WARN] Failed to return chunk to queue: {re}")
+            else:
+                try:
+                    tq.unclaim_task(REGION, _redis_cid, INSTANCE_ID,
+                                    reason=f"infra: {error_msg}", back=True)
+                except Exception as re:
+                    print(f"[WARN] Failed to unclaim chunk: {re}")
+            hb.unregister(_redis_cid)
+            _cleanup_chunk_files(work_dir, chunk_id)
 
             # Still collect prefetch result
             pf_thread.join()

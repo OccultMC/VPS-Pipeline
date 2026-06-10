@@ -9,6 +9,8 @@ Replaces the old gsvpd/ tile pipeline entirely.
 """
 import asyncio
 import random
+import threading
+import time
 from typing import Optional
 
 # Uses curl_cffi instead of aiohttp so the TLS + HTTP/2/3 fingerprint matches
@@ -34,6 +36,43 @@ THUMB_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 BLACK_THUMB_MEAN = 5.0
 BLACK_THUMB_STD = 5.0
 
+# ── Throttled exception logging ───────────────────────────────────────────
+_exc_log_lock = threading.Lock()
+_exc_log_last = [0.0]
+
+
+def _log_fetch_exc(exc: BaseException):
+    """Print fetch exception types at most once per ~30s so network
+    pathologies (DNS failures, resets, TLS errors) are visible without
+    generating gigabytes of duplicate log lines."""
+    now = time.time()
+    with _exc_log_lock:
+        if now - _exc_log_last[0] < 30.0:
+            return
+        _exc_log_last[0] = now
+    print(f"[THUMB] fetch exception {type(exc).__name__}: {str(exc)[:120]} "
+          f"(throttled — at most one line per 30s)", flush=True)
+
+
+def _decode_and_check(body: bytes):
+    """Decode JPEG bytes → RGB array plus a status tag.
+
+    Runs in a thread-pool executor: cv2.imdecode + the black-placeholder
+    mean/std check done inline on the asyncio event loop across hundreds of
+    concurrent fetches visibly starves the loop and stalls in-flight requests.
+
+    Returns ('ok', rgb) | ('decode_fail', None) | ('black', None).
+    """
+    arr_bgr = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+    if arr_bgr is None:
+        return 'decode_fail', None
+    # "No imagery here" placeholder: solid black JPEG. Detected via low
+    # mean AND low std so legitimate dark scenes (night, tunnels) with
+    # any texture still pass.
+    if arr_bgr.mean() < BLACK_THUMB_MEAN and arr_bgr.std() < BLACK_THUMB_STD:
+        return 'black', None
+    return 'ok', cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2RGB)
+
 
 async def fetch_thumbnail_view(
     session: AsyncSession,
@@ -58,12 +97,18 @@ async def fetch_thumbnail_view(
       * 403                                -> retry with backoff (Google
                                               occasionally flags a single
                                               request for a split second);
-                                              only after every retry also
-                                              returns 403 do we conclude the
-                                              IP is blocked and set
-                                              stats['ip_blocked_403']
-      * 5xx / 429                          -> retry with Retry-After + jittered
-                                              exponential backoff
+                                              if every retry returns 403 the
+                                              pano is counted as suspect
+                                              (stats['suspect_403']) and
+                                              dropped. The global
+                                              stats['ip_blocked_403'] flag is
+                                              ONLY set by the known-good-URL
+                                              probe machinery in pipeline.py
+                                              — a single pano 403ing forever
+                                              must not poison the whole chunk.
+      * 5xx / 429                          -> retry with Retry-After (capped
+                                              at 30s) + jittered exponential
+                                              backoff
       * other 4xx                          -> None (no retry — permanent)
       * exception (timeout / reset / DNS)  -> retry with backoff
     """
@@ -80,24 +125,20 @@ async def fetch_thumbnail_view(
 
             if status == 200:
                 data = response.content
-                arr_bgr = cv2.imdecode(
-                    np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR
+                # Decode + black-check off the event loop — done inline it
+                # blocks every in-flight request for the imdecode duration.
+                tag, rgb = await asyncio.get_running_loop().run_in_executor(
+                    None, _decode_and_check, data
                 )
-                if arr_bgr is None:
+                if tag == 'decode_fail':
                     if stats is not None:
                         stats['decode_fail'] = stats.get('decode_fail', 0) + 1
                     return None
-
-                # "No imagery here" placeholder: solid black JPEG.
-                # Detected via low mean AND low std so legitimate dark
-                # scenes (night, tunnels) with any texture still pass.
-                if (arr_bgr.mean() < BLACK_THUMB_MEAN
-                        and arr_bgr.std() < BLACK_THUMB_STD):
+                if tag == 'black':
                     if stats is not None:
                         stats['black_views'] = stats.get('black_views', 0) + 1
                     return None
-
-                return cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2RGB)
+                return rgb
 
             if status == 403:
                 # Two flavours of 403 from this endpoint:
@@ -105,10 +146,13 @@ async def fetch_thumbnail_view(
                 #       split second; the next attempt succeeds.
                 #   (b) persistent IP block — every request from this IP
                 #       returns 403 until the cooldown lifts (hours).
-                # Retry with backoff to absorb (a). If we exhaust retries
-                # the 403 is persistent → flag so the outer downloader
-                # short-circuits and the worker self-destructs instead of
-                # poisoning the queue with half-extracted features.
+                # Retry with backoff to absorb (a). If we exhaust retries,
+                # count the pano as suspect and drop it — do NOT set the
+                # global ip_blocked_403 flag here. A single pano can 403
+                # forever (pulled imagery, region lock) while the IP is
+                # perfectly fine; flipping the global flag from one pano
+                # poison-pills the whole chunk. Only the known-good-URL
+                # probe machinery in pipeline.py decides IP-level blocks.
                 if stats is not None:
                     stats['http_403'] = stats.get('http_403', 0) + 1
 
@@ -119,7 +163,7 @@ async def fetch_thumbnail_view(
                     continue
 
                 if stats is not None:
-                    stats['ip_blocked_403'] = True
+                    stats['suspect_403'] = stats.get('suspect_403', 0) + 1
                 return None
 
             if status not in THUMB_RETRYABLE_STATUS or attempt >= retries:
@@ -133,10 +177,16 @@ async def fetch_thumbnail_view(
                 delay = float(ra) if ra else backoff * (2 ** (attempt - 1))
             except ValueError:
                 delay = backoff * (2 ** (attempt - 1))
+            # Cap honoured Retry-After — Google occasionally sends absurd
+            # values that would park a downloader slot for minutes.
+            delay = min(delay, 30.0)
             delay += random.uniform(0, backoff)
             await asyncio.sleep(delay)
 
-        except Exception:
+        except Exception as e:
+            if stats is not None:
+                stats['fetch_exc'] = stats.get('fetch_exc', 0) + 1
+            _log_fetch_exc(e)
             if attempt < retries:
                 await asyncio.sleep(
                     backoff * (2 ** (attempt - 1)) + random.uniform(0, backoff)

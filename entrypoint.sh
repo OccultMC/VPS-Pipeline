@@ -89,13 +89,74 @@ export VAST_CONTAINERLABEL=${VAST_CONTAINERLABEL:-}
     done
 ) &>/dev/null || true
 
-# Run the pipeline — filter out SSH noise from stdout/stderr
-echo "[INFO] Starting pipeline.py at $(date -u)..."
-python pipeline.py 2>&1 | grep -v -E "^(Warning: Permanently added|Error: remote port forwarding|kex_exchange_identification|Connection closed by|Connection from|banner exchange|ssh: Could not resolve)" || true
-EXIT_CODE=${PIPESTATUS[0]}
+# Run the pipeline — filter out SSH noise from stdout/stderr.
+# --line-buffered so progress lines reach `vastai logs` as they happen
+# instead of in 4KB block-buffered bursts.
+run_pipeline() {
+    python pipeline.py 2>&1 | grep --line-buffered -v -E "^(Warning: Permanently added|Error: remote port forwarding|kex_exchange_identification|Connection closed by|Connection from|banner exchange|ssh: Could not resolve)"
+    return "${PIPESTATUS[0]}"
+}
 
-if [ $EXIT_CODE -ne 0 ]; then
-    echo "[ERROR] Pipeline exited with code $EXIT_CODE at $(date -u)"
-    echo "[INFO] Container kept alive for debugging. SSH in to investigate."
-    tail -f /dev/null
+# Self-destruct this Vast.ai instance. Matches pipeline.py's self_destruct():
+# vastai CLI, plural "destroy instances" form (singular prompts [y/N] and
+# exits 0 without destroying on empty stdin), success confirmed by the
+# "destroying instance N." stdout pattern. Falls back to the raw REST API
+# (DELETE /api/v0/instances/{id}/) if the CLI is unavailable or unconfirmed.
+self_destruct() {
+    if [ -z "${INSTANCE_ID}" ] || [ -z "${VAST_API_KEY}" ]; then
+        echo "[ERROR] Cannot self-destruct: INSTANCE_ID or VAST_API_KEY not set"
+        return 1
+    fi
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        echo "[INFO] Self-destruct attempt ${attempt} for instance ${INSTANCE_ID}..."
+        if command -v vastai &>/dev/null; then
+            local out
+            out=$(echo "y" | vastai --api-key "${VAST_API_KEY}" destroy instances "${INSTANCE_ID}" 2>&1) || true
+            echo "[INFO] Self-destruct response: ${out}"
+            if echo "${out}" | grep -qi "destroying instance ${INSTANCE_ID}"; then
+                echo "[INFO] Instance ${INSTANCE_ID} destroyed successfully."
+                return 0
+            fi
+        fi
+        local code
+        code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+            "https://console.vast.ai/api/v0/instances/${INSTANCE_ID}/" \
+            -H "Authorization: Bearer ${VAST_API_KEY}") || true
+        echo "[INFO] Vast API DELETE returned HTTP ${code}"
+        if [ "${code}" = "200" ]; then
+            return 0
+        fi
+        echo "[WARN] Self-destruct attempt ${attempt} did not confirm — retrying in 30s"
+        sleep 30
+    done
+    return 1
+}
+
+MAX_ATTEMPTS=3
+EXIT_CODE=0
+for ATTEMPT in $(seq 1 ${MAX_ATTEMPTS}); do
+    echo "[INFO] Starting pipeline.py at $(date -u) (attempt ${ATTEMPT}/${MAX_ATTEMPTS})..."
+    set +e
+    run_pipeline
+    EXIT_CODE=$?
+    set -e
+    if [ "${EXIT_CODE}" -eq 0 ]; then
+        break
+    fi
+    echo "[ERROR] Pipeline exited with code ${EXIT_CODE} at $(date -u)"
+    if [ "${ATTEMPT}" -lt "${MAX_ATTEMPTS}" ]; then
+        echo "[INFO] Retrying in 30s..."
+        sleep 30
+    fi
+done
+
+if [ "${EXIT_CODE}" -ne 0 ]; then
+    if [ "${DEBUG_KEEP_ALIVE:-0}" = "1" ]; then
+        echo "[INFO] DEBUG_KEEP_ALIVE=1 — container kept alive for debugging. SSH in to investigate."
+        tail -f /dev/null
+    fi
+    echo "[ERROR] Pipeline failed ${MAX_ATTEMPTS} times — self-destructing so the instance stops billing."
+    self_destruct || echo "[ERROR] Self-destruct failed — exiting anyway (do NOT idle on a paid GPU)"
+    exit "${EXIT_CODE}"
 fi
